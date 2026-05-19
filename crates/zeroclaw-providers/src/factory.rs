@@ -509,6 +509,30 @@ impl CompatFamilySpec for XaiModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> OpenAiCompatibleModelProvider {
+        self.build_compat_base(alias, key, api_url).with_vision()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::model_provider::ModelProvider;
+
+    #[test]
+    fn xai_provider_declares_vision_support() {
+        let cfg = XaiModelProviderConfig::default();
+        let p = cfg.build_compat("test", None, None);
+        assert!(
+            <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p).vision,
+            "xai provider must declare vision support (grok-2-vision, grok-4.3 both support images)"
+        );
+    }
 }
 
 impl FamilyProviderFactory for MinimaxModelProviderConfig {

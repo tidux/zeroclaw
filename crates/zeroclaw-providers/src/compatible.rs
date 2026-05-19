@@ -354,6 +354,11 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
+    pub fn with_vision(mut self) -> Self {
+        self.supports_vision = true;
+        self
+    }
+
     /// Collect all `system` role messages and keep them in a provider-safe
     /// shape. Strict OpenAI-compatible endpoints accept a leading system
     /// message but reject system messages later in the history.
@@ -3977,6 +3982,20 @@ mod tests {
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
         assert_eq!(p.user_agent.as_deref(), Some("zeroclaw-test/vision"));
+    }
+
+    #[test]
+    fn with_vision_builder_enables_vision_capability() {
+        let p = OpenAiCompatibleModelProvider::new(
+            "test",
+            "xAI",
+            "https://api.x.ai/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        )
+        .with_vision();
+        let caps = <OpenAiCompatibleModelProvider as ModelProvider>::capabilities(&p);
+        assert!(caps.vision);
     }
 
     #[test]

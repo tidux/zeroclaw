@@ -2093,7 +2093,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 continue;
             }
 
-            // Inline formatting pass (only outside code blocks)
+            // Inside code blocks: HTML-escape only, no markdown interpretation.
+            if in_code_block {
+                result_lines.push(Self::escape_html(line));
+                continue;
+            }
+
+            // Inline formatting pass
             let mut line_out = String::new();
             let mut i = 0;
             let bytes = line.as_bytes();
@@ -4114,6 +4120,23 @@ mod tests {
         assert_eq!(rendered, "<pre><code>let x = 1;</code></pre>");
         assert!(!rendered.contains("language-"));
         assert!(!rendered.contains("onclick"));
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_diff_block_preserved_verbatim() {
+        let input = "```diff\n+++ b/file.rs\n--- a/file.rs\n@@ -1,5 +1,7 @@\n context\n-removed **bold** line\n+added *italic* line\n```";
+        let rendered = TelegramChannel::markdown_to_telegram_html(input);
+        // Markdown formatting must NOT be applied inside the fenced block.
+        assert!(
+            !rendered.contains("<b>") && !rendered.contains("<i>"),
+            "inline markdown must not be processed inside code blocks, got: {rendered}"
+        );
+        // The literal markers must survive verbatim.
+        assert!(rendered.contains("**bold**"), "got: {rendered}");
+        assert!(rendered.contains("*italic*"), "got: {rendered}");
+        // diff +/- prefixes must be preserved.
+        assert!(rendered.contains("-removed"), "got: {rendered}");
+        assert!(rendered.contains("+added"), "got: {rendered}");
     }
 
     #[test]

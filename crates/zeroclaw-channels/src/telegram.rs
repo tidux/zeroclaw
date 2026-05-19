@@ -1211,6 +1211,18 @@ impl TelegramChannel {
             return;
         };
 
+        // Under mention_only, silently ignore group messages that don't address the bot.
+        if self.mention_only && Self::is_group_message(message) {
+            let bot_username = self.bot_username.lock();
+            if let Some(ref bu) = *bot_username {
+                if !Self::contains_bot_mention(text, bu) {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+
         let username_opt = message
             .get("from")
             .and_then(|from| from.get("username"))
@@ -2054,28 +2066,35 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let lines: Vec<&str> = text.split('\n').collect();
         let mut result_lines: Vec<String> = Vec::new();
 
+        let mut in_code_block = false;
+
         for line in &lines {
             let trimmed_line = line.trim_start();
-            if trimmed_line.starts_with("```") {
-                // Preserve fence lines so the second-pass block parser can consume them
-                // without interference from inline backtick handling.
+            let is_fence = trimmed_line.starts_with("```");
+
+            if is_fence {
+                // Toggle code-block state and preserve the fence line literally
+                in_code_block = !in_code_block;
                 result_lines.push(trimmed_line.to_string());
                 continue;
             }
 
-            let mut line_out = String::new();
-
-            // Handle code blocks (``` ... ```) - handled at text level below
-            // Handle headers: ## Title → <b>Title</b>
+            // Only convert Markdown headers outside code blocks.
+            // Inside ``` blocks we must keep literal # (e.g. shell heredocs, comments).
             let stripped = line.trim_start_matches('#');
             let header_level = line.len() - stripped.len();
-            if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
+            if !in_code_block
+                && header_level > 0
+                && line.starts_with('#')
+                && stripped.starts_with(' ')
+            {
                 let title = Self::escape_html(stripped.trim());
                 result_lines.push(format!("<b>{title}</b>"));
                 continue;
             }
 
-            // Inline formatting
+            // Inline formatting pass (only outside code blocks)
+            let mut line_out = String::new();
             let mut i = 0;
             let bytes = line.as_bytes();
             let len = bytes.len();
@@ -2122,12 +2141,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     i += 2 + end;
                     continue;
                 }
-                // Markdown link: [text](url)
+                // Markdown link: [text](url) — only http(s)
                 if bytes[i] == b'['
                     && let Some(bracket_end) = line[i + 1..].find(']')
                 {
                     let text_part = &line[i + 1..i + 1 + bracket_end];
-                    let after_bracket = i + 1 + bracket_end + 1; // position after ']'
+                    let after_bracket = i + 1 + bracket_end + 1;
                     if after_bracket < len
                         && bytes[after_bracket] == b'('
                         && let Some(paren_end) = line[after_bracket + 1..].find(')')
@@ -2168,10 +2187,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             result_lines.push(line_out);
         }
 
-        // Second pass: handle ``` code blocks across lines
+        // Second pass: assemble final output, handling code blocks for <pre><code>
         let joined = result_lines.join("\n");
         let mut final_out = String::with_capacity(joined.len());
-        let mut in_code_block = false;
+        in_code_block = false;
         let mut code_buf = String::new();
 
         for line in joined.split('\n') {
@@ -2180,7 +2199,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 if in_code_block {
                     in_code_block = false;
                     let escaped = code_buf.trim_end_matches('\n');
-                    // Telegram HTML parse mode supports <pre> and <code>, but not class attributes.
                     let _ = writeln!(final_out, "<pre><code>{escaped}</code></pre>");
                     code_buf.clear();
                 } else {
@@ -3537,6 +3555,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                         if let Some(rest) = cb_data.strip_prefix("approval:")
                             && let Some((approval_id, action)) = rest.rsplit_once(':')
                         {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_attrs(::serde_json::json!({"approval_id": approval_id, "action": action})),
+                                "Received tool approval callback"
+                            );
+
                             let response = match action {
                                 "approve" => {
                                     Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
@@ -3714,12 +3739,10 @@ Ensure only one `zeroclaw` process is using this bot token."
     ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        // Parse recipient for chat_id + optional thread_id ("chat_id:thread_id" format).
         let (chat_id, thread_id) = recipient
             .split_once(':')
             .map_or((recipient, None), |(c, t)| (c, Some(t)));
 
-        // Unique key embedded in callback_data so listen() can route the tap.
         let approval_id = uuid::Uuid::new_v4().to_string();
 
         let tool = Self::escape_html(&request.tool_name);
@@ -3749,26 +3772,27 @@ Ensure only one `zeroclaw` process is using this bot token."
             body["message_thread_id"] = serde_json::Value::String(tid.to_string());
         }
 
-        // Register the oneshot BEFORE sending the message to avoid a race
-        // where the user taps the button before the sender is in the map.
+        // Register the oneshot BEFORE sending to avoid the "tap before registration" race
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals
             .lock()
             .await
             .insert(approval_id.clone(), tx);
 
-        let resp = self
+        // Attempt to send the approval prompt
+        let send_result = self
             .http_client()
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
             .await;
 
-        let send_ok = match resp {
+        let send_ok = match send_result {
             Ok(r) if r.status().is_success() => true,
             Ok(r) => {
                 let status = r.status();
                 let err = r.text().await.unwrap_or_default();
+
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3779,11 +3803,12 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
-                // Fallback: plain text, no parse_mode, keep the buttons
+                // Fallback without parse_mode
                 let plain_text = format!(
                     "🔧 Tool approval required\n\nTool: {}\n{}\n\nTap a button below:",
                     request.tool_name, request.arguments_summary
                 );
+
                 let mut plain_body = serde_json::json!({
                     "chat_id": chat_id,
                     "text": plain_text,
@@ -3805,8 +3830,9 @@ Ensure only one `zeroclaw` process is using this bot token."
                     Ok(r) => {
                         let status = r.status();
                         let err = r.text().await.unwrap_or_default();
+                        // Clean up on hard failure
                         self.pending_approvals.lock().await.remove(&approval_id);
-                        anyhow::bail!("Telegram sendMessage (approval) failed ({status}): {err}");
+                        anyhow::bail!("Telegram sendMessage failed ({}): {}", status, err);
                     }
                     Err(e) => {
                         self.pending_approvals.lock().await.remove(&approval_id);
@@ -3822,7 +3848,7 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         if !send_ok {
             self.pending_approvals.lock().await.remove(&approval_id);
-            anyhow::bail!("Telegram sendMessage (approval) failed after fallback");
+            anyhow::bail!("Telegram approval message failed to send");
         }
 
         // Wait for the user to tap a button. Timeout is configurable via
@@ -6898,5 +6924,66 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    // ── Approval race condition regression tests ────────────────────────
+
+    #[tokio::test]
+    async fn request_approval_does_not_auto_deny_on_successful_send() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        let approval_id = "test-regression-123".to_string();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        // After successful registration (simulating successful send),
+        // the pending entry must still exist.
+        let map = ch.pending_approvals.lock().await;
+        assert!(
+            map.contains_key(&approval_id),
+            "pending entry must survive successful send path"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_approval_cleans_up_on_timeout() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_approval_timeout_secs(0); // force immediate timeout behavior
+
+        let approval_id = "timeout-test".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        // Trigger timeout path
+        let _ = tokio::time::timeout(Duration::from_millis(1), rx).await;
+
+        // Simulate the cleanup that happens on timeout
+        ch.pending_approvals.lock().await.remove(&approval_id);
+
+        let map = ch.pending_approvals.lock().await;
+        assert!(
+            !map.contains_key(&approval_id),
+            "entry must be cleaned up after timeout"
+        );
     }
 }

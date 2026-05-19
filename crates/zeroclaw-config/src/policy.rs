@@ -293,7 +293,11 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "python".into(),
         "python3".into(),
         "pip".into(),
+        "uv".into(),
         "node".into(),
+        "gh".into(),
+        "cd".into(),
+        "which".into(),
     ];
     // `free` is Linux-only; it does not exist on macOS or other BSDs.
     #[cfg(target_os = "linux")]
@@ -313,6 +317,8 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "npm".into(),
         "cargo".into(),
         "echo".into(),
+        "uv".into(),
+        "gh".into(),
         // Windows-native equivalents
         "dir".into(),
         "type".into(),
@@ -337,7 +343,10 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "python".into(),
         "python3".into(),
         "pip".into(),
+        "uv".into(),
         "node".into(),
+        "gh".into(),
+        "cd".into(),
     ]
 }
 

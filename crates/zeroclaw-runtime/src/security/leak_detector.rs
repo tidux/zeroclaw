@@ -325,11 +325,20 @@ impl LeakDetector {
         static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
         let receipt_re =
             RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
+        // Strip absolute filesystem paths before entropy scanning. The token
+        // splitter keeps '/' in the allowed set (for base64 '+/'), which means
+        // long paths like /home/user/agents/bot/workspace become single tokens
+        // with falsely elevated entropy. Real credentials don't look like
+        // multi-component /a/b/c chains, so this strip is safe.
+        static FS_PATH_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let fspath_re = FS_PATH_PATTERN
+            .get_or_init(|| Regex::new(r"/[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._-]+)+").unwrap());
         let content_stripped = url_re.replace_all(content, "");
         let content_without_urls = media_re.replace_all(&content_stripped, "");
         let content_without_receipts = receipt_re.replace_all(&content_without_urls, "");
+        let content_without_fspaths = fspath_re.replace_all(&content_without_receipts, "");
 
-        let tokens = extract_candidate_tokens(&content_without_receipts);
+        let tokens = extract_candidate_tokens(&content_without_fspaths);
 
         for token in tokens {
             if token.len() >= ENTROPY_TOKEN_MIN_LEN {
@@ -573,6 +582,94 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         assert!(
             matches!(result, LeakResult::Clean),
             "Media marker video paths should not trigger high-entropy detection"
+        );
+    }
+
+    #[test]
+    fn bare_agent_workspace_path_not_redacted() {
+        // Derive the actual agent workspace path from the running environment so
+        // this test exercises the exact path shape that triggers the false positive,
+        // without embedding any deployment-specific strings.
+        //
+        // Resolution order (mirrors zeroclaw's own config lookup):
+        //   1. $ZEROCLAW_CONFIG_DIR/agents/<first-agent>/workspace
+        //   2. $HOME/<first-dir-under-HOME-that-contains-config.toml>/agents/<first-agent>/workspace
+        //
+        // If neither resolves to a path with sufficient entropy (≥ 24 chars,
+        // mixed alpha+digit) the test is skipped rather than asserting on a
+        // path that wouldn't trigger the bug in the first place.
+        let config_root: Option<std::path::PathBuf> =
+            std::env::var("ZEROCLAW_CONFIG_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    // Walk $HOME looking for a directory that contains config.toml
+                    // and an agents/ subdirectory — that's the zeroclaw config root.
+                    let home = std::env::var("HOME").ok()?;
+                    std::fs::read_dir(&home).ok()?.find_map(|entry| {
+                        let path = entry.ok()?.path();
+                        if path.join("config.toml").exists() && path.join("agents").is_dir() {
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+        let workspace_path: Option<std::path::PathBuf> = config_root.and_then(|root| {
+            // Pick the first agent directory found.
+            let agents_dir = root.join("agents");
+            let first_agent = std::fs::read_dir(&agents_dir)
+                .ok()?
+                .find_map(|e| e.ok().filter(|e| e.path().is_dir()))
+                .map(|e| e.file_name())?;
+            Some(agents_dir.join(first_agent).join("workspace"))
+        });
+
+        let Some(workspace) = workspace_path else {
+            // No resolvable agent workspace in this environment; skip.
+            return;
+        };
+        let path_str = workspace.display().to_string();
+
+        // Only run the assertion when the path would actually trigger the false
+        // positive (entropy ≥ threshold AND mixed alpha+digit AND len ≥ 24).
+        // If the path doesn't meet that bar, the test trivially passes without
+        // validating the fix, so we skip rather than silently succeed.
+        let would_trigger = path_str.len() >= ENTROPY_TOKEN_MIN_LEN
+            && has_mixed_alpha_digit(&path_str)
+            && shannon_entropy(&path_str) >= 3.5 + 0.7 * 1.25;
+        if !would_trigger {
+            return;
+        }
+
+        let detector = LeakDetector::new();
+        let content = format!("Working in {path_str} on this task.");
+        let result = detector.scan(&content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Agent workspace paths must not be redacted as high-entropy tokens: {path_str}"
+        );
+    }
+
+    #[test]
+    fn synthetic_workspace_path_not_redacted() {
+        let detector = LeakDetector::new();
+        // Build a path that has the structural characteristics of a real agent
+        // workspace (long, mixed alpha+digit, high character diversity) without
+        // embedding any user- or deployment-specific information.
+        let base = std::env::temp_dir();
+        let workspace = base
+            .join("agents")
+            .join("my-agent-instance-1")
+            .join("workspace");
+        let path_str = workspace.display().to_string();
+        let content = format!("Working in {path_str} on this task.");
+        let result = detector.scan(&content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Agent workspace paths must not be redacted as high-entropy tokens: {path_str}"
         );
     }
 

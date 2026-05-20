@@ -2127,8 +2127,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     continue;
                 }
                 // Italic: *text* or _text_ (single)
+                // Per CommonMark: a left-flanking `*` must not be followed by whitespace.
+                // `* **bold**` uses `*` as a list bullet, not an italic opener.
                 if bytes[i] == b'*'
                     && (i == 0 || bytes[i - 1] != b'*')
+                    && i + 1 < len
+                    && bytes[i + 1] != b' '
                     && let Some(end) = line[i + 1..].find('*')
                     && end > 0
                 {
@@ -4137,6 +4141,27 @@ mod tests {
         // diff +/- prefixes must be preserved.
         assert!(rendered.contains("-removed"), "got: {rendered}");
         assert!(rendered.contains("+added"), "got: {rendered}");
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_star_bullet_bold_title() {
+        // Gemma 4 emits `* **Title**: description` lists. The `*` bullet must not
+        // be treated as an italic opener — that would consume the space before `**`
+        // as italic content, leaving the bold title un-parsed.
+        let input = "* **Option A**: First choice\n* **Option B**: Second choice";
+        let rendered = TelegramChannel::markdown_to_telegram_html(input);
+        assert!(
+            rendered.contains("<b>Option A</b>"),
+            "star-bullet bold title must be bold, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("<b>Option B</b>"),
+            "star-bullet bold title must be bold, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<i> </i>"),
+            "bullet asterisk must not become italic space, got: {rendered}"
+        );
     }
 
     #[test]

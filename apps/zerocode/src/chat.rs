@@ -6667,6 +6667,9 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        // The TodoWrite plan is per-session; drop it (and its show/hide state)
+        // so a switched-to session doesn't inherit the previous plan's tasks.
+        self.todo_tracker.reset_for_session();
         self.clear_queue();
     }
 }
@@ -10300,6 +10303,38 @@ mod tests {
         s.push_user_message(Some("ask".to_string()), Vec::new());
         s.reset_for_session("sess-2".to_string(), None);
         assert!(s.first_message.is_none());
+    }
+
+    #[test]
+    fn reset_for_session_clears_todo_plan() {
+        // Reviewer report (#9013): the TodoWrite pane's tasks must not
+        // persist when the Code pane switches sessions.
+        use crate::wire::{PlanEntry, PlanPriority, PlanStatus};
+        let mut s = state();
+        s.todo_tracker.set_plan(vec![
+            PlanEntry {
+                content: "task one".to_string(),
+                status: PlanStatus::InProgress,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+            PlanEntry {
+                content: "task two".to_string(),
+                status: PlanStatus::Pending,
+                priority: PlanPriority::Medium,
+                active_form: None,
+            },
+        ]);
+        assert_eq!(s.todo_tracker.total(), 2);
+
+        s.reset_for_session("sess-2".to_string(), None);
+
+        assert_eq!(
+            s.todo_tracker.total(),
+            0,
+            "a session switch must drop the previous session's TodoWrite plan"
+        );
+        assert!(!s.todo_tracker.is_visible());
     }
 
     #[test]

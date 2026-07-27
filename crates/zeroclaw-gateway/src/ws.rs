@@ -480,7 +480,9 @@ async fn handle_socket(
                 return;
             }
         };
-    agent.set_channel_name("wss".to_string());
+    // Must match the registered back-channel key (`"ws"`) so ask_user/poll
+    // default to this conversation instead of an arbitrary seeded channel.
+    agent.set_channel_name("ws".to_string());
     agent.set_memory_session_id(Some(memory_session_id));
     let restore_trim_event = if stored_messages.is_empty() {
         None

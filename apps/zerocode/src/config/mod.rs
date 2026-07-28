@@ -241,78 +241,6 @@ impl Default for TodoTrackerSettings {
     }
 }
 
-// ── Message queue ─────────────────────────────────────────────────────────────
-
-/// The `[message_queue]` section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MessageQueueSection {
-    #[serde(default = "default_queue_cap")]
-    pub cap: usize,
-    #[serde(default = "default_queue_width")]
-    pub default_width: u16,
-    #[serde(default = "default_queue_min")]
-    pub min_width: u16,
-    #[serde(default = "default_queue_max")]
-    pub max_width: u16,
-    #[serde(default = "default_queue_step")]
-    pub width_step: u16,
-    #[serde(default = "default_true")]
-    pub auto_open: bool,
-    #[serde(default)]
-    pub stay_open_when_empty: bool,
-}
-
-impl Default for MessageQueueSection {
-    fn default() -> Self {
-        Self {
-            cap: default_queue_cap(),
-            default_width: default_queue_width(),
-            min_width: default_queue_min(),
-            max_width: default_queue_max(),
-            width_step: default_queue_step(),
-            auto_open: true,
-            stay_open_when_empty: false,
-        }
-    }
-}
-
-impl MessageQueueSection {
-    /// Reject values that the runtime resolver would otherwise normalize.
-    /// The ordering check covers the complete candidate section, not only the
-    /// leaf currently being edited.
-    pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
-        if self.cap == 0
-            || self.default_width == 0
-            || self.min_width == 0
-            || self.max_width == 0
-            || self.width_step == 0
-        {
-            return Err(UiSectionValidationError::PositiveRequired);
-        }
-        if self.min_width > self.default_width || self.default_width > self.max_width {
-            return Err(UiSectionValidationError::WidthOrder);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn resolve(&self) -> MessageQueueSettings {
-        let cap = self.cap.max(1);
-        let width_step = self.width_step.max(1);
-        let min_width = self.min_width.max(1);
-        let max_width = self.max_width.max(min_width);
-        let default_width = self.default_width.clamp(min_width, max_width);
-        MessageQueueSettings {
-            cap,
-            default_width,
-            min_width,
-            max_width,
-            width_step,
-            auto_open: self.auto_open,
-            stay_open_when_empty: self.stay_open_when_empty,
-        }
-    }
-}
-
 /// Validation failures shared by the local UI config sections. User-facing
 /// wording is supplied by the Config pane's Fluent catalogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,34 +260,6 @@ impl std::fmt::Display for UiSectionValidationError {
 
 impl std::error::Error for UiSectionValidationError {}
 
-// ── Runtime settings types ────────────────────────────────────────────────────
-
-/// Runtime settings for the message queue, derived from `[message_queue]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MessageQueueSettings {
-    pub cap: usize,
-    pub default_width: u16,
-    pub min_width: u16,
-    pub max_width: u16,
-    pub width_step: u16,
-    pub auto_open: bool,
-    pub stay_open_when_empty: bool,
-}
-
-impl Default for MessageQueueSettings {
-    fn default() -> Self {
-        Self {
-            cap: default_queue_cap(),
-            default_width: default_queue_width(),
-            min_width: default_queue_min(),
-            max_width: default_queue_max(),
-            width_step: default_queue_step(),
-            auto_open: true,
-            stay_open_when_empty: false,
-        }
-    }
-}
-
 // ── Default helpers ───────────────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -372,26 +272,6 @@ fn default_todotracker_width() -> u16 {
 
 fn default_todotracker_max_height() -> u16 {
     5
-}
-
-fn default_queue_cap() -> usize {
-    32
-}
-
-fn default_queue_width() -> u16 {
-    36
-}
-
-fn default_queue_min() -> u16 {
-    24
-}
-
-fn default_queue_max() -> u16 {
-    80
-}
-
-fn default_queue_step() -> u16 {
-    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,8 +288,6 @@ pub(crate) struct ZerocodeConfig {
     keybindings: HashMap<String, ChordSpec>,
     #[serde(default)]
     pub todotracker: TodoTrackerSection,
-    #[serde(default)]
-    pub message_queue: MessageQueueSection,
 }
 
 impl Default for ZerocodeConfig {
@@ -420,7 +298,6 @@ impl Default for ZerocodeConfig {
             connection: ConnectionSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
-            message_queue: MessageQueueSection::default(),
         }
     }
 }
@@ -506,31 +383,29 @@ impl ZerocodeConfig {
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
         self.todotracker.resolve()
     }
-
-    /// Convert the `[message_queue]` section into the runtime settings type.
-    ///
-    /// The section fields are operator-supplied and therefore untrusted:
-    /// they were safe compile-time constants before local config existed.
-    /// This canonical boundary normalizes them so no downstream consumer
-    /// has to defend against a degenerate value:
-    ///
-    /// - `cap` and `width_step` are floored at `1` (a `0` cap would drop
-    ///   every message; a `0` step would make resize a no-op).
-    /// - The three widths are coerced into a consistent
-    ///   `min_width <= default_width <= max_width` relationship, with
-    ///   `min_width` floored at `1`. An inverted or partial config (e.g.
-    ///   `max_width < min_width`, or a `default_width` outside the band)
-    ///   is clamped rather than allowed to produce an unusable sidebar.
-    pub fn resolve_message_queue(&self) -> MessageQueueSettings {
-        self.message_queue.resolve()
-    }
 }
 
 pub(crate) fn config_path(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE_NAME)
 }
 
+/// The effective config: on-disk values with `ZEROCODE_*` env overrides
+/// applied on top. This is what runtime consumers (sessions, rendering) read.
+///
+/// Env overrides are process-transient and must never be written back to disk,
+/// so anything that *edits and saves* config must use [`load_persisted`]
+/// instead — otherwise saving one field would bake an env-injected value for
+/// an unrelated field into `zerocode-config.toml`.
 pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
+    let mut config = load_persisted(config_dir)?;
+    apply_env_overrides(&mut config)?;
+    Ok(config)
+}
+
+/// The on-disk config exactly as persisted, with **no** env overrides applied.
+/// This is the correct base for read-modify-write edits (the Config pane), so
+/// a transient `ZEROCODE_*` value can never leak into the saved file.
+pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
 
@@ -603,21 +478,11 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
-    if let Some(v) = doc.get("message_queue") {
-        match v.clone().try_into::<MessageQueueSection>() {
-            Ok(section) => config.message_queue = section,
-            Err(e) => eprintln!(
-                "zerocode: ignoring [message_queue] in {} ({e}); using default",
-                path.display()
-            ),
-        }
-    }
 
     if migrated_keybindings {
         write_document(&path, &doc)?;
     }
 
-    apply_env_overrides(&mut config)?;
     Ok(config)
 }
 
@@ -732,24 +597,6 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
     write_document(&path, &doc)
 }
 
-/// Persist the entire `[message_queue]` section, editing only that section.
-/// Other sections are preserved.
-pub(crate) fn persist_message_queue(
-    config_dir: &Path,
-    section: &MessageQueueSection,
-) -> Result<()> {
-    section.validate()?;
-    let path = config_path(config_dir);
-    let mut doc = load_document(&path)?;
-    let serialized = toml::Value::try_from(section)
-        .context("serializing message_queue section")?
-        .as_table()
-        .cloned()
-        .unwrap_or_default();
-    doc.insert("message_queue".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
-}
-
 pub(crate) fn persist_connection_field(
     config_dir: &Path,
     leaf_path: &str,
@@ -822,6 +669,11 @@ fn flatten_table(table: &OverrideTable) -> HashMap<String, ChordSpec> {
 
 /// Apply every `ZEROCODE_<dotted__path>=value` env var. Hard-errors on any var
 /// that does not resolve to a known config path.
+///
+/// Canonical spelling: the `ZEROCODE_` prefix followed by the lowercase dotted
+/// config path with `.` written as `__` — e.g. `ZEROCODE_todotracker__enabled=false`
+/// sets `todotracker.enabled`. This mirrors the daemon's `ZEROCLAW_<path>` form.
+/// Overrides are process-transient and are never written back to disk.
 fn apply_env_overrides(config: &mut ZerocodeConfig) -> Result<()> {
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
@@ -874,7 +726,7 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     }
 
     // Parse the string into the correct TOML type by inspecting the existing
-    // field value. This lets env overrides like ZEROCODE__TODOTRACKER__ENABLED=false
+    // field value. This lets env overrides like `ZEROCODE_todotracker__enabled=false`
     // set a boolean without the caller knowing the field type.
     let existing = table[*leaf].clone();
     let new_value = match existing {
@@ -1440,7 +1292,7 @@ mod tests {
             max_height: 10,
         };
         persist_todotracker(dir.path(), &section).unwrap();
-        let cfg = ensure_and_load(dir.path()).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
         assert!(!cfg.todotracker.enabled);
         assert!(cfg.todotracker.enabled_at_start);
         assert_eq!(cfg.todotracker.location, TodoTrackerLocation::Bottom);
@@ -1467,93 +1319,14 @@ mod tests {
             dir.path(),
             "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
         );
-        let cfg = ensure_and_load(dir.path()).unwrap();
+        // Asserts on-disk parsing/fallback, so read the persisted view: the
+        // effective view would also layer in any ambient `ZEROCODE_*` override.
+        let cfg = load_persisted(dir.path()).unwrap();
         assert_eq!(cfg.theme.name, "dracula");
         assert_eq!(cfg.todotracker.width, default_todotracker_width());
     }
 
-    // ── Message queue persistence tests ─────────────────────────────────────
-
-    #[test]
-    fn persist_message_queue_writes_section_and_preserves_others() {
-        let dir = tempfile::tempdir().unwrap();
-        seed(
-            dir.path(),
-            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
-        );
-        let section = MessageQueueSection {
-            cap: 64,
-            default_width: 40,
-            min_width: 20,
-            max_width: 100,
-            width_step: 8,
-            auto_open: false,
-            stay_open_when_empty: true,
-        };
-        persist_message_queue(dir.path(), &section).unwrap();
-        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
-        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
-        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
-        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(64));
-        assert_eq!(doc["message_queue"]["default_width"].as_integer(), Some(40));
-        assert_eq!(doc["message_queue"]["min_width"].as_integer(), Some(20));
-        assert_eq!(doc["message_queue"]["max_width"].as_integer(), Some(100));
-        assert_eq!(doc["message_queue"]["width_step"].as_integer(), Some(8));
-        assert_eq!(doc["message_queue"]["auto_open"].as_bool(), Some(false));
-        assert_eq!(
-            doc["message_queue"]["stay_open_when_empty"].as_bool(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn persist_message_queue_round_trips_through_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let section = MessageQueueSection {
-            cap: 64,
-            default_width: 40,
-            min_width: 20,
-            max_width: 100,
-            width_step: 8,
-            auto_open: false,
-            stay_open_when_empty: true,
-        };
-        persist_message_queue(dir.path(), &section).unwrap();
-        let cfg = ensure_and_load(dir.path()).unwrap();
-        assert_eq!(cfg.message_queue.cap, 64);
-        assert_eq!(cfg.message_queue.default_width, 40);
-        assert_eq!(cfg.message_queue.min_width, 20);
-        assert_eq!(cfg.message_queue.max_width, 100);
-        assert_eq!(cfg.message_queue.width_step, 8);
-        assert!(!cfg.message_queue.auto_open);
-        assert!(cfg.message_queue.stay_open_when_empty);
-    }
-
-    #[test]
-    fn persist_message_queue_creates_file_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let section = MessageQueueSection {
-            cap: 64,
-            ..Default::default()
-        };
-        persist_message_queue(dir.path(), &section).unwrap();
-        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
-        assert_eq!(doc["message_queue"]["cap"].as_integer(), Some(64));
-    }
-
-    #[test]
-    fn bad_message_queue_does_not_blank_theme() {
-        let dir = tempfile::tempdir().unwrap();
-        seed(
-            dir.path(),
-            "[theme]\nname = \"dracula\"\n\n[message_queue]\ncap = \"not_a_number\"\n",
-        );
-        let cfg = ensure_and_load(dir.path()).unwrap();
-        assert_eq!(cfg.theme.name, "dracula");
-        assert_eq!(cfg.message_queue.cap, default_queue_cap());
-    }
-
-    // ── Env override tests for new sections ─────────────────────────────────
+    // ── Env override tests ──────────────────────────────────────────────────
 
     #[test]
     fn set_prop_todotracker_enabled() {
@@ -1570,20 +1343,6 @@ mod tests {
     }
 
     #[test]
-    fn set_prop_message_queue_cap() {
-        let mut c = ZerocodeConfig::default();
-        set_prop(&mut c, "message_queue.cap", "128").unwrap();
-        assert_eq!(c.message_queue.cap, 128);
-    }
-
-    #[test]
-    fn set_prop_message_queue_auto_open() {
-        let mut c = ZerocodeConfig::default();
-        set_prop(&mut c, "message_queue.auto_open", "false").unwrap();
-        assert!(!c.message_queue.auto_open);
-    }
-
-    #[test]
     fn set_prop_todotracker_location() {
         let mut c = ZerocodeConfig::default();
         set_prop(&mut c, "todotracker.location", "left").unwrap();
@@ -1591,47 +1350,6 @@ mod tests {
     }
 
     // ── Resolver validation / normalization (untrusted config boundary) ──────
-
-    #[test]
-    fn resolve_message_queue_floors_zero_cap_and_step() {
-        let mut c = ZerocodeConfig::default();
-        c.message_queue.cap = 0;
-        c.message_queue.width_step = 0;
-        let s = c.resolve_message_queue();
-        assert_eq!(s.cap, 1, "cap=0 must be floored to 1, never drop messages");
-        assert_eq!(s.width_step, 1, "width_step=0 must be floored to 1");
-    }
-
-    #[test]
-    fn resolve_message_queue_coerces_inconsistent_widths() {
-        let mut c = ZerocodeConfig::default();
-        // Inverted band + a default outside it, plus a zero min.
-        c.message_queue.min_width = 0;
-        c.message_queue.max_width = 10;
-        c.message_queue.default_width = 200;
-        let s = c.resolve_message_queue();
-        assert_eq!(s.min_width, 1, "min_width floored at 1");
-        assert!(s.max_width >= s.min_width, "max_width >= min_width");
-        assert!(
-            s.default_width >= s.min_width && s.default_width <= s.max_width,
-            "default_width clamped into [min, max]: got {} for [{}, {}]",
-            s.default_width,
-            s.min_width,
-            s.max_width
-        );
-    }
-
-    #[test]
-    fn resolve_message_queue_preserves_valid_widths() {
-        let mut c = ZerocodeConfig::default();
-        c.message_queue.min_width = 20;
-        c.message_queue.default_width = 48;
-        c.message_queue.max_width = 100;
-        let s = c.resolve_message_queue();
-        assert_eq!(s.min_width, 20);
-        assert_eq!(s.default_width, 48);
-        assert_eq!(s.max_width, 100);
-    }
 
     #[test]
     fn resolve_todo_tracker_floors_zero_width_and_height() {
@@ -1643,50 +1361,142 @@ mod tests {
         assert_eq!(s.max_height, 1, "tracker max_height=0 must be floored to 1");
     }
 
-    // ── Single-source-of-truth regression (reviewer Blocking #2) ────────────
+    // ── Single source of truth ──────────────────────────────────────────────
     //
-    // `zerocode-config.toml` must be the live source of truth: a Config-pane
-    // save has to be picked up by the *next* session, not shadowed by a value
-    // cached at first-session start. `start_session` resolves the file per
-    // session, so this exercises that boundary at the config layer — load,
-    // persist a change (as the Config pane does), load again — and asserts the
-    // second resolve reflects the edit.
+    // `zerocode-config.toml` is the live source of truth for the tracker's
+    // display settings: a value persisted by the Config pane must be visible
+    // to the next session that resolves the file, never shadowed by a copy
+    // cached at first-session start. Sessions resolve the file at each session
+    // boundary, so this exercises that contract at the config layer: load,
+    // persist a change (as the Config pane does), load again.
     #[test]
     fn resolved_settings_track_edits_across_sessions() {
+        // Resolves the effective view, so serialize against the env-mutating
+        // tests below: `std::env` is process-global.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
 
         // "Session 1" resolves the defaults.
         let cfg1 = ensure_and_load(dir.path()).unwrap();
-        let q1 = cfg1.resolve_message_queue();
         let t1 = cfg1.resolve_todo_tracker();
 
-        // A Config-pane save persists changed fields to the same file.
-        let mut queue = cfg1.message_queue.clone();
-        queue.cap = q1.cap + 11;
-        queue.default_width = q1.default_width + 5;
-        persist_message_queue(dir.path(), &queue).unwrap();
+        // A Config-pane save persists a changed field to the same file.
         let mut tracker = cfg1.todotracker.clone();
         tracker.width = t1.width + 7;
         persist_todotracker(dir.path(), &tracker).unwrap();
 
-        // "Session 2" must resolve the *edited* values, not the cached copy.
+        // "Session 2" must resolve the *edited* value, not a cached copy.
         let cfg2 = ensure_and_load(dir.path()).unwrap();
-        let q2 = cfg2.resolve_message_queue();
         let t2 = cfg2.resolve_todo_tracker();
-        assert_eq!(
-            q2.cap,
-            q1.cap + 11,
-            "second session must see the persisted cap edit"
-        );
-        assert_eq!(
-            q2.default_width,
-            q1.default_width + 5,
-            "second session must see the persisted default_width edit"
-        );
         assert_eq!(
             t2.width,
             t1.width + 7,
             "second session must see the persisted tracker width edit"
+        );
+    }
+    // ── Environment override contract ───────────────────────────────────────
+    //
+    // Canonical spelling is `ZEROCODE_<lowercase dotted path with __>`, e.g.
+    // `ZEROCODE_todotracker__enabled`. These exercise real environment
+    // variables through `ensure_and_load` rather than calling `set_prop`
+    // directly, so the public spelling stays covered.
+
+    use crate::test_support::env_test_lock;
+
+    struct EnvVarGuard(&'static str);
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            // SAFETY: these tests serialize on `env_test_lock()`.
+            unsafe { std::env::set_var(name, value) };
+            Self(name)
+        }
+    }
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: these tests serialize on `env_test_lock()`.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracker_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__enabled", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.todotracker.enabled,
+            "ZEROCODE_todotracker__enabled must reach the parser and win over the file"
+        );
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracker_width() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "41");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.resolve_todo_tracker().width, 41);
+    }
+
+    #[test]
+    fn unknown_env_path_is_rejected() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+
+        let err = ensure_and_load(dir.path()).expect_err("unknown path must hard-error");
+        assert!(format!("{err:#}").contains("did not resolve to a config field"));
+    }
+
+    // Env overrides are process-transient: `load_persisted` is the on-disk
+    // truth and must not see them, otherwise a Config-pane save of one field
+    // would bake an env-injected value for another field into the file.
+    #[test]
+    fn env_overrides_do_not_reach_the_persisted_view() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = TodoTrackerSection {
+            width: 30,
+            ..TodoTrackerSection::default()
+        };
+        persist_todotracker(dir.path(), &on_disk).unwrap();
+
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // Effective view honors the override...
+        assert_eq!(ensure_and_load(dir.path()).unwrap().todotracker.width, 77);
+        // ...while the persisted view keeps the real file contents.
+        assert_eq!(load_persisted(dir.path()).unwrap().todotracker.width, 30);
+    }
+
+    // Saving an unrelated field must rewrite the section from *disk* state, so
+    // an env-injected value for a different field is never written through.
+    #[test]
+    fn saving_unrelated_field_does_not_persist_env_value() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = TodoTrackerSection {
+            width: 30,
+            max_height: 5,
+            ..TodoTrackerSection::default()
+        };
+        persist_todotracker(dir.path(), &on_disk).unwrap();
+
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // Edit an unrelated field starting from the persisted section.
+        let mut candidate = load_persisted(dir.path()).unwrap().todotracker;
+        candidate.max_height = 9;
+        persist_todotracker(dir.path(), &candidate).unwrap();
+
+        let reloaded = load_persisted(dir.path()).unwrap().todotracker;
+        assert_eq!(reloaded.max_height, 9, "the edited field must be saved");
+        assert_eq!(
+            reloaded.width, 30,
+            "the env-injected width must not be written to disk"
         );
     }
 }

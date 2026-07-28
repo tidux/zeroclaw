@@ -24,9 +24,6 @@ pub(crate) struct TodoTracker {
     has_ever_popped: bool,
     location: TodoLocation,
     enabled: bool,
-    /// Baseline visibility for a fresh session (mirrors `enabled_at_start`);
-    /// used to restore the launch state on a session switch.
-    enabled_at_start: bool,
     /// Side-panel target column width (left/right); runtime-clamped.
     width: u16,
     /// Bottom-strip max height in rows (grows up to this).
@@ -42,7 +39,6 @@ impl TodoTracker {
             has_ever_popped: false,
             location: settings.location,
             enabled: settings.enabled,
-            enabled_at_start: settings.enabled_at_start,
             width: settings.width,
             max_height: settings.max_height,
         }
@@ -88,10 +84,13 @@ impl TodoTracker {
     /// configured launch visibility (`enabled_at_start`). Config-derived layout
     /// (location/width/max_height) and the master `enabled` gate are per-install
     /// and are left untouched.
-    pub(crate) fn reset_for_session(&mut self) {
-        self.entries.clear();
-        self.has_ever_popped = false;
-        self.visible = self.enabled && self.enabled_at_start;
+    /// Rebuild the tracker for a newly-entered session from freshly resolved
+    /// settings. The plan is per-session, so entries are dropped and the
+    /// one-time auto-pop is re-armed; layout/visibility come from `settings`
+    /// so a Config-pane edit takes effect on the next session transition
+    /// (restart or switch), not only on a fresh session.
+    pub(crate) fn reset_for_session(&mut self, settings: TodoTrackerSettings) {
+        *self = Self::from_settings(settings);
     }
 
     /// User show/hide. Inert while master-disabled.
@@ -198,6 +197,20 @@ mod tests {
     use super::*;
     use crate::wire::{PlanEntry, PlanPriority, PlanStatus};
 
+    /// Settings fixture mirroring the old `TodoTracker::new` shorthand.
+    fn settings_for(
+        location: TodoLocation,
+        enabled: bool,
+        enabled_at_start: bool,
+    ) -> TodoTrackerSettings {
+        TodoTrackerSettings {
+            enabled,
+            enabled_at_start,
+            location,
+            ..TodoTrackerSettings::default()
+        }
+    }
+
     fn entry(content: &str, status: PlanStatus) -> PlanEntry {
         PlanEntry {
             content: content.to_string(),
@@ -219,8 +232,8 @@ mod tests {
 
     #[test]
     fn config_enabled_false_disables_tracker() {
-        // The reviewer's core case: [todotracker] enabled = false must
-        // actually disable the running tracker.
+        // `enabled = false` is the master gate: it must keep the running
+        // tracker hidden even when a plan arrives.
         let s = TodoTrackerSettings {
             enabled: false,
             ..TodoTrackerSettings::default()
@@ -297,7 +310,8 @@ mod tests {
     fn reset_for_session_clears_plan_and_visibility() {
         // A tracker that auto-popped for one session's plan must not carry
         // that plan (or its shown state) into the next session.
-        let mut t = TodoTracker::new(TodoLocation::Right, true, false);
+        let settings = settings_for(TodoLocation::Right, true, false);
+        let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![
             entry("A", PlanStatus::Pending),
             entry("B", PlanStatus::Completed),
@@ -305,7 +319,7 @@ mod tests {
         assert!(t.is_visible(), "first plan auto-pops into view");
         assert_eq!(t.total(), 2);
 
-        t.reset_for_session();
+        t.reset_for_session(settings);
 
         assert_eq!(t.total(), 0, "session switch clears the plan");
         assert_eq!(t.done(), 0);
@@ -320,9 +334,10 @@ mod tests {
     fn reset_for_session_rearms_autopop() {
         // After a reset the one-time auto-pop must arm again so the next
         // session's first plan pops the tracker back into view.
-        let mut t = TodoTracker::new(TodoLocation::Right, true, false);
+        let settings = settings_for(TodoLocation::Right, true, false);
+        let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
-        t.reset_for_session();
+        t.reset_for_session(settings);
         assert!(!t.is_visible());
         t.set_plan(vec![entry("B", PlanStatus::InProgress)]);
         assert!(t.is_visible(), "post-reset first plan auto-pops again");
@@ -332,11 +347,12 @@ mod tests {
     fn reset_for_session_restores_enabled_at_start_visibility() {
         // enabled_at_start=true means the tracker shows at each session's
         // launch, including after a switch.
-        let mut t = TodoTracker::new(TodoLocation::Right, true, true);
+        let settings = settings_for(TodoLocation::Right, true, true);
+        let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
         t.toggle(); // hide it mid-session
         assert!(!t.is_visible());
-        t.reset_for_session();
+        t.reset_for_session(settings);
         assert!(
             t.is_visible(),
             "enabled_at_start restores visibility on the new session"
@@ -348,15 +364,16 @@ mod tests {
     fn reset_for_session_preserves_config() {
         // Layout/config knobs are per-install, not per-session — a reset
         // must keep location/width/max_height/enabled intact.
-        let mut t = TodoTracker::from_settings(TodoTrackerSettings {
+        let settings = TodoTrackerSettings {
             enabled: true,
             enabled_at_start: false,
             location: TodoLocation::Bottom,
             width: 42,
             max_height: 9,
-        });
+        };
+        let mut t = TodoTracker::from_settings(settings);
         t.set_plan(vec![entry("A", PlanStatus::Pending)]);
-        t.reset_for_session();
+        t.reset_for_session(settings);
         assert_eq!(t.location(), TodoLocation::Bottom);
         assert_eq!(t.width(), 42);
         assert_eq!(t.max_height(), 9);
@@ -364,8 +381,9 @@ mod tests {
 
     #[test]
     fn reset_for_session_master_disabled_stays_hidden() {
-        let mut t = TodoTracker::new(TodoLocation::Right, false, true);
-        t.reset_for_session();
+        let settings = settings_for(TodoLocation::Right, false, true);
+        let mut t = TodoTracker::from_settings(settings);
+        t.reset_for_session(settings);
         assert!(
             !t.is_visible(),
             "master-disabled tracker never shows, even after reset"

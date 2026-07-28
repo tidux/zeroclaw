@@ -42,6 +42,8 @@ mod mouse;
 mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod todo_tracker;
 mod turn_status;

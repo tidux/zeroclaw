@@ -229,20 +229,16 @@ mod tests {
         assert!(mismatch.contains("0.8.0"));
     }
 
-    // Regression: every Config-pane key the zerocode UI section renders must
-    // resolve through the *same* Fluent bundle the TUI uses, not fall back to
-    // the raw `{key}` identifier. A prior revision shipped the code using
-    // `zc-zerocode-tab-todo-tracker` / `zc-zerocode-tracker-*` / `zc-zerocode-queue-*`
-    // while the catalog only defined a differently named `zc-zerocode-todo-*`
-    // family, so the pane rendered fallback key names. This guards the exact
-    // keys `zerocode_pane.rs` looks up for the Todo tracker + Message queue UI.
+    // Every Config-pane key the zerocode UI section renders must resolve
+    // through the *same* Fluent bundle the TUI uses, never falling back to the
+    // raw `{key}` identifier. Code and catalog can drift independently, so this
+    // pins the exact keys `zerocode_pane.rs` looks up for the Todo tracker UI.
     #[test]
-    fn todo_tracker_and_queue_config_keys_resolve() {
+    fn todo_tracker_config_keys_resolve() {
         let map = format_ftl_messages(EN_FTL, "en");
         const KEYS: &[&str] = &[
             // Section tabs
             "zc-zerocode-tab-todo-tracker",
-            "zc-zerocode-tab-message-queue",
             // Todo tracker section
             "zc-zerocode-tracker-title",
             "zc-zerocode-tracker-enabled",
@@ -254,25 +250,13 @@ mod tests {
             "zc-zerocode-tracker-edit-number",
             "zc-zerocode-tracker-edit-bool",
             "zc-zerocode-tracker-edit-location",
-            // Message queue section
-            "zc-zerocode-queue-title",
-            "zc-zerocode-queue-cap",
-            "zc-zerocode-queue-default-width",
-            "zc-zerocode-queue-min-width",
-            "zc-zerocode-queue-max-width",
-            "zc-zerocode-queue-width-step",
-            "zc-zerocode-queue-auto-open",
-            "zc-zerocode-queue-stay-open-when-empty",
-            "zc-zerocode-queue-saved",
-            "zc-zerocode-queue-edit-number",
-            "zc-zerocode-queue-edit-bool",
+            // Shared Config-pane validation/status keys
             "zc-zerocode-config-invalid-number",
             "zc-zerocode-config-positive-required",
             "zc-zerocode-config-width-order",
             "zc-zerocode-config-save-mismatch",
             // Help hints
             "zc-zerocode-help-todo-tracker",
-            "zc-zerocode-help-message-queue",
         ];
         for key in KEYS {
             let value = map

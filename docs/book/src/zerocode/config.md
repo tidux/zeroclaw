@@ -30,8 +30,8 @@ Some settings describe how *zerocode itself* draws its panes rather than how the
 daemon behaves. Those live in zerocode's own file,
 `<config-dir>/zerocode-config.toml`, and are edited from **Config → UI**.
 
-The TodoWrite tracker is one of them. It is a display-only concern — the daemon
-just emits plan updates, and over ACP the client controls formatting entirely —
+The TodoWrite tracker is one of them. It is a display-only concern: the daemon
+just emits plan updates, and over ACP the client controls formatting entirely,
 so it is owned by zerocode:
 
 ```toml
@@ -44,7 +44,7 @@ max_height = 5           # bottom-strip maximum height in rows
 ```
 
 Values are re-read at every session boundary, so an edit made in the Config pane
-applies to the next session you start, restart, or switch to — no zerocode
+applies to the next session you start, restart, or switch to, with no zerocode
 restart needed.
 
 ### Environment overrides

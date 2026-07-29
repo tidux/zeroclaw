@@ -136,6 +136,10 @@ impl Tool for EscalateToHumanTool {
                 "timeout_secs": {
                     "type": "integer",
                     "description": "Seconds to wait for a response when wait_for_response is true (default: 600)"
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "Channel to escalate on. Defaults to the channel this conversation is happening on."
                 }
             },
             "required": ["summary"]
@@ -209,6 +213,12 @@ impl Tool for EscalateToHumanTool {
         // Format the message
         let text = Self::format_message(urgency, &summary, context.as_deref());
 
+        let requested_channel = args
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         // Resolve channel — block-scoped to drop the RwLock guard before any .await
         let (channel_name, channel): (String, Arc<dyn Channel>) = {
             let channels = self.channel_map.read();
@@ -219,18 +229,57 @@ impl Tool for EscalateToHumanTool {
                     error: Some("No channels available yet (channels not initialized)".to_string()),
                 });
             }
-            let (name, ch) = channels.iter().next().ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "channels"})),
-                    "escalate: no channels configured"
-                );
-                anyhow::Error::msg("No channels available. Configure at least one channel.")
-            })?;
-            (name.clone(), ch.clone())
+            if let Some(ref name) = requested_channel {
+                // Explicit or origin-injected channel: honour it exactly rather
+                // than silently escalating somewhere the operator isn't looking.
+                let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "escalate: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
+                })?;
+                (name.clone(), ch)
+            } else {
+                let (name, ch) = channels.iter().next().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "escalate: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
+                })?;
+                (name.clone(), ch.clone())
+            }
         };
+
+        // An escalation that nobody receives is worse than a failed one: the
+        // agent believes a human was notified. RPC/WS back-channels return
+        // `Ok(())` from `send` without rendering anything, so refuse rather
+        // than report a delivery that never happened.
+        if !channel.supports_outbound_send() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Channel '{channel_name}' cannot deliver an escalation message \
+                     (no outbound send support), so the human would never see it. \
+                     Re-run `escalate_to_human` with an explicit `channel` that can \
+                     deliver, or configure `[escalation] alert_channels`."
+                )),
+            });
+        }
 
         if wait_for_response && !channel.supports_free_form_ask() {
             return Ok(ToolResult {
@@ -714,6 +763,161 @@ mod tests {
 
         assert!(result.success, "error: {:?}", result.error);
         assert_eq!(stub.sent.read().len(), 1);
+    }
+
+    /// Stub whose `send` silently no-ops, mirroring `RpcApprovalChannel` /
+    /// `WsApprovalChannel`: returns `Ok(())` but renders nothing.
+    struct NoDeliveryChannel {
+        channel_name: String,
+        sent: Arc<RwLock<Vec<String>>>,
+    }
+
+    impl NoDeliveryChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                sent: Arc::new(RwLock::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NoDeliveryChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for NoDeliveryChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn escalate_uses_requested_channel_not_arbitrary_map_entry() {
+        // Regression: escalate_to_human had no `channel` parameter and always
+        // used channels.iter().next() (HashMap order), so an escalation could
+        // land on an arbitrary configured channel while the operator watched
+        // the channel that actually issued the turn.
+        let origin = Arc::new(SilentChannel::new("telegram"));
+        let other_a = Arc::new(SilentChannel::new("discord"));
+        let other_b = Arc::new(SilentChannel::new("slack"));
+        let tool = make_tool_with_channels(vec![
+            ("discord", Arc::clone(&other_a) as Arc<dyn Channel>),
+            ("telegram", Arc::clone(&origin) as Arc<dyn Channel>),
+            ("slack", Arc::clone(&other_b) as Arc<dyn Channel>),
+        ]);
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need a human",
+                "channel": "telegram",
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["channel"], "telegram");
+        assert_eq!(
+            origin.sent.read().len(),
+            1,
+            "escalation must go to the requested channel"
+        );
+        assert!(
+            other_a.sent.read().is_empty() && other_b.sent.read().is_empty(),
+            "no other channel may receive the escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_reports_unknown_requested_channel() {
+        let tool = make_tool_with_channels(vec![(
+            "telegram",
+            Arc::new(SilentChannel::new("telegram")) as Arc<dyn Channel>,
+        )]);
+
+        let result = tool
+            .execute(json!({ "summary": "Help", "channel": "nope" }))
+            .await;
+
+        // Unknown channel surfaces as an error rather than silently escalating
+        // somewhere the caller did not ask for.
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(r) => r.error.unwrap_or_default(),
+        };
+        assert!(
+            err.contains("nope"),
+            "error should name the missing channel: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_fails_honestly_when_channel_cannot_deliver() {
+        // Regression: routing escalations to the originating channel means RPC
+        // and WS back-channels are now reachable. Their `send` returns Ok(())
+        // without rendering anything, so reporting "escalated" would tell the
+        // agent a human was notified when nobody was.
+        let ch = Arc::new(NoDeliveryChannel::new("rpc"));
+        let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
+
+        let result = tool
+            .execute(json!({ "summary": "Production down", "channel": "rpc" }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not claim escalation succeeded on a non-delivering channel"
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("rpc") && err.contains("deliver"),
+            "error should explain the delivery gap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn escalate_without_channel_still_uses_map_fallback() {
+        // Back-compat: callers that omit `channel` (and turns with no
+        // originating channel to inject) keep the previous behaviour.
+        let tool = make_tool_with_channels(vec![(
+            "telegram",
+            Arc::new(SilentChannel::new("telegram")) as Arc<dyn Channel>,
+        )]);
+
+        let result = tool.execute(json!({ "summary": "Help" })).await.unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["channel"], "telegram");
     }
 
     // ── 10. test_high_urgency_succeeds_without_alert_channels ──

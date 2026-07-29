@@ -210,4 +210,23 @@ mod tests {
             assert_eq!(args["channel"], "acp", "tool={tool}");
         }
     }
+
+    #[test]
+    fn injected_channel_matches_escalate_tool_schema_parameter() {
+        // Guard against the injection being a no-op: `escalate_to_human` must
+        // actually declare the `channel` parameter we inject, otherwise the
+        // helper "passes" while the tool ignores the key and falls back to
+        // channels.iter().next(). Behavioural coverage of the routing itself
+        // lives in zeroclaw-tools::escalate tests.
+        let tool = zeroclaw_tools::escalate::EscalateToHumanTool::new(
+            std::sync::Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            vec![],
+            std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        );
+        let schema = zeroclaw_api::tool::Tool::parameters_schema(&tool);
+        assert!(
+            schema["properties"]["channel"].is_object(),
+            "escalate_to_human must declare the injected `channel` parameter; schema: {schema}"
+        );
+    }
 }

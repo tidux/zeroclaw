@@ -12,20 +12,22 @@ pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Async counterpart of [`env_test_lock`] for `#[tokio::test]` cases, which
-/// hold the guard across await points. Uses a separate async-aware mutex, so
-/// sync and async env tests must not run concurrently with each other; the
-/// async side additionally serializes on [`env_test_lock`] internally.
-///
-/// Only the binary target has async env-dependent tests (`chat`), so this is
-/// unused in the lib target.
-#[allow(dead_code)]
-pub(crate) async fn env_test_lock_async() -> (
-    tokio::sync::MutexGuard<'static, ()>,
-    std::sync::MutexGuard<'static, ()>,
-) {
-    static ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let async_guard = ASYNC_LOCK.lock().await;
-    let sync_guard = env_test_lock();
-    (async_guard, sync_guard)
+/// Sets an environment variable for the duration of a test and removes it on
+/// drop. Callers MUST hold [`env_test_lock`] for the guard's whole lifetime,
+/// since `std::env` mutation is process-global.
+pub(crate) struct EnvVarGuard(&'static str);
+
+impl EnvVarGuard {
+    pub(crate) fn set(name: &'static str, value: &str) -> Self {
+        // SAFETY: callers serialize on `env_test_lock()`.
+        unsafe { std::env::set_var(name, value) };
+        Self(name)
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: callers serialize on `env_test_lock()`.
+        unsafe { std::env::remove_var(self.0) };
+    }
 }

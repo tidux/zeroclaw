@@ -420,19 +420,35 @@ impl Chat {
     /// Resolve the local `[todotracker]` settings from `zerocode-config.toml`.
     /// Called at every session boundary (new / restart / switch) so the file
     /// stays the single source of truth and a Config-pane save takes effect on
-    /// the next transition. Best-effort: a load failure falls back to defaults.
-    fn resolve_todo_settings() -> crate::todo_tracker::TodoTrackerSettings {
-        crate::config::ensure_and_load(&crate::i18n::config_dir())
-            .map(|cfg| cfg.resolve_todo_tracker())
-            .unwrap_or_default()
+    /// the next transition.
+    ///
+    /// On a load failure (e.g. an invalid `ZEROCODE_todotracker__*` override or
+    /// a malformed section) the `fallback` is returned rather than hard
+    /// defaults, so a transient error does not silently reset a user's tracker
+    /// layout/visibility to the built-ins. The failure is logged so it can be
+    /// diagnosed.
+    fn resolve_todo_settings(
+        fallback: crate::todo_tracker::TodoTrackerSettings,
+    ) -> crate::todo_tracker::TodoTrackerSettings {
+        match crate::config::ensure_and_load(&crate::i18n::config_dir()) {
+            Ok(cfg) => cfg.resolve_todo_tracker(),
+            Err(error) => {
+                eprintln!(
+                    "zerocode: resolving [todotracker] failed ({error:#}); keeping current settings"
+                );
+                fallback
+            }
+        }
     }
 
     async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
         // TodoWrite display is a ZeroCode UI concern owned by
         // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
         // — so read it from the local config file (honoring `--config-dir` /
-        // `ZEROCLAW_CONFIG_DIR`), not over RPC.
-        let todo_settings = Self::resolve_todo_settings();
+        // `ZEROCLAW_CONFIG_DIR`), not over RPC. A fresh pane has no prior
+        // tracker, so a load failure falls back to the built-in defaults.
+        let todo_settings =
+            Self::resolve_todo_settings(crate::todo_tracker::TodoTrackerSettings::default());
 
         // Reattach to a carried-over session on reconnect (one-shot); else a
         // fresh session. `session_new_with_id`/`_acp` with Some(id) restores
@@ -563,7 +579,8 @@ impl Chat {
             Ok(s) => {
                 let old_session_id = state.session_id.clone();
                 let _ = rpc.session_close(&old_session_id).await;
-                state.reset_for_session(s.session_id, None, Self::resolve_todo_settings());
+                let current = state.todo_tracker.settings();
+                state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
                 state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
@@ -1815,7 +1832,12 @@ impl Chat {
 
         let _ = rpc.session_close(&state.session_id).await;
         state.session_overlay = SessionOverlay::None;
-        state.reset_for_session(new_sid.clone(), new_name, Self::resolve_todo_settings());
+        let current = state.todo_tracker.settings();
+        state.reset_for_session(
+            new_sid.clone(),
+            new_name,
+            Self::resolve_todo_settings(current),
+        );
         state.agent_alias = agent_alias.clone();
         state.cwd = rehydrated.workspace_dir;
 
@@ -6775,6 +6797,23 @@ pub async fn open_editor_for_content(content: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Async env-lock for `#[tokio::test]` cases that resolve config through
+    /// environment variables and hold the guard across await points. Serializes
+    /// on a dedicated async mutex and, internally, on the shared sync
+    /// `env_test_lock` so sync and async env tests never run concurrently.
+    /// Lives here (not in `test_support`) because only the bin target has async
+    /// env-dependent tests, so keeping it module-local avoids a lib-target
+    /// dead-code suppression.
+    async fn env_test_lock_async() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        static ASYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let async_guard = ASYNC_LOCK.lock().await;
+        let sync_guard = crate::test_support::env_test_lock();
+        (async_guard, sync_guard)
+    }
+
     fn state() -> ChatState {
         ChatState::new(
             "sess-1".to_string(),
@@ -7490,7 +7529,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_reloads_local_todo_settings() {
-        let _lock = crate::test_support::env_test_lock_async().await;
+        let _lock = env_test_lock_async().await;
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::set(dir.path());
 
@@ -7549,7 +7588,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_switch_reloads_local_todo_settings() {
-        let _lock = crate::test_support::env_test_lock_async().await;
+        let _lock = env_test_lock_async().await;
         let dir = tempfile::tempdir().unwrap();
         let _guard = ConfigDirGuard::set(dir.path());
 
@@ -7610,6 +7649,44 @@ mod tests {
         assert!(
             state.todo_tracker.is_visible(),
             "session switch must honor the newly saved enabled_at_start"
+        );
+    }
+
+    // A transition-time config load failure (here: an unknown, hard-erroring
+    // `ZEROCODE_todotracker__*` override) must NOT silently reset the tracker
+    // to built-in defaults. `resolve_todo_settings` returns the supplied
+    // fallback so a restart/switch keeps the user's current layout.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_load_error() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // The in-use settings differ from the built-in defaults.
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+        assert_ne!(
+            current,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+            "fallback must be distinguishable from defaults for this test to mean anything"
+        );
+
+        // An unknown override makes `ensure_and_load` hard-error.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        assert!(
+            crate::config::ensure_and_load(dir.path()).is_err(),
+            "precondition: the bogus override should make resolution fail"
+        );
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a load error must keep the current settings, not reset to defaults"
         );
     }
 

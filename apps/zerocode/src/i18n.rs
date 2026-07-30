@@ -247,13 +247,13 @@ mod tests {
             "zc-zerocode-tracker-width",
             "zc-zerocode-tracker-max-height",
             "zc-zerocode-tracker-saved",
+            "zc-zerocode-tracker-saved-env-override",
             "zc-zerocode-tracker-edit-number",
             "zc-zerocode-tracker-edit-bool",
             "zc-zerocode-tracker-edit-location",
             // Shared Config-pane validation/status keys
             "zc-zerocode-config-invalid-number",
             "zc-zerocode-config-positive-required",
-            "zc-zerocode-config-width-order",
             "zc-zerocode-config-save-mismatch",
             // Help hints
             "zc-zerocode-help-todo-tracker",

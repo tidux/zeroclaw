@@ -246,14 +246,12 @@ impl Default for TodoTrackerSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiSectionValidationError {
     PositiveRequired,
-    WidthOrder,
 }
 
 impl std::fmt::Display for UiSectionValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PositiveRequired => f.write_str("numeric values must be greater than zero"),
-            Self::WidthOrder => f.write_str("queue widths must satisfy min <= default <= max"),
         }
     }
 }
@@ -1401,22 +1399,7 @@ mod tests {
     // variables through `ensure_and_load` rather than calling `set_prop`
     // directly, so the public spelling stays covered.
 
-    use crate::test_support::env_test_lock;
-
-    struct EnvVarGuard(&'static str);
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            // SAFETY: these tests serialize on `env_test_lock()`.
-            unsafe { std::env::set_var(name, value) };
-            Self(name)
-        }
-    }
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: these tests serialize on `env_test_lock()`.
-            unsafe { std::env::remove_var(self.0) };
-        }
-    }
+    use crate::test_support::{EnvVarGuard, env_test_lock};
 
     #[test]
     fn canonical_env_spelling_overrides_tracker_field() {

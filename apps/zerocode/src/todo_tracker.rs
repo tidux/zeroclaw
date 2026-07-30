@@ -22,12 +22,10 @@ pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
     visible: bool,
     has_ever_popped: bool,
-    location: TodoLocation,
-    enabled: bool,
-    /// Side-panel target column width (left/right); runtime-clamped.
-    width: u16,
-    /// Bottom-strip max height in rows (grows up to this).
-    max_height: u16,
+    /// The resolved settings this tracker was built from. Retained so the
+    /// active settings can be read back (e.g. as a fallback when a later
+    /// config reload fails) without losing `enabled_at_start`.
+    settings: TodoTrackerSettings,
 }
 
 impl TodoTracker {
@@ -37,10 +35,7 @@ impl TodoTracker {
             entries: Vec::new(),
             visible: settings.enabled && settings.enabled_at_start,
             has_ever_popped: false,
-            location: settings.location,
-            enabled: settings.enabled,
-            width: settings.width,
-            max_height: settings.max_height,
+            settings,
         }
     }
 
@@ -54,36 +49,35 @@ impl TodoTracker {
         })
     }
 
+    /// The settings this tracker is currently running with.
+    pub(crate) fn settings(&self) -> TodoTrackerSettings {
+        self.settings
+    }
+
     pub(crate) fn location(&self) -> TodoLocation {
-        self.location
+        self.settings.location
     }
 
     /// Side-panel target column width from config (left/right).
     pub(crate) fn width(&self) -> u16 {
-        self.width
+        self.settings.width
     }
 
     /// Bottom-strip max height from config.
     pub(crate) fn max_height(&self) -> u16 {
-        self.max_height
+        self.settings.max_height
     }
 
     /// Replace the plan wholesale. On the first non-empty plan of the
     /// session, auto-pop into view exactly once (unless master-disabled).
     pub(crate) fn set_plan(&mut self, entries: Vec<PlanEntry>) {
         self.entries = entries;
-        if self.enabled && !self.has_ever_popped && !self.entries.is_empty() {
+        if self.settings.enabled && !self.has_ever_popped && !self.entries.is_empty() {
             self.visible = true;
             self.has_ever_popped = true;
         }
     }
 
-    /// Clear per-session state when the Code pane switches to (or starts) a
-    /// different session. The plan is per-session, so it must not carry over:
-    /// drop the entries, re-arm the one-time auto-pop, and restore the
-    /// configured launch visibility (`enabled_at_start`). Config-derived layout
-    /// (location/width/max_height) and the master `enabled` gate are per-install
-    /// and are left untouched.
     /// Rebuild the tracker for a newly-entered session from freshly resolved
     /// settings. The plan is per-session, so entries are dropped and the
     /// one-time auto-pop is re-armed; layout/visibility come from `settings`
@@ -95,13 +89,13 @@ impl TodoTracker {
 
     /// User show/hide. Inert while master-disabled.
     pub(crate) fn toggle(&mut self) {
-        if self.enabled {
+        if self.settings.enabled {
             self.visible = !self.visible;
         }
     }
 
     pub(crate) fn is_visible(&self) -> bool {
-        self.enabled && self.visible
+        self.settings.enabled && self.visible
     }
 
     #[cfg(test)]
@@ -128,7 +122,7 @@ impl TodoTracker {
         if !self.is_visible() {
             return false;
         }
-        match self.location {
+        match self.settings.location {
             TodoLocation::Left | TodoLocation::Right => true,
             TodoLocation::Bottom => !self.entries.is_empty(),
         }

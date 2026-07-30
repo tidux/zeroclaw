@@ -1377,7 +1377,6 @@ impl ZerocodePane {
             config::UiSectionValidationError::PositiveRequired => {
                 "zc-zerocode-config-positive-required"
             }
-            config::UiSectionValidationError::WidthOrder => "zc-zerocode-config-width-order",
         };
         self.status = Some(crate::i18n::t(key));
     }
@@ -1402,14 +1401,27 @@ impl ZerocodePane {
         // the success status reflects what was actually written to disk.
         match config::load_persisted(&self.config_dir) {
             Ok(loaded) => {
-                let resolved_matches = loaded.resolve_todo_tracker() == candidate.resolve();
-                if loaded.todotracker != candidate || !resolved_matches {
+                let persisted_resolved = loaded.resolve_todo_tracker();
+                if loaded.todotracker != candidate || persisted_resolved != candidate.resolve() {
                     self.tracker = loaded.todotracker;
                     self.status = Some(crate::i18n::t("zc-zerocode-config-save-mismatch"));
                     return;
                 }
                 self.tracker = candidate;
-                self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved"));
+                // The write to disk is correct, but new sessions resolve
+                // through `ensure_and_load`, which layers `ZEROCODE_todotracker__*`
+                // environment overrides on top. If such an override shadows this
+                // section the effective value differs from what we just saved, so
+                // report that honestly instead of promising the disk value.
+                let effective_differs = config::ensure_and_load(&self.config_dir)
+                    .map(|effective| effective.resolve_todo_tracker() != persisted_resolved)
+                    .unwrap_or(false);
+                let key = if effective_differs {
+                    "zc-zerocode-tracker-saved-env-override"
+                } else {
+                    "zc-zerocode-tracker-saved"
+                };
+                self.status = Some(crate::i18n::t(key));
             }
             Err(error) => self.set_ui_save_error(&error),
         }
@@ -2031,9 +2043,72 @@ mod tests {
         );
     }
 
-    // The Locale tab is a pick-from-list surface with no free-entry, so the
-    // pane never claims text input — typing a locale code by hand was removed
-    // because it implied users could conjure locales the build does not ship.
+    // A save writes to disk correctly, but runtime sessions resolve through
+    // `ensure_and_load`, which layers `ZEROCODE_todotracker__*` overrides on
+    // top. When such an override shadows the saved field, the pane must not
+    // promise that new sessions will use the just-saved value — it reports the
+    // env-override status instead so the feedback stays truthful.
+    #[test]
+    fn tracker_save_reports_env_override_when_active() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        // An override pins width to 77 for every resolved session.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // The user saves width 52. It lands on disk verbatim...
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .width,
+            52
+        );
+        // ...but the next session still resolves 77 via the override, so the
+        // feedback must say so rather than claim sessions will use 52.
+        assert_eq!(
+            config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker()
+                .width,
+            77
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
+    // Without an active override the ordinary success message stands: the
+    // saved value is exactly what the next session resolves.
+    #[test]
+    fn tracker_save_reports_plain_success_without_override() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+
+        assert_eq!(
+            config::ensure_and_load(dir.path())
+                .unwrap()
+                .resolve_todo_tracker()
+                .width,
+            52
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
     #[test]
     fn locale_tab_never_claims_text_input() {
         let dir = tempfile::tempdir().unwrap();

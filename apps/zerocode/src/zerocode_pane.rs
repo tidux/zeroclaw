@@ -1968,6 +1968,93 @@ mod tests {
         pane.handle_tracker_edit_key(key(KeyCode::Enter));
     }
 
+    // Current-head smoke of the Config-pane Todo-tracker save path, driven
+    // through the real edit/persist/resolve functions (no interactive TUI is
+    // available in CI). Run with:
+    //   cargo test -p zerocode --bin zerocode -- --ignored --nocapture smoke_config_pane_save
+    // Prints the observable status/disk/effective values for each scenario so
+    // the user-facing contract can be eyeballed. Serializes on the env lock
+    // because it mutates process env.
+    #[test]
+    #[ignore = "current-head smoke; run explicitly with --ignored --nocapture"]
+    fn smoke_config_pane_save_tracker_flow() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+
+        let disk = |d: &std::path::Path| config::load_persisted(d).unwrap().todotracker.width;
+        let effective = |d: &std::path::Path| {
+            config::ensure_and_load(d)
+                .unwrap()
+                .resolve_todo_tracker()
+                .width
+        };
+
+        eprintln!("── SMOKE: Config-pane Todo-tracker save (current head) ──");
+
+        // Scenario A: no override — a saved value is exactly what sessions use.
+        {
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "48");
+            eprintln!(
+                "A. no override      -> saved width 48 | disk={} | effective={} | status={:?}",
+                disk(dir.path()),
+                effective(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), 48);
+            assert_eq!(effective(dir.path()), 48);
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+            );
+        }
+
+        // Scenario B: an active ZEROCODE_todotracker__width override shadows the
+        // save — the pane must not claim sessions will use the saved value.
+        {
+            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "52");
+            eprintln!(
+                "B. width override=77 -> saved width 52 | disk={} | effective={} | status={:?}",
+                disk(dir.path()),
+                effective(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(
+                disk(dir.path()),
+                52,
+                "the edit still lands on disk verbatim"
+            );
+            assert_eq!(effective(dir.path()), 77, "sessions still see the override");
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved-env-override").as_str())
+            );
+        }
+
+        // Scenario C: a malformed edit is rejected, not silently saved.
+        {
+            let mut pane = ZerocodePane::new(dir.path());
+            let before = disk(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
+            eprintln!(
+                "C. malformed edit    -> disk unchanged ({}={}) | status={:?}",
+                before,
+                disk(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), before, "malformed edit must not persist");
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
+            );
+        }
+
+        eprintln!("── SMOKE OK ──");
+    }
+
     #[test]
     fn tracker_malformed_edit_does_not_persist_or_report_success() {
         let dir = tempfile::tempdir().unwrap();

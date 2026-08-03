@@ -2055,6 +2055,26 @@ mod tests {
             );
         }
 
+        // Scenario D: an invalid override makes the effective resolution fail —
+        // the disk write succeeds but the pane must not promise sessions will
+        // use it; it reports the resolve-error status.
+        {
+            let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+            let mut pane = ZerocodePane::new(dir.path());
+            edit_tracker_number(&mut pane, TrackerField::Width, "40");
+            eprintln!(
+                "D. resolve error     -> saved width 40 | disk={} | ensure_and_load=Err | status={:?}",
+                disk(dir.path()),
+                pane.status.as_deref(),
+            );
+            assert_eq!(disk(dir.path()), 40, "the edit still lands on disk");
+            assert!(config::ensure_and_load(dir.path()).is_err());
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+            );
+        }
+
         eprintln!("── SMOKE OK ──");
     }
 

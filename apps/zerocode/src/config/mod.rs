@@ -400,6 +400,32 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     Ok(config)
 }
 
+/// Resolve the effective `[todotracker]` settings for a session boundary,
+/// treating a **present-but-malformed** `[todotracker]` section as an error
+/// rather than silently falling back to defaults.
+///
+/// [`load_persisted`] deliberately tolerates a malformed section (so one bad
+/// block cannot blank unrelated config), which means a botched manual edit
+/// would otherwise resolve to defaults and silently reset a user's live
+/// tracker on restart/switch. This variant re-parses that one section strictly
+/// so the caller can preserve the current settings on failure; a *valid* or
+/// *absent* section resolves exactly as `ensure_and_load` would, with
+/// `ZEROCODE_todotracker__*` overrides applied.
+pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
+    let path = config_path(config_dir);
+    if path.exists() {
+        let doc = load_document(&path)?;
+        if let Some(v) = doc.get("todotracker") {
+            // Strict parse: a malformed section is an error here, unlike the
+            // tolerant `load_persisted` path.
+            v.clone()
+                .try_into::<TodoTrackerSection>()
+                .with_context(|| format!("[todotracker] in {} is malformed", path.display()))?;
+        }
+    }
+    Ok(ensure_and_load(config_dir)?.resolve_todo_tracker())
+}
+
 /// The on-disk config exactly as persisted, with **no** env overrides applied.
 /// This is the correct base for read-modify-write edits (the Config pane), so
 /// a transient `ZEROCODE_*` value can never leak into the saved file.
@@ -1322,6 +1348,46 @@ mod tests {
         let cfg = load_persisted(dir.path()).unwrap();
         assert_eq!(cfg.theme.name, "dracula");
         assert_eq!(cfg.todotracker.width, default_todotracker_width());
+    }
+
+    // The tolerant `load_persisted` path substitutes defaults for a malformed
+    // `[todotracker]`, but the transition resolver must instead see an error so
+    // it can preserve the live tracker rather than silently reset to defaults.
+    #[test]
+    fn resolve_todo_tracker_checked_errors_on_malformed_section() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
+        );
+        let err = resolve_todo_tracker_checked(dir.path())
+            .expect_err("a malformed [todotracker] must surface as an error");
+        assert!(
+            format!("{err:#}").contains("[todotracker]")
+                && format!("{err:#}").contains("malformed"),
+            "error should name the malformed section, got: {err:#}"
+        );
+    }
+
+    // A valid section resolves normally through the checked path.
+    #[test]
+    fn resolve_todo_tracker_checked_ok_on_valid_section() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[todotracker]\nwidth = 41\nmax_height = 6\n");
+        let settings =
+            resolve_todo_tracker_checked(dir.path()).expect("a valid [todotracker] must resolve");
+        assert_eq!(settings.width, 41);
+        assert_eq!(settings.max_height, 6);
+    }
+
+    // An absent section resolves to defaults (not an error).
+    #[test]
+    fn resolve_todo_tracker_checked_ok_when_section_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[theme]\nname = \"dracula\"\n");
+        let settings = resolve_todo_tracker_checked(dir.path())
+            .expect("an absent [todotracker] must resolve to defaults");
+        assert_eq!(settings.width, default_todotracker_width());
     }
 
     // ── Env override tests ──────────────────────────────────────────────────

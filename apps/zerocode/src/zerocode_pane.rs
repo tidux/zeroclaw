@@ -1410,16 +1410,19 @@ impl ZerocodePane {
                 self.tracker = candidate;
                 // The write to disk is correct, but new sessions resolve
                 // through `ensure_and_load`, which layers `ZEROCODE_todotracker__*`
-                // environment overrides on top. If such an override shadows this
-                // section the effective value differs from what we just saved, so
-                // report that honestly instead of promising the disk value.
-                let effective_differs = config::ensure_and_load(&self.config_dir)
-                    .map(|effective| effective.resolve_todo_tracker() != persisted_resolved)
-                    .unwrap_or(false);
-                let key = if effective_differs {
-                    "zc-zerocode-tracker-saved-env-override"
-                } else {
-                    "zc-zerocode-tracker-saved"
+                // environment overrides on top. Report what the next session
+                // will actually see:
+                //   - resolves to the saved value  -> plain success
+                //   - resolves to a different value -> an override shadows it
+                //   - resolution fails              -> the value may not apply
+                // so the ordinary "sessions will use this" is never shown when
+                // the effective outcome does not match the saved value.
+                let key = match config::ensure_and_load(&self.config_dir) {
+                    Ok(effective) if effective.resolve_todo_tracker() != persisted_resolved => {
+                        "zc-zerocode-tracker-saved-env-override"
+                    }
+                    Ok(_) => "zc-zerocode-tracker-saved",
+                    Err(_) => "zc-zerocode-tracker-saved-resolve-error",
                 };
                 self.status = Some(crate::i18n::t(key));
             }
@@ -2196,6 +2199,46 @@ mod tests {
             Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
         );
     }
+
+    // When the effective resolution itself fails (here: a bogus, hard-erroring
+    // ZEROCODE_todotracker__* override), a disk write still succeeds — but the
+    // pane must not claim "New Code sessions will use this", because the next
+    // session's resolution errors. It reports the distinct resolve-error status.
+    #[test]
+    fn tracker_save_reports_resolve_error_when_effective_resolution_fails() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+
+        // An unknown override makes ensure_and_load hard-error.
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+        assert!(
+            config::ensure_and_load(dir.path()).is_err(),
+            "precondition: the bogus override should make effective resolution fail"
+        );
+
+        edit_tracker_number(&mut pane, TrackerField::Width, "52");
+
+        // The edit still lands on disk...
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .width,
+            52
+        );
+        // ...but the status reflects the resolution failure, not plain success.
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved-resolve-error").as_str())
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str())
+        );
+    }
+
     #[test]
     fn locale_tab_never_claims_text_input() {
         let dir = tempfile::tempdir().unwrap();

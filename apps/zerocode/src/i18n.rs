@@ -248,6 +248,7 @@ mod tests {
             "zc-zerocode-tracker-max-height",
             "zc-zerocode-tracker-saved",
             "zc-zerocode-tracker-saved-env-override",
+            "zc-zerocode-tracker-saved-resolve-error",
             "zc-zerocode-tracker-edit-number",
             "zc-zerocode-tracker-edit-bool",
             "zc-zerocode-tracker-edit-location",

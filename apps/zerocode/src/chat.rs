@@ -430,8 +430,8 @@ impl Chat {
     fn resolve_todo_settings(
         fallback: crate::todo_tracker::TodoTrackerSettings,
     ) -> crate::todo_tracker::TodoTrackerSettings {
-        match crate::config::ensure_and_load(&crate::i18n::config_dir()) {
-            Ok(cfg) => cfg.resolve_todo_tracker(),
+        match crate::config::resolve_todo_tracker_checked(&crate::i18n::config_dir()) {
+            Ok(settings) => settings,
             Err(error) => {
                 eprintln!(
                     "zerocode: resolving [todotracker] failed ({error:#}); keeping current settings"
@@ -7687,6 +7687,39 @@ mod tests {
         assert_eq!(
             resolved, current,
             "a load error must keep the current settings, not reset to defaults"
+        );
+    }
+
+    // A malformed on-disk `[todotracker]` section is tolerated by
+    // `load_persisted` (defaults substituted), which previously let a botched
+    // manual edit silently reset the live tracker on restart/switch. The
+    // checked transition resolver must instead treat it as an error and keep
+    // the current settings.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_malformed_disk_section() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        // A hand-edited, malformed section on disk (width is not a number).
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = \"oops\"\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "a malformed on-disk section must keep current settings, not reset to defaults"
         );
     }
 

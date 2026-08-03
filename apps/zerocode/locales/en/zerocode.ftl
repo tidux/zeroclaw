@@ -61,6 +61,7 @@ zc-zerocode-tracker-width = Side panel width
 zc-zerocode-tracker-max-height = Bottom max height
 zc-zerocode-tracker-saved = Saved. New Code sessions will use this.
 zc-zerocode-tracker-saved-env-override = Saved to disk, but a ZEROCODE_todotracker__* environment override is active, so new sessions will use the override value until it is unset.
+zc-zerocode-tracker-saved-resolve-error = Saved to disk, but resolving the effective settings failed (check ZEROCODE_todotracker__* overrides); new sessions may not use this value until it is fixed.
 zc-zerocode-tracker-edit-number = Enter to save, Esc to cancel.
 zc-zerocode-tracker-edit-bool = Enter toggles; this field saves on toggle.
 zc-zerocode-tracker-edit-location = Enter cycles bottom / left / right.

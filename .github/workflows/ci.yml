@@ -148,7 +148,9 @@ jobs:
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
       - name: Rustdoc warnings gate
-        run: cargo doc --no-deps --workspace
+        # Exclude zeroclaw-desktop: same surface as xtask build_api / docs-deploy.
+        # Desktop pulls glib-sys on Linux; the lint runner does not install GTK libs.
+        run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
       - name: Config-write isolation guard
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)

@@ -28,7 +28,8 @@ explicitly.
 
 Some settings describe how *zerocode itself* draws its panes rather than how the
 daemon behaves. Those live in zerocode's own file,
-`<config-dir>/zerocode-config.toml`, and are edited from **Config → UI**.
+`<config-dir>/zerocode-config.toml`, and are edited from zerocode's **Config**
+pane.
 
 The TodoWrite tracker is one of them. It is a display-only concern: the daemon
 just emits plan updates, and over ACP the client controls formatting entirely,
@@ -69,7 +70,7 @@ Before this setting moved, `[todotracker]` was a section of the *daemon's*
 
 1. Open your daemon `config.toml` and note the `[todotracker]` values.
 2. Put the same block into `<config-dir>/zerocode-config.toml` (shown above), or
-   set them from **Config → UI → Todo tracker**.
+   set them from **Config → Todo tracker**.
 3. Delete the `[todotracker]` section from the daemon `config.toml`.
 
 Existing `ZEROCLAW_todotracker__*` environment variables do **not** need to be

@@ -180,9 +180,14 @@ impl Default for TodoTrackerSection {
 }
 
 impl TodoTrackerSection {
-    /// Reject values that the runtime resolver would otherwise normalize.
-    /// Config-pane saves call this before persistence so a success message
-    /// always describes the values the next session will consume.
+    /// Reject values that must never reach the runtime.
+    ///
+    /// Run at **every** authoritative boundary: Config-pane saves call it
+    /// before persistence so a success message always describes the values
+    /// the next session will consume, and [`resolve_todo_tracker_checked`]
+    /// calls it on the effective (post-env-override) section so hand-edited
+    /// files and `ZEROCODE_todotracker__*` overrides fail visibly instead of
+    /// being normalized. RFC #9246 §5.
     pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
         if self.width == 0 || self.max_height == 0 {
             return Err(UiSectionValidationError::PositiveRequired);
@@ -190,6 +195,17 @@ impl TodoTrackerSection {
         Ok(())
     }
 
+    /// Infallible view used by non-authoritative callers (e.g. the Config
+    /// pane's persisted-vs-effective comparison), which must render something
+    /// rather than fail.
+    ///
+    /// The `.max(1)` here is a last-resort clamp so a zero can never collapse
+    /// the panel if some future caller bypasses validation — it is **not** the
+    /// authority on validity. Explicit zeros from the file or the environment
+    /// are rejected by [`ZerocodeConfig::validate_todo_tracker`], which every
+    /// session boundary runs via [`resolve_todo_tracker_checked`], per
+    /// RFC #9246 §5 ("explicit zero values ... must not be silently
+    /// normalized to `1`").
     pub(crate) fn resolve(&self) -> TodoTrackerSettings {
         TodoTrackerSettings {
             enabled: self.enabled,
@@ -373,13 +389,19 @@ impl ZerocodeConfig {
     /// Convert the `[todotracker]` section into the runtime settings type
     /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
     ///
-    /// Values are validated/normalized here — this is the canonical
-    /// config boundary, and the section fields are operator-supplied and
-    /// therefore untrusted. `width` and `max_height` are floored at `1`
-    /// so a `0` (which would collapse the panel/strip) can never reach
-    /// the runtime.
+    /// This is the infallible view. Validity is enforced separately by
+    /// [`Self::validate_todo_tracker`] at the authoritative boundaries, so
+    /// an explicit zero surfaces an error instead of being normalized.
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
         self.todotracker.resolve()
+    }
+
+    /// Validate the effective `[todotracker]` section, whatever its origin
+    /// (file, defaults, or `ZEROCODE_todotracker__*` override).
+    pub(crate) fn validate_todo_tracker(
+        &self,
+    ) -> std::result::Result<(), UiSectionValidationError> {
+        self.todotracker.validate()
     }
 }
 
@@ -411,6 +433,12 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// so the caller can preserve the current settings on failure; a *valid* or
 /// *absent* section resolves exactly as `ensure_and_load` would, with
 /// `ZEROCODE_todotracker__*` overrides applied.
+///
+/// The effective section is validated **after** env overrides are applied, so
+/// an explicit zero `width`/`max_height` fails visibly whether it came from
+/// the file or from the canonical environment surface, rather than being
+/// normalized to `1` (RFC #9246 §5). Callers keep their current settings on
+/// error, so an invalid value never resets a live tracker to defaults.
 pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
     let path = config_path(config_dir);
     if path.exists() {
@@ -423,7 +451,11 @@ pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrac
                 .with_context(|| format!("[todotracker] in {} is malformed", path.display()))?;
         }
     }
-    Ok(ensure_and_load(config_dir)?.resolve_todo_tracker())
+    let config = ensure_and_load(config_dir)?;
+    config
+        .validate_todo_tracker()
+        .map_err(|e| anyhow::Error::msg(format!("[todotracker] is invalid: {e}")))?;
+    Ok(config.resolve_todo_tracker())
 }
 
 /// The on-disk config exactly as persisted, with **no** env overrides applied.
@@ -1415,14 +1447,93 @@ mod tests {
 
     // ── Resolver validation / normalization (untrusted config boundary) ──────
 
+    // ── Zero-dimension rejection (RFC #9246 §5) ─────────────────────────────
+    //
+    // Explicit zero `width`/`max_height` must fail *visibly* at the session
+    // boundary rather than being silently normalized to 1 — for file values
+    // and for canonical environment overrides alike. The Config-pane edit
+    // path is covered separately by the pane's own save tests.
+
     #[test]
-    fn resolve_todo_tracker_floors_zero_width_and_height() {
-        let mut c = ZerocodeConfig::default();
-        c.todotracker.width = 0;
-        c.todotracker.max_height = 0;
-        let s = c.resolve_todo_tracker();
-        assert_eq!(s.width, 1, "tracker width=0 must be floored to 1");
-        assert_eq!(s.max_height, 1, "tracker max_height=0 must be floored to 1");
+    fn resolve_todo_tracker_checked_rejects_zero_width_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let err = resolve_todo_tracker_checked(dir.path())
+            .expect_err("an explicit width = 0 in the file must fail, not normalize to 1");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("todotracker"),
+            "error must name the offending section, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 0\n",
+        )
+        .unwrap();
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "an explicit max_height = 0 in the file must fail, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_width_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // File is valid; only the canonical env override carries the zero, so
+        // this pins that validation happens *after* overrides are applied.
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 5\n",
+        )
+        .unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "ZEROCODE_todotracker__width=0 must fail visibly, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_rejects_zero_max_height_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_err(),
+            "ZEROCODE_todotracker__max_height=0 must fail visibly, not normalize to 1"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_positive_dimensions() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 44\nmax_height = 9\n",
+        )
+        .unwrap();
+
+        let s = resolve_todo_tracker_checked(dir.path())
+            .expect("a valid section must still resolve unchanged");
+        assert_eq!(s.width, 44);
+        assert_eq!(s.max_height, 9);
     }
 
     // ── Single source of truth ──────────────────────────────────────────────

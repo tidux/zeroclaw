@@ -1418,6 +1418,13 @@ impl ZerocodePane {
                 // so the ordinary "sessions will use this" is never shown when
                 // the effective outcome does not match the saved value.
                 let key = match config::ensure_and_load(&self.config_dir) {
+                    // An effective section that a session boundary would
+                    // reject (e.g. `ZEROCODE_todotracker__width=0`) must not
+                    // be reported as a mere shadowing override — the next
+                    // session keeps its current settings instead.
+                    Ok(effective) if effective.validate_todo_tracker().is_err() => {
+                        "zc-zerocode-tracker-saved-resolve-error"
+                    }
                     Ok(effective) if effective.resolve_todo_tracker() != persisted_resolved => {
                         "zc-zerocode-tracker-saved-env-override"
                     }

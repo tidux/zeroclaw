@@ -7908,6 +7908,63 @@ mod tests {
         );
     }
 
+    // An explicit zero dimension (RFC #9246 §5) must fail visibly at the
+    // session boundary rather than normalizing to 1. At *this* layer, "fail
+    // visibly" means the transition keeps the user's current settings and logs
+    // the error instead of silently rendering a collapsed 1-cell tracker.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        std::fs::write(
+            crate::config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "an explicit width = 0 must keep current settings, never resolve to a 1-cell tracker"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
+    // Same contract via the canonical environment surface.
+    #[tokio::test]
+    async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_env() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        let _v = crate::test_support::EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        let current = crate::todo_tracker::TodoTrackerSettings {
+            enabled: true,
+            enabled_at_start: true,
+            location: crate::todo_tracker::TodoLocation::Bottom,
+            width: 44,
+            max_height: 7,
+        };
+
+        let resolved = Chat::resolve_todo_settings(current);
+        assert_eq!(
+            resolved, current,
+            "ZEROCODE_todotracker__width=0 must keep current settings, not normalize to 1"
+        );
+        assert_ne!(resolved.width, 1, "the zero must not be normalized to 1");
+    }
+
     #[tokio::test]
     async fn open_picker_makes_chat_claim_text_input() {
         // While the picker is open the pane is modal (claims text-input so

@@ -7908,10 +7908,10 @@ mod tests {
         );
     }
 
-    // An explicit zero dimension (RFC #9246 §5) must fail visibly at the
-    // session boundary rather than normalizing to 1. At *this* layer, "fail
-    // visibly" means the transition keeps the user's current settings and logs
-    // the error instead of silently rendering a collapsed 1-cell tracker.
+    // An explicit zero dimension must fail visibly at the session boundary
+    // rather than normalizing to 1. At *this* layer, "fail visibly" means the
+    // transition keeps the user's current settings and logs the error instead
+    // of silently rendering a collapsed 1-cell tracker.
     #[tokio::test]
     async fn resolve_todo_settings_preserves_fallback_on_zero_width_from_file() {
         let _lock = env_test_lock_async().await;

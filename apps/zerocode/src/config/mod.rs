@@ -187,7 +187,7 @@ impl TodoTrackerSection {
     /// the next session will consume, and [`resolve_todo_tracker_checked`]
     /// calls it on the effective (post-env-override) section so hand-edited
     /// files and `ZEROCODE_todotracker__*` overrides fail visibly instead of
-    /// being normalized. RFC #9246 §5.
+    /// being normalized.
     pub(crate) fn validate(&self) -> std::result::Result<(), UiSectionValidationError> {
         if self.width == 0 || self.max_height == 0 {
             return Err(UiSectionValidationError::PositiveRequired);
@@ -201,11 +201,10 @@ impl TodoTrackerSection {
     ///
     /// The `.max(1)` here is a last-resort clamp so a zero can never collapse
     /// the panel if some future caller bypasses validation — it is **not** the
-    /// authority on validity. Explicit zeros from the file or the environment
-    /// are rejected by [`ZerocodeConfig::validate_todo_tracker`], which every
-    /// session boundary runs via [`resolve_todo_tracker_checked`], per
-    /// RFC #9246 §5 ("explicit zero values ... must not be silently
-    /// normalized to `1`").
+    /// authority on validity. An explicit zero from the file or the
+    /// environment must fail visibly rather than be silently normalized to
+    /// `1`, which is enforced by [`ZerocodeConfig::validate_todo_tracker`];
+    /// every session boundary runs it via [`resolve_todo_tracker_checked`].
     pub(crate) fn resolve(&self) -> TodoTrackerSettings {
         TodoTrackerSettings {
             enabled: self.enabled,
@@ -437,8 +436,8 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
 /// The effective section is validated **after** env overrides are applied, so
 /// an explicit zero `width`/`max_height` fails visibly whether it came from
 /// the file or from the canonical environment surface, rather than being
-/// normalized to `1` (RFC #9246 §5). Callers keep their current settings on
-/// error, so an invalid value never resets a live tracker to defaults.
+/// normalized to `1`. Callers keep their current settings on error, so an
+/// invalid value never resets a live tracker to defaults.
 pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
     let path = config_path(config_dir);
     if path.exists() {
@@ -1447,7 +1446,7 @@ mod tests {
 
     // ── Resolver validation / normalization (untrusted config boundary) ──────
 
-    // ── Zero-dimension rejection (RFC #9246 §5) ─────────────────────────────
+    // ── Zero-dimension rejection ────────────────────────────────────────────
     //
     // Explicit zero `width`/`max_height` must fail *visibly* at the session
     // boundary rather than being silently normalized to 1 — for file values

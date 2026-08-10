@@ -289,6 +289,18 @@ mod tests {
             ),
             "{zc-zerocode-config-save-failed}"
         );
+
+        // The malformed-section prompt carries the parser detail, so it is
+        // argument-bearing too and cannot be checked by the no-arg loop above.
+        let load_error = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-tracker-load-error",
+            &[("error", "invalid type: string")],
+        )
+        .expect("argument-bearing tracker load error key must format");
+        assert!(load_error.contains("invalid type: string"));
+        assert!(load_error.contains("[todotracker]"));
     }
 
     #[test]

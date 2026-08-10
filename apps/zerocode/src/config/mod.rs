@@ -457,6 +457,34 @@ pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrac
     Ok(config.resolve_todo_tracker())
 }
 
+/// The persisted `[todotracker]` section, parsed **strictly**.
+///
+/// [`load_persisted`] tolerates a malformed section by substituting defaults so
+/// one bad block cannot blank unrelated config. That is right for rendering,
+/// but wrong for an *editor*: editing a phantom default and saving it would
+/// overwrite the user's unparseable canonical text — the very text they need in
+/// order to repair it, on the supported manual-upgrade path. The Config pane
+/// uses this instead so it can refuse edits and surface the error.
+///
+/// `Ok(None)` means the section is absent (a fresh file), which is editable
+/// from defaults; `Err` means present-but-malformed.
+pub(crate) fn load_persisted_todotracker_strict(
+    config_dir: &Path,
+) -> Result<Option<TodoTrackerSection>> {
+    let path = config_path(config_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let doc = load_document(&path)?;
+    let Some(v) = doc.get("todotracker") else {
+        return Ok(None);
+    };
+    v.clone()
+        .try_into::<TodoTrackerSection>()
+        .map(Some)
+        .with_context(|| format!("[todotracker] in {} is malformed", path.display()))
+}
+
 /// The on-disk config exactly as persisted, with **no** env overrides applied.
 /// This is the correct base for read-modify-write edits (the Config pane), so
 /// a transient `ZEROCODE_*` value can never leak into the saved file.
@@ -982,6 +1010,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_round_trips_through_resolver() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
         let cfg = ensure_and_load(dir.path()).unwrap();
@@ -991,6 +1022,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_clear_removes_entry() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_agent_theme(dir.path(), "a", "dracula").unwrap();
         persist_agent_theme(dir.path(), "b", "nord_dark").unwrap();
@@ -1014,6 +1048,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_clear_is_noop_when_absent() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[theme]\nname = \"nord_dark\"\n");
         persist_agent_theme_clear(dir.path(), "ghost").unwrap();
@@ -1104,6 +1141,9 @@ mod tests {
 
     #[test]
     fn bad_keybindings_do_not_blank_theme() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         // `"+"` was historically unparseable; even if a future bug
         // re-introduces that, the theme must still load.
@@ -1121,6 +1161,9 @@ mod tests {
 
     #[test]
     fn bad_theme_does_not_blank_keybindings() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -1133,6 +1176,9 @@ mod tests {
 
     #[test]
     fn legacy_help_defaults_migrate_without_touching_other_config() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -1158,6 +1204,9 @@ mod tests {
 
     #[test]
     fn customized_help_binding_is_not_migrated() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -1221,6 +1270,9 @@ mod tests {
 
     #[test]
     fn first_run_file_has_no_connection_section() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         ensure_and_load(dir.path()).unwrap();
         let on_disk = read(dir.path());
@@ -1257,6 +1309,9 @@ mod tests {
 
     #[test]
     fn persist_wss_route_ack_dedups() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
         persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
@@ -1403,6 +1458,10 @@ mod tests {
     // A valid section resolves normally through the checked path.
     #[test]
     fn resolve_todo_tracker_checked_ok_on_valid_section() {
+        // Resolves through `ensure_and_load`, which *reads* the environment, so
+        // this must serialize against the env-mutating tests below even though
+        // it sets nothing itself.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[todotracker]\nwidth = 41\nmax_height = 6\n");
         let settings =
@@ -1414,6 +1473,7 @@ mod tests {
     // An absent section resolves to defaults (not an error).
     #[test]
     fn resolve_todo_tracker_checked_ok_when_section_absent() {
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[theme]\nname = \"dracula\"\n");
         let settings = resolve_todo_tracker_checked(dir.path())

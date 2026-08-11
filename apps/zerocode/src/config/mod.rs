@@ -667,10 +667,33 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 
 /// Persist the entire `[todotracker]` section, editing only that section.
 /// Other sections (theme, keybindings, connection, etc.) are preserved.
+/// Persist the `[todotracker]` section, preserving every other section.
+///
+/// This is the owning read-modify-write boundary, so it enforces the
+/// preservation invariant for the section it replaces: if a `[todotracker]`
+/// section is currently present but does not parse, the write is refused.
+/// A caller's snapshot of "the section was fine" can be arbitrarily old — a
+/// Config pane may stay open indefinitely while an external editor rewrites
+/// the file — so validating the *candidate* alone is not enough. Only the
+/// latest document, which this function already loads, can answer whether the
+/// text about to be overwritten is the user's unparseable canonical data.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
     section.validate()?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
+    // Strictly re-check the section as it exists *now*, immediately before
+    // replacing it. An absent section is fine (nothing to preserve).
+    if let Some(current) = doc.get("todotracker") {
+        current
+            .clone()
+            .try_into::<TodoTrackerSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to overwrite the malformed [todotracker] section in {}",
+                    path.display()
+                )
+            })?;
+    }
     let serialized = toml::Value::try_from(section)
         .context("serializing todotracker section")?
         .as_table()

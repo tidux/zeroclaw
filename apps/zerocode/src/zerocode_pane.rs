@@ -2175,9 +2175,13 @@ mod tests {
 
         edit_tracker_number(&mut pane, TrackerField::Width, "not-a-number");
 
-        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        // Asserts what is *persisted*, so load without env overrides: this
+        // contract is about the file, and reading through `ensure_and_load`
+        // would let a concurrent `ZEROCODE_todotracker__*` test change the
+        // observed value.
+        let reloaded = config::load_persisted(dir.path()).unwrap();
         assert_eq!(reloaded.todotracker, original);
-        assert_eq!(reloaded.resolve_todo_tracker().width, 40);
+        assert_eq!(reloaded.todotracker.width, 40);
         assert_eq!(
             pane.status.as_deref(),
             Some(crate::i18n::t("zc-zerocode-config-invalid-number").as_str())
@@ -2204,9 +2208,10 @@ mod tests {
 
         edit_tracker_number(&mut pane, TrackerField::Width, "0");
 
-        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        // Persisted-only: the contract is that nothing was written to disk.
+        let reloaded = config::load_persisted(dir.path()).unwrap();
         assert_eq!(reloaded.todotracker, original);
-        assert_eq!(reloaded.resolve_todo_tracker().width, 40);
+        assert_eq!(reloaded.todotracker.width, 40);
         assert_eq!(
             pane.status.as_deref(),
             Some(crate::i18n::t("zc-zerocode-config-positive-required").as_str())
@@ -2228,7 +2233,9 @@ mod tests {
 
         edit_tracker_number(&mut pane, TrackerField::Width, "52");
 
-        let reloaded = config::ensure_and_load(dir.path()).unwrap();
+        // Persisted-only: this asserts the saved value, not an env-resolved
+        // one, so it must not read through the process-global environment.
+        let reloaded = config::load_persisted(dir.path()).unwrap();
         assert_eq!(reloaded.todotracker.width, 52);
         assert_eq!(reloaded.resolve_todo_tracker().width, 52);
         assert_eq!(pane.tracker.width, 52);
@@ -2245,6 +2252,127 @@ mod tests {
     // canonical data on the next toggle — silently destroying the very text
     // they need to repair, on the supported manual-upgrade path. The pane must
     // instead retain the error, refuse the edit, and leave the file byte-identical.
+    // The refusal is only useful if the user can *see* why. The controller
+    // tests above prove the file is preserved and no success is reported;
+    // this proves the repair warning actually reaches the screen, which is
+    // the part a headless controller assertion cannot show.
+    #[test]
+    fn malformed_tracker_section_renders_a_visible_repair_warning() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nwidth = \"oops\"\n",
+        )
+        .unwrap();
+
+        let mut pane = ZerocodePane::new(dir.path());
+        pane.focus = Focus::TodoTracker;
+
+        let (w, h) = (120u16, 24u16);
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| pane.draw(f, Rect::new(0, 0, w, h))).unwrap();
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("[todotracker]"),
+            "the rendered pane must name the unreadable section"
+        );
+        assert!(
+            rendered.contains("zerocode-config.toml"),
+            "the rendered pane must name the file to repair"
+        );
+        // And it must not render as a raw Fluent identifier.
+        assert!(
+            !rendered.contains("zc-zerocode-tracker-load-error"),
+            "the warning must be a translated string, not its raw key"
+        );
+    }
+
+    // The pane's constructor snapshot is not enough on its own: it can be held
+    // for the whole life of the pane. If the file is valid at open and an
+    // external editor later makes `[todotracker]` malformed, the cached
+    // "no error" state would let the next unrelated save replace that
+    // externally authored text with the pane's stale candidate and report
+    // success. The write boundary itself must re-check what is on disk.
+    #[test]
+    fn tracker_save_preserves_section_made_malformed_after_pane_open() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        // Pane opens on a perfectly valid file, so no load error is recorded.
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        assert!(
+            pane.tracker_load_error.is_none(),
+            "precondition: the pane must open cleanly on valid data"
+        );
+
+        // An external editor rewrites the section into something unparseable.
+        let malformed = "[theme]\nname = \"nord\"\n\n[todotracker]\nwidth = \"clobbered\"\n";
+        std::fs::write(config::config_path(dir.path()), malformed).unwrap();
+
+        // The user now toggles an unrelated field in the still-open pane.
+        pane.tracker_cursor = TRACKER_FIELDS
+            .iter()
+            .position(|c| *c == TrackerField::Enabled)
+            .expect("tracker field is registered");
+        pane.activate_tracker();
+
+        let after = std::fs::read_to_string(config::config_path(dir.path())).unwrap();
+        assert_eq!(
+            after, malformed,
+            "a save must not replace a section that became malformed after pane open"
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            "a refused write must never report a successful save"
+        );
+        // The refusal must be legible, naming the section and the reason,
+        // rather than failing silently or with a bare generic message.
+        let status = pane
+            .status
+            .as_deref()
+            .expect("a refused write must set a status");
+        assert!(
+            status.contains("todotracker"),
+            "the status must name the offending section, got: {status}"
+        );
+    }
+
+    // Same invariant at the owning boundary, independent of any pane state:
+    // `persist_todotracker` must refuse to overwrite a malformed current
+    // section even when handed a perfectly valid candidate.
+    #[test]
+    fn persist_todotracker_refuses_to_replace_a_malformed_current_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "[todotracker]\nmax_height = \"nope\"\n";
+        std::fs::write(config::config_path(dir.path()), malformed).unwrap();
+
+        let err = config::persist_todotracker(dir.path(), &TodoTrackerSection::default())
+            .expect_err("replacing a malformed current section must fail");
+        assert!(
+            format!("{err:#}").contains("todotracker"),
+            "the error must name the offending section, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config::config_path(dir.path())).unwrap(),
+            malformed,
+            "the malformed file must be left byte-identical"
+        );
+    }
+
     #[test]
     fn tracker_toggle_preserves_malformed_persisted_section() {
         let _guard = crate::test_support::env_test_lock();

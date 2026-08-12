@@ -702,7 +702,14 @@ pub(crate) fn persist_todotracker_with_intent(
     section: &TodoTrackerSection,
     intent: TrackerWriteIntent,
 ) -> Result<()> {
-    section.validate()?;
+    // The candidate must be valid, except during an explicit repair: when
+    // several fields are invalid on disk, fixing them one at a time means
+    // every intermediate candidate is still partially invalid. Rejecting
+    // those would make such a section permanently unrepairable. The caller
+    // is responsible for not reporting success until the result is valid.
+    if intent == TrackerWriteIntent::PreserveInvalid {
+        section.validate()?;
+    }
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
     // Re-check the section as it exists *now*, immediately before replacing

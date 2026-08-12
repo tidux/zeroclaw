@@ -220,16 +220,31 @@ pub(crate) struct ZerocodePane {
 /// Status/banner surfaces are a fixed number of rows, so an over-long string
 /// must be cut rather than wrapped: wrapping silently steals rows from the
 /// widgets below it.
+///
+/// Measured in display cells via [`crate::display_width`], not scalars: a wide
+/// glyph (CJK, or an emoji presentation sequence) occupies two cells while
+/// counting as one `char`, so a scalar-based cut would still overflow the row.
+/// Truncation advances by grapheme cluster, so a multi-scalar sequence is never
+/// split down the middle.
 fn truncate_to_width(s: &str, width: u16) -> String {
     let width = width as usize;
     if width == 0 {
         return String::new();
     }
-    if s.chars().count() <= width {
+    if crate::display_width::display_width(s) <= width {
         return s.to_string();
     }
-    let keep = width.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
+    // Reserve one cell for the ellipsis.
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for (_, grapheme, w) in crate::display_width::grapheme_widths(s) {
+        if used + w > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
     out.push('…');
     out
 }
@@ -1535,7 +1550,17 @@ impl ZerocodePane {
             self.set_tracker_load_error_status();
             return;
         }
-        if let Err(error) = candidate.validate() {
+        // A candidate must be valid before it can be written — except during
+        // an explicit repair. When *both* dimensions are invalid on disk,
+        // fixing one at a time necessarily leaves the other invalid, so
+        // rejecting the whole candidate here would make the section
+        // permanently unrepairable from the pane. A repair edit is therefore
+        // allowed to land a partially valid section; the status logic below
+        // still refuses to claim success while the effective section is
+        // invalid, so the user is told there is more to fix.
+        if intent == config::TrackerWriteIntent::PreserveInvalid
+            && let Err(error) = candidate.validate()
+        {
             self.set_ui_validation_error(error);
             return;
         }
@@ -1565,6 +1590,13 @@ impl ZerocodePane {
                 //   - resolution fails              -> the value may not apply
                 // so the ordinary "sessions will use this" is never shown when
                 // the effective outcome does not match the saved value.
+                // A repair that has not finished (the other dimension is still
+                // invalid) landed on disk, but must not report the ordinary
+                // success message: the section is not yet usable.
+                if loaded.todotracker.validate().is_err() {
+                    self.status = Some(crate::i18n::t("zc-zerocode-tracker-saved-still-invalid"));
+                    return;
+                }
                 let key = match config::ensure_and_load(&self.config_dir) {
                     // An effective section that a session boundary would
                     // reject (e.g. `ZEROCODE_todotracker__width=0`) must not
@@ -1596,6 +1628,14 @@ impl ZerocodePane {
                 return;
             }
         };
+        // The value the user just typed must itself be valid, whatever the
+        // rest of the section looks like. Repair intent below tolerates
+        // *other* fields still being invalid; it must never let a fresh zero
+        // in through the field being edited.
+        if parsed == 0 {
+            self.set_ui_validation_error(config::UiSectionValidationError::PositiveRequired);
+            return;
+        }
         let mut candidate = self.tracker.clone();
         match edit.field {
             TrackerField::Width => {
@@ -2388,8 +2428,10 @@ mod tests {
             );
             for (i, row) in rows.iter().enumerate() {
                 assert!(
-                    row.chars().count() <= width as usize,
-                    "row {i} overflows {width} cols at {width}: {row}"
+                    crate::display_width::display_width(row) <= width as usize,
+                    "row {i} overflows {width} cols (display width \
+                     {}): {row}",
+                    crate::display_width::display_width(row)
                 );
             }
             // The widgets below must keep their rows: the section list starts
@@ -2440,6 +2482,50 @@ mod tests {
             detail.contains("expected u16") && detail.contains("width"),
             "the detail must still identify the type error and field: {detail}"
         );
+    }
+
+    // Wide glyphs must not overflow the fixed-width banner. A CJK character
+    // is one `char` but two terminal cells, so scalar-based truncation
+    // silently overruns the row; and a multi-scalar sequence must never be
+    // split. Exercised directly on the helper so the assertion is exact.
+    #[test]
+    fn truncate_to_width_measures_terminal_cells_not_scalars() {
+        use crate::display_width::display_width;
+
+        // 10 CJK chars = 20 cells, but only 10 `char`s.
+        let wide = "世界世界世界世界世界";
+        assert_eq!(wide.chars().count(), 10);
+        assert_eq!(display_width(wide), 20);
+
+        for budget in [1u16, 2, 5, 8, 12, 19, 20, 30] {
+            let out = truncate_to_width(wide, budget);
+            assert!(
+                display_width(&out) <= budget as usize,
+                "truncating to {budget} cells produced {} cells: {out:?}",
+                display_width(&out)
+            );
+        }
+
+        // An emoji presentation sequence (base + U+FE0F) is two scalars and
+        // must not be cut between them.
+        let seq = "⚠️⚠️⚠️";
+        for budget in [1u16, 2, 3, 4, 5, 6] {
+            let out = truncate_to_width(seq, budget);
+            assert!(
+                display_width(&out) <= budget as usize,
+                "sequence truncation to {budget} produced {} cells: {out:?}",
+                display_width(&out)
+            );
+            assert!(
+                !out.contains('\u{fe0f}') || out.contains('⚠'),
+                "a variation selector must never be orphaned: {out:?}"
+            );
+        }
+
+        // ASCII is unchanged when it already fits.
+        assert_eq!(truncate_to_width("abc", 10), "abc");
+        assert_eq!(truncate_to_width("", 10), "");
+        assert_eq!(truncate_to_width("abc", 0), "");
     }
 
     // The same screen must not say the same thing twice. The banner carries
@@ -2586,6 +2672,104 @@ mod tests {
             pane.status.as_deref(),
             Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
             "a refused write must never report a successful save"
+        );
+    }
+
+    // Repair must work field-by-field even when *both* dimensions are invalid.
+    // Validating the whole candidate before the writer means fixing one field
+    // still leaves the other zero, so the candidate is rejected and neither
+    // field can ever be repaired from the pane. Both edit orders must work.
+    #[test]
+    fn both_zero_dimensions_are_repairable_in_either_order() {
+        for first in [TrackerField::Width, TrackerField::MaxHeight] {
+            let _guard = crate::test_support::env_test_lock();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                config::config_path(dir.path()),
+                "[todotracker]\nwidth = 0\nmax_height = 0\n",
+            )
+            .unwrap();
+
+            let mut pane = ZerocodePane::new(dir.path());
+
+            // Repair the first field. The other is still zero at this point.
+            let (a, b) = match first {
+                TrackerField::Width => (TrackerField::Width, TrackerField::MaxHeight),
+                _ => (TrackerField::MaxHeight, TrackerField::Width),
+            };
+            edit_tracker_number(&mut pane, a, "44");
+            let after_first = config::load_persisted(dir.path()).unwrap().todotracker;
+            let first_value = match a {
+                TrackerField::Width => after_first.width,
+                _ => after_first.max_height,
+            };
+            assert_eq!(
+                first_value,
+                44,
+                "editing {} first must land even while the other dimension is still zero",
+                a.fluent_key()
+            );
+
+            // Repair the second field; the section is now fully valid.
+            edit_tracker_number(&mut pane, b, "9");
+            let repaired = config::load_persisted(dir.path()).unwrap().todotracker;
+            let second_value = match b {
+                TrackerField::Width => repaired.width,
+                _ => repaired.max_height,
+            };
+            assert_eq!(
+                second_value,
+                9,
+                "editing {} second must land",
+                b.fluent_key()
+            );
+            repaired
+                .validate()
+                .expect("the repaired section must be valid");
+            assert_eq!(
+                pane.status.as_deref(),
+                Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+                "a completed repair must report success"
+            );
+        }
+    }
+
+    // A half-finished repair lands on disk but is not yet usable, so it must
+    // not claim the ordinary success. Telling the user "saved, new sessions
+    // will use this" while the section is still invalid is exactly the
+    // false-success reporting the preservation contract forbids.
+    #[test]
+    fn partial_repair_does_not_report_ordinary_success() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 0\n",
+        )
+        .unwrap();
+
+        let mut pane = ZerocodePane::new(dir.path());
+        edit_tracker_number(&mut pane, TrackerField::Width, "44");
+
+        // The edit landed...
+        assert_eq!(
+            config::load_persisted(dir.path())
+                .unwrap()
+                .todotracker
+                .width,
+            44
+        );
+        // ...but max_height is still zero, so this is not a success yet.
+        let status = pane.status.as_deref().expect("a save must set a status");
+        assert_ne!(
+            Some(status),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            "a partial repair must not report the ordinary success"
+        );
+        assert_eq!(
+            status,
+            crate::i18n::t("zc-zerocode-tracker-saved-still-invalid").as_str(),
+            "the user must be told the section is still invalid"
         );
     }
 

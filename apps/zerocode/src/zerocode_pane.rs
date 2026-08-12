@@ -215,6 +215,36 @@ pub(crate) struct ZerocodePane {
     tracker_load_error: Option<String>,
 }
 
+/// Truncate `s` to at most `width` terminal cells, marking elision with `…`.
+///
+/// Status/banner surfaces are a fixed number of rows, so an over-long string
+/// must be cut rather than wrapped: wrapping silently steals rows from the
+/// widgets below it.
+fn truncate_to_width(s: &str, width: u16) -> String {
+    let width = width as usize;
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Flatten a multi-line error into a single line for status/banner display.
+///
+/// `toml` deserialization errors embed newlines (for example
+/// `expected u16\nin `width``), which render as a run-together artifact
+/// (`u16in `width``) once a single-line surface strips the break. Collapsing
+/// every whitespace run to one space keeps the detail readable wherever it is
+/// shown.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 struct ConnEdit {
     field: ConnField,
     buf: String,
@@ -301,7 +331,9 @@ impl ZerocodePane {
                 .unwrap_or_default(),
             tracker_cursor: 0,
             tracker_edit: None,
-            tracker_load_error: tracker_loaded.err().map(|e| format!("{e:#}")),
+            tracker_load_error: tracker_loaded
+                .err()
+                .map(|e| collapse_whitespace(&format!("{e:#}"))),
         };
         pane.rebuild_rows();
         pane
@@ -856,17 +888,17 @@ impl ZerocodePane {
             use ratatui::layout::{Constraint, Direction, Layout};
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(area);
+            // Deliberately one line, hard-truncated: this banner shares the
+            // pane's area, so wrapping it would push the section list and the
+            // field panel off their rows. The full detail stays available in
+            // the config file itself.
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    crate::i18n::t_args(
-                        "zc-zerocode-tracker-load-error",
-                        &[("error", self.tracker_load_error.as_deref().unwrap_or(""))],
-                    ),
+                    truncate_to_width(&self.tracker_load_banner(), rows[0].width),
                     theme::warn_style(),
-                ))
-                .wrap(Wrap { trim: true }),
+                )),
                 rows[0],
             );
             frame.render_stateful_widget(
@@ -1430,16 +1462,24 @@ impl ZerocodePane {
         self.tracker_edit = Some(TrackerEdit { field, buf });
     }
 
+    /// The one-line banner text for an unreadable tracker section.
+    fn tracker_load_banner(&self) -> String {
+        crate::i18n::t_args(
+            "zc-zerocode-tracker-load-error",
+            &[("error", self.tracker_load_error.as_deref().unwrap_or(""))],
+        )
+    }
+
     /// Surface the retained malformed-section error, including the parser
     /// detail so the user can see which field is wrong. The persisted text is
     /// left untouched; they repair it by hand (or delete the section to get
     /// defaults back), and the pane picks it up on the next open.
     fn set_tracker_load_error_status(&mut self) {
-        let detail = self.tracker_load_error.clone().unwrap_or_default();
-        self.status = Some(crate::i18n::t_args(
-            "zc-zerocode-tracker-load-error",
-            &[("error", &detail)],
-        ));
+        // The pane already renders the full explanation as a banner, and the
+        // status is echoed on the shared section tab bar, so repeating the
+        // whole sentence here would print it twice on one screen. Point at the
+        // banner instead.
+        self.status = Some(crate::i18n::t("zc-zerocode-tracker-edit-refused"));
     }
 
     fn set_ui_validation_error(&mut self, error: config::UiSectionValidationError) {
@@ -2271,51 +2311,142 @@ mod tests {
     // canonical data on the next toggle — silently destroying the very text
     // they need to repair, on the supported manual-upgrade path. The pane must
     // instead retain the error, refuse the edit, and leave the file byte-identical.
-    // The refusal is only useful if the user can *see* why. The controller
-    // tests above prove the file is preserved and no success is reported;
-    // this proves the repair warning actually reaches the screen, which is
-    // the part a headless controller assertion cannot show.
-    #[test]
-    fn malformed_tracker_section_renders_a_visible_repair_warning() {
+    /// Render the pane and return its rows as separate strings.
+    ///
+    /// Row-wise, not a flattened blob: concatenating every cell hides exactly
+    /// the defects that matter on a shared surface — a banner that wraps and
+    /// pushes widgets off their rows, or a message printed twice on one
+    /// screen. Both are invisible to a `contains()` check over joined cells.
+    fn render_rows(pane: &mut ZerocodePane, w: u16, h: u16) -> Vec<String> {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::layout::Rect;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| pane.draw(f, Rect::new(0, 0, w, h))).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
 
-        let _guard = crate::test_support::env_test_lock();
-        let dir = tempfile::tempdir().unwrap();
+    fn malformed_pane(dir: &std::path::Path) -> ZerocodePane {
         std::fs::write(
-            config::config_path(dir.path()),
+            config::config_path(dir),
             "[todotracker]\nwidth = \"oops\"\n",
         )
         .unwrap();
-
-        let mut pane = ZerocodePane::new(dir.path());
+        let mut pane = ZerocodePane::new(dir);
         pane.focus = Focus::TodoTracker;
+        pane
+    }
 
-        let (w, h) = (120u16, 24u16);
-        let backend = TestBackend::new(w, h);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| pane.draw(f, Rect::new(0, 0, w, h))).unwrap();
-        let rendered: String = term
-            .backend()
-            .buffer()
-            .content()
+    // The repair warning must be legible *and* stay inside its own row. An
+    // interactive smoke found this wrapping across three rows and painting
+    // over the section list and the field panel, which a flattened-buffer
+    // assertion could not see.
+    #[test]
+    fn malformed_tracker_warning_occupies_exactly_one_row_at_every_width() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = malformed_pane(dir.path());
+
+        for width in [80u16, 120, 200] {
+            let rows = render_rows(&mut pane, width, 12);
+            let hits: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.contains("is unreadable"))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits,
+                vec![0],
+                "at {width} cols the warning must occupy exactly row 0, got rows {hits:?}"
+            );
+            for (i, row) in rows.iter().enumerate() {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "row {i} overflows {width} cols at {width}: {row}"
+                );
+            }
+            // The widgets below must keep their rows: the section list starts
+            // at row 0 and the tracker panel border sits on row 1.
+            assert!(
+                rows[0].contains("zerocode"),
+                "the section list header must still be on row 0 at {width} cols"
+            );
+            assert!(
+                rows[1].contains("Todo tracker"),
+                "the tracker panel must start on row 1 at {width} cols, got: {}",
+                rows[1]
+            );
+        }
+    }
+
+    // The same screen must not say the same thing twice. The banner carries
+    // the explanation; the tab-bar status is a short pointer to it.
+    #[test]
+    fn malformed_tracker_warning_is_not_duplicated_on_screen() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = malformed_pane(dir.path());
+        pane.tracker_cursor = TRACKER_FIELDS
             .iter()
-            .map(|c| c.symbol())
-            .collect();
+            .position(|c| *c == TrackerField::Enabled)
+            .expect("tracker field is registered");
+        pane.activate_tracker();
+
+        let rows = render_rows(&mut pane, 200, 12);
+        let count = rows.iter().filter(|r| r.contains("is unreadable")).count();
+        assert_eq!(
+            count, 1,
+            "the warning must appear once, found {count} times"
+        );
+
+        let status = pane.status.as_deref().expect("a refusal must set a status");
+        assert!(
+            !status.contains("is unreadable"),
+            "the status must point at the banner, not repeat it: {status}"
+        );
+        assert!(
+            status.len() < 80,
+            "the status shares a one-line bar, so it must stay short: {status}"
+        );
+    }
+
+    // The warning must be legible: translated, and free of the run-together
+    // artifact produced when a multi-line parser error is flattened.
+    #[test]
+    fn malformed_tracker_warning_is_translated_and_readable() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = malformed_pane(dir.path());
+        let rows = render_rows(&mut pane, 200, 12);
+        let banner = &rows[0];
 
         assert!(
-            rendered.contains("[todotracker]"),
-            "the rendered pane must name the unreadable section"
+            banner.contains("[todotracker]") && banner.contains("zerocode-config.toml"),
+            "the banner must name the section and the file: {banner}"
         );
         assert!(
-            rendered.contains("zerocode-config.toml"),
-            "the rendered pane must name the file to repair"
+            !banner.contains("zc-zerocode-tracker-load-error"),
+            "the warning must be translated, not a raw Fluent key: {banner}"
         );
-        // And it must not render as a raw Fluent identifier.
+        // `toml` embeds a newline before "in `width`"; flattening it without
+        // normalizing whitespace produced the unreadable "u16in `width`".
+        let detail = pane
+            .tracker_load_error
+            .as_deref()
+            .expect("a malformed section must record its parser detail");
         assert!(
-            !rendered.contains("zc-zerocode-tracker-load-error"),
-            "the warning must be a translated string, not its raw key"
+            !detail.contains('\n') && !detail.contains("u16in"),
+            "the parser detail must be collapsed to readable single-line text: {detail}"
         );
     }
 
@@ -2585,9 +2716,16 @@ mod tests {
             status.contains("[todotracker]"),
             "the user must be told which section needs repair, got: {status}"
         );
+        // The parser detail lives in the banner rather than the status: the
+        // status shares a one-line bar, so duplicating the full explanation
+        // there printed it twice on one screen.
+        let detail = pane
+            .tracker_load_error
+            .as_deref()
+            .expect("a malformed section must record its parser detail");
         assert!(
-            status.contains("max_height") || status.contains("width"),
-            "the status must carry the parser detail naming the bad field, got: {status}"
+            detail.contains("max_height") || detail.contains("width"),
+            "the retained detail must name the bad field, got: {detail}"
         );
 
         // The user repairs the file by hand and reopens the pane.

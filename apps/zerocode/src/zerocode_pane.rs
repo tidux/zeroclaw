@@ -1459,6 +1459,17 @@ impl ZerocodePane {
     }
 
     fn persist_tracker_candidate(&mut self, candidate: TodoTrackerSection) {
+        self.persist_tracker_candidate_with_intent(
+            candidate,
+            config::TrackerWriteIntent::PreserveInvalid,
+        );
+    }
+
+    fn persist_tracker_candidate_with_intent(
+        &mut self,
+        candidate: TodoTrackerSection,
+        intent: config::TrackerWriteIntent,
+    ) {
         // The persisted section is present but unparseable: the in-memory
         // `tracker` is a default stand-in, not the user's data. Writing it
         // would destroy the canonical text they need in order to repair it, so
@@ -1471,7 +1482,9 @@ impl ZerocodePane {
             self.set_ui_validation_error(error);
             return;
         }
-        if let Err(error) = config::persist_todotracker(&self.config_dir, &candidate) {
+        if let Err(error) =
+            config::persist_todotracker_with_intent(&self.config_dir, &candidate, intent)
+        {
             self.set_ui_save_error(&error);
             return;
         }
@@ -1536,7 +1549,13 @@ impl ZerocodePane {
             }
             _ => return,
         }
-        self.persist_tracker_candidate(candidate);
+        // An explicit numeric edit of a dimension is the repair path for an
+        // invalid stored value, so it may replace one. An unrelated toggle
+        // (which routes through `persist_tracker_candidate` directly) may not.
+        self.persist_tracker_candidate_with_intent(
+            candidate,
+            config::TrackerWriteIntent::RepairInvalid,
+        );
     }
 
     fn handle_tracker_edit_key(&mut self, key: KeyEvent) {
@@ -2306,6 +2325,113 @@ mod tests {
     // "no error" state would let the next unrelated save replace that
     // externally authored text with the pane's stale candidate and report
     // success. The write boundary itself must re-check what is on disk.
+    // The repair path is deliberately narrow. Carrying repair intent must not
+    // become a general bypass: a numeric edit still cannot overwrite a section
+    // that is *unparseable*, because the pane never showed the user that text,
+    // so they cannot knowingly be replacing it.
+    #[test]
+    fn repair_intent_still_refuses_an_unparseable_current_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = "[todotracker]\nwidth = \"oops\"\n";
+        std::fs::write(config::config_path(dir.path()), malformed).unwrap();
+
+        let err = config::persist_todotracker_with_intent(
+            dir.path(),
+            &TodoTrackerSection::default(),
+            config::TrackerWriteIntent::RepairInvalid,
+        )
+        .expect_err("repair intent must not bypass the unparseable-section refusal");
+        assert!(
+            format!("{err:#}").contains("malformed"),
+            "the error must identify the malformed section, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config::config_path(dir.path())).unwrap(),
+            malformed,
+            "the unparseable file must be left byte-identical even under repair intent"
+        );
+    }
+
+    // A zero dimension is *syntactically* valid TOML and parses cleanly as a
+    // `u16`, so a strict type re-read alone lets it through. It is still
+    // explicitly invalid configuration, and the preservation contract makes no
+    // distinction between "unparseable" and "parses but invalid": neither may
+    // be silently replaced, and neither may report a successful save.
+    #[test]
+    fn tracker_save_preserves_zero_width_written_after_pane_open() {
+        assert_external_zero_section_survives_unrelated_save("width = 0\nmax_height = 5\n");
+    }
+
+    #[test]
+    fn tracker_save_preserves_zero_max_height_written_after_pane_open() {
+        assert_external_zero_section_survives_unrelated_save("width = 32\nmax_height = 0\n");
+    }
+
+    /// Open the pane on valid data, let an external writer install
+    /// `[todotracker]` with `fields`, then perform an *unrelated* tracker
+    /// action and assert the file is byte-identical with no success status.
+    fn assert_external_zero_section_survives_unrelated_save(fields: &str) {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        config::persist_todotracker(dir.path(), &TodoTrackerSection::default()).unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        assert!(
+            pane.tracker_load_error.is_none(),
+            "precondition: the pane must open cleanly on valid data"
+        );
+
+        let external = format!("[theme]\nname = \"nord\"\n\n[todotracker]\n{fields}");
+        std::fs::write(config::config_path(dir.path()), &external).unwrap();
+
+        // Unrelated action: toggle a boolean, nothing to do with dimensions.
+        pane.tracker_cursor = TRACKER_FIELDS
+            .iter()
+            .position(|c| *c == TrackerField::Enabled)
+            .expect("tracker field is registered");
+        pane.activate_tracker();
+
+        assert_eq!(
+            std::fs::read_to_string(config::config_path(dir.path())).unwrap(),
+            external,
+            "an unrelated save must not replace an explicitly invalid current section"
+        );
+        assert_ne!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            "a refused write must never report a successful save"
+        );
+    }
+
+    // Refusing to overwrite an invalid section must not lock the user out of
+    // fixing it: an explicit numeric edit of the offending field is the repair
+    // path and must still land.
+    #[test]
+    fn explicit_numeric_edit_repairs_a_zero_width_section() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config::config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        // The pane opens: the section parses, so this is not the type-malformed
+        // path; the user edits width directly to a usable value.
+        let mut pane = ZerocodePane::new(dir.path());
+        edit_tracker_number(&mut pane, TrackerField::Width, "44");
+
+        let repaired = config::load_persisted(dir.path()).unwrap();
+        assert_eq!(
+            repaired.todotracker.width, 44,
+            "an explicit edit of the invalid field must repair it"
+        );
+        assert_eq!(
+            pane.status.as_deref(),
+            Some(crate::i18n::t("zc-zerocode-tracker-saved").as_str()),
+            "a successful repair must report success"
+        );
+    }
+
     #[test]
     fn tracker_save_preserves_section_made_malformed_after_pane_open() {
         let _guard = crate::test_support::env_test_lock();

@@ -671,20 +671,47 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 ///
 /// This is the owning read-modify-write boundary, so it enforces the
 /// preservation invariant for the section it replaces: if a `[todotracker]`
-/// section is currently present but does not parse, the write is refused.
+/// section is currently present but is not *valid* — either unparseable or
+/// parseable-but-invalid, such as a zero dimension — the write is refused
+/// unless the caller passes `intent`, below.
+///
 /// A caller's snapshot of "the section was fine" can be arbitrarily old — a
 /// Config pane may stay open indefinitely while an external editor rewrites
 /// the file — so validating the *candidate* alone is not enough. Only the
 /// latest document, which this function already loads, can answer whether the
-/// text about to be overwritten is the user's unparseable canonical data.
+/// value about to be overwritten is the user's invalid canonical data.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
+    persist_todotracker_with_intent(config_dir, section, TrackerWriteIntent::PreserveInvalid)
+}
+
+/// Whether a tracker write is allowed to replace an invalid current section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackerWriteIntent {
+    /// Default. Refuse to replace a current section that is unparseable or
+    /// invalid, so an unrelated edit cannot silently erase it.
+    PreserveInvalid,
+    /// The user is explicitly repairing this section, so replacing an invalid
+    /// current value is the whole point. An *unparseable* section is still
+    /// refused: it cannot be shown in the editor, so there is nothing the user
+    /// could knowingly be replacing.
+    RepairInvalid,
+}
+
+pub(crate) fn persist_todotracker_with_intent(
+    config_dir: &Path,
+    section: &TodoTrackerSection,
+    intent: TrackerWriteIntent,
+) -> Result<()> {
     section.validate()?;
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
-    // Strictly re-check the section as it exists *now*, immediately before
-    // replacing it. An absent section is fine (nothing to preserve).
+    // Re-check the section as it exists *now*, immediately before replacing
+    // it. An absent section is fine (nothing to preserve). Both failure modes
+    // matter: `try_into` catches a type error, and `validate` catches a value
+    // that parses cleanly but is not usable, which a type check alone lets
+    // through.
     if let Some(current) = doc.get("todotracker") {
-        current
+        let parsed = current
             .clone()
             .try_into::<TodoTrackerSection>()
             .with_context(|| {
@@ -693,6 +720,14 @@ pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSectio
                     path.display()
                 )
             })?;
+        if intent == TrackerWriteIntent::PreserveInvalid {
+            parsed.validate().with_context(|| {
+                format!(
+                    "refusing to overwrite the invalid [todotracker] section in {}",
+                    path.display()
+                )
+            })?;
+        }
     }
     let serialized = toml::Value::try_from(section)
         .context("serializing todotracker section")?

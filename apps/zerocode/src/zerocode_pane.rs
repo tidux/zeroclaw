@@ -234,6 +234,18 @@ fn truncate_to_width(s: &str, width: u16) -> String {
     out
 }
 
+/// The innermost cause of an error chain, as a display string.
+///
+/// Outer `anyhow` context is written for logs, where repeating the section and
+/// path is helpful. On a truncated one-line banner it is pure padding that
+/// hides the diagnosis, so the UI shows only the root cause.
+fn root_cause_of(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .last()
+        .map_or_else(|| format!("{error}"), std::string::ToString::to_string)
+}
+
 /// Flatten a multi-line error into a single line for status/banner display.
 ///
 /// `toml` deserialization errors embed newlines (for example
@@ -331,9 +343,14 @@ impl ZerocodePane {
                 .unwrap_or_default(),
             tracker_cursor: 0,
             tracker_edit: None,
+            // Only the *root* cause is displayed. `{e:#}` would render the
+            // whole anyhow chain, whose outer context repeats the section name
+            // and the file path that the surrounding message already states —
+            // and that padding pushes the actual diagnosis past the end of a
+            // truncated one-line banner, which is the only part the user needs.
             tracker_load_error: tracker_loaded
                 .err()
-                .map(|e| collapse_whitespace(&format!("{e:#}"))),
+                .map(|e| collapse_whitespace(&root_cause_of(&e))),
         };
         pane.rebuild_rows();
         pane
@@ -2361,7 +2378,7 @@ mod tests {
             let hits: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.contains("is unreadable"))
+                .filter(|(_, r)| r.contains("[todotracker] unreadable:"))
                 .map(|(i, _)| i)
                 .collect();
             assert_eq!(
@@ -2389,6 +2406,42 @@ mod tests {
         }
     }
 
+    // Truncation must never cost the user the diagnosis. An interactive smoke
+    // showed the banner cut at "...zerocode-config.to…", because the parser
+    // detail sat behind ~190 characters of boilerplate that repeated the
+    // section name and the file path. The actionable part must come early
+    // enough to survive a narrow terminal.
+    #[test]
+    fn malformed_tracker_warning_keeps_the_diagnosis_when_truncated() {
+        let _guard = crate::test_support::env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = malformed_pane(dir.path());
+
+        for width in [80u16, 100, 120] {
+            let rows = render_rows(&mut pane, width, 12);
+            let banner = &rows[0];
+            assert!(
+                banner.contains("oops"),
+                "at {width} cols the offending value must survive truncation: {banner}"
+            );
+        }
+
+        // The retained detail is the *root* cause only: outer context that
+        // repeats the section and path is what pushed the diagnosis off-screen.
+        let detail = pane
+            .tracker_load_error
+            .as_deref()
+            .expect("a malformed section must record its parser detail");
+        assert!(
+            !detail.contains("is malformed") && !detail.contains(".toml"),
+            "the detail must be the root parse error, not the wrapped chain: {detail}"
+        );
+        assert!(
+            detail.contains("expected u16") && detail.contains("width"),
+            "the detail must still identify the type error and field: {detail}"
+        );
+    }
+
     // The same screen must not say the same thing twice. The banner carries
     // the explanation; the tab-bar status is a short pointer to it.
     #[test]
@@ -2403,7 +2456,10 @@ mod tests {
         pane.activate_tracker();
 
         let rows = render_rows(&mut pane, 200, 12);
-        let count = rows.iter().filter(|r| r.contains("is unreadable")).count();
+        let count = rows
+            .iter()
+            .filter(|r| r.contains("[todotracker] unreadable:"))
+            .count();
         assert_eq!(
             count, 1,
             "the warning must appear once, found {count} times"
@@ -2411,7 +2467,7 @@ mod tests {
 
         let status = pane.status.as_deref().expect("a refusal must set a status");
         assert!(
-            !status.contains("is unreadable"),
+            !status.contains("[todotracker] unreadable:"),
             "the status must point at the banner, not repeat it: {status}"
         );
         assert!(

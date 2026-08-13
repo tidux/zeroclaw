@@ -667,13 +667,12 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 
 /// Persist the entire `[todotracker]` section, editing only that section.
 /// Other sections (theme, keybindings, connection, etc.) are preserved.
-/// Persist the `[todotracker]` section, preserving every other section.
 ///
 /// This is the owning read-modify-write boundary, so it enforces the
 /// preservation invariant for the section it replaces: if a `[todotracker]`
 /// section is currently present but is not *valid* — either unparseable or
 /// parseable-but-invalid, such as a zero dimension — the write is refused
-/// unless the caller passes `intent`, below.
+/// unless the caller passes a field-scoped repair `intent`, below.
 ///
 /// A caller's snapshot of "the section was fine" can be arbitrarily old — a
 /// Config pane may stay open indefinitely while an external editor rewrites
@@ -682,6 +681,44 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
 /// value about to be overwritten is the user's invalid canonical data.
 pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
     persist_todotracker_with_intent(config_dir, section, TrackerWriteIntent::PreserveInvalid)
+        .map(|_| ())
+}
+
+/// One of the two editable numeric dimensions, used to scope repair authority
+/// to exactly the field the user typed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackerNumericField {
+    Width,
+    MaxHeight,
+}
+
+impl TrackerNumericField {
+    fn get(self, section: &TodoTrackerSection) -> u16 {
+        match self {
+            Self::Width => section.width,
+            Self::MaxHeight => section.max_height,
+        }
+    }
+
+    fn set(self, section: &mut TodoTrackerSection, value: u16) {
+        match self {
+            Self::Width => section.width = value,
+            Self::MaxHeight => section.max_height = value,
+        }
+    }
+
+    /// The repaired field must itself be usable, whatever the rest of the
+    /// section looks like: repair authority tolerates *other* fields being
+    /// invalid, never a fresh zero in the field being written.
+    fn validate_in(
+        self,
+        section: &TodoTrackerSection,
+    ) -> std::result::Result<(), UiSectionValidationError> {
+        if self.get(section) == 0 {
+            return Err(UiSectionValidationError::PositiveRequired);
+        }
+        Ok(())
+    }
 }
 
 /// Whether a tracker write is allowed to replace an invalid current section.
@@ -690,59 +727,90 @@ pub(crate) enum TrackerWriteIntent {
     /// Default. Refuse to replace a current section that is unparseable or
     /// invalid, so an unrelated edit cannot silently erase it.
     PreserveInvalid,
-    /// The user is explicitly repairing this section, so replacing an invalid
-    /// current value is the whole point. An *unparseable* section is still
-    /// refused: it cannot be shown in the editor, so there is nothing the user
-    /// could knowingly be replacing.
-    RepairInvalid,
+    /// The user is explicitly repairing one numeric field, so replacing *that
+    /// field's* invalid current value is the whole point. Authority stops
+    /// there: every other field keeps its latest on-disk value, so a stale
+    /// caller snapshot cannot erase an invalid value the user never touched.
+    /// An *unparseable* section is still refused outright: it cannot be shown
+    /// in the editor, so there is nothing the user could knowingly replace.
+    RepairField(TrackerNumericField),
 }
 
+/// Write the `[todotracker]` section and return the section as it was
+/// *actually* written, which under [`TrackerWriteIntent::RepairField`] is the
+/// latest on-disk section with only the repaired field applied — not
+/// necessarily the caller's candidate. Callers must report status against the
+/// returned value, never against what they proposed.
 pub(crate) fn persist_todotracker_with_intent(
     config_dir: &Path,
     section: &TodoTrackerSection,
     intent: TrackerWriteIntent,
-) -> Result<()> {
-    // The candidate must be valid, except during an explicit repair: when
-    // several fields are invalid on disk, fixing them one at a time means
-    // every intermediate candidate is still partially invalid. Rejecting
-    // those would make such a section permanently unrepairable. The caller
-    // is responsible for not reporting success until the result is valid.
-    if intent == TrackerWriteIntent::PreserveInvalid {
-        section.validate()?;
+) -> Result<TodoTrackerSection> {
+    // The whole candidate must be valid, except during an explicit repair:
+    // when several fields are invalid on disk, fixing them one at a time
+    // means every intermediate section is still partially invalid. Rejecting
+    // those would make such a section permanently unrepairable, so a repair
+    // validates only the field it is authorized to write. The caller is
+    // responsible for not reporting success until the result is valid.
+    match intent {
+        TrackerWriteIntent::PreserveInvalid => section.validate()?,
+        TrackerWriteIntent::RepairField(field) => field.validate_in(section)?,
     }
     let path = config_path(config_dir);
     let mut doc = load_document(&path)?;
-    // Re-check the section as it exists *now*, immediately before replacing
-    // it. An absent section is fine (nothing to preserve). Both failure modes
-    // matter: `try_into` catches a type error, and `validate` catches a value
-    // that parses cleanly but is not usable, which a type check alone lets
-    // through.
-    if let Some(current) = doc.get("todotracker") {
-        let parsed = current
-            .clone()
-            .try_into::<TodoTrackerSection>()
-            .with_context(|| {
-                format!(
-                    "refusing to overwrite the malformed [todotracker] section in {}",
-                    path.display()
-                )
-            })?;
-        if intent == TrackerWriteIntent::PreserveInvalid {
-            parsed.validate().with_context(|| {
+    // Re-read the section as it exists *now*, immediately before replacing
+    // it: a caller's "the section was fine" snapshot can be arbitrarily old,
+    // since a Config pane may stay open indefinitely while an external editor
+    // rewrites the file. An unparseable section is refused under either
+    // intent — the user was never shown that text, so they cannot knowingly
+    // be replacing it.
+    let current = match doc.get("todotracker") {
+        Some(value) => Some(
+            value
+                .clone()
+                .try_into::<TodoTrackerSection>()
+                .with_context(|| {
+                    format!(
+                        "refusing to overwrite the malformed [todotracker] section in {}",
+                        path.display()
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    let to_write = match (current, intent) {
+        // Nothing on disk to preserve: the candidate stands as written.
+        (None, _) => section.clone(),
+        // An ordinary edit may not replace a current section that parses but
+        // is not usable — a zero dimension is explicitly invalid canonical
+        // data, and a type check alone lets it through.
+        (Some(current), TrackerWriteIntent::PreserveInvalid) => {
+            current.validate().with_context(|| {
                 format!(
                     "refusing to overwrite the invalid [todotracker] section in {}",
                     path.display()
                 )
             })?;
+            section.clone()
         }
-    }
-    let serialized = toml::Value::try_from(section)
+        // A repair rebases onto the latest section and applies only the one
+        // field the user explicitly edited. Any other field — including one
+        // that is invalid, and including one an external editor changed after
+        // the caller's snapshot — is preserved exactly as it is on disk.
+        (Some(current), TrackerWriteIntent::RepairField(field)) => {
+            let mut merged = current;
+            field.set(&mut merged, field.get(section));
+            merged
+        }
+    };
+    let serialized = toml::Value::try_from(&to_write)
         .context("serializing todotracker section")?
         .as_table()
         .cloned()
         .unwrap_or_default();
     doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
-    write_document(&path, &doc)
+    write_document(&path, &doc)?;
+    Ok(to_write)
 }
 
 pub(crate) fn persist_connection_field(

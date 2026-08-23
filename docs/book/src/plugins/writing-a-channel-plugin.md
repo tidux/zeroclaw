@@ -39,7 +39,10 @@ ways, and each drives a design decision in your code:
    `config_read` grant is denied, the host validates `{}` instead; an optional
    schema receives that object, while required fields make construction fail
    before guest code runs. Deserialize the object into a typed config struct
-   and store it in your component's state.
+   and store it in your component's state. The channel world does not import
+   the scoped secret service yet, so admission rejects channel-capable
+   manifests containing `x-secret` until the host has a coherent warm-store
+   secret lifecycle.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -286,6 +289,13 @@ is tool-only. Alias-aware channel key display and seeding is tracked in
 successor. Prepare the manifest and guest now, but do not publish a channel-only
 package as migrated to typed config until that production path exists.
 
+> **Credential limitation.** Do not add `x-secret` to this channel schema.
+> The current channel world has no `secrets` import, and admission rejects any
+> channel-capable manifest containing that marker. Credentials therefore arrive
+> in the one typed `configure` object and remain in warm guest state. A channel
+> migration that requires scoped reads or rotation must remain built in until a
+> coherent warm-store secret lifecycle lands.
+
 ## Build and install
 
 {{#include ../_snippets/plugin-build-component.md}}
@@ -311,11 +321,11 @@ cargo add --dev zeroclaw-plugins \
 ```
 
 The test then loads your built component through `WasmChannel::from_wasm` with
-a `PluginConfigResolver` backed by the manifest and test operator values,
-enqueues onto the `InboundQueue` handle it exposes, and asserts your
-`poll-message` drains and translates the message. That is the same code path a
-production daemon will run; passing it is the strongest pre-distribution signal
-you can get without a live host.
+a `PluginHostServices` bundle wrapping a `PluginConfigResolver` backed by the
+manifest and test operator values, enqueues onto the `InboundQueue` handle it
+exposes, and asserts your `poll-message` drains and translates the message.
+That is the same code path a production daemon will run; passing it is the
+strongest pre-distribution signal you can get without a live host.
 
 ## Next
 

@@ -8,7 +8,6 @@ use serde::Deserialize;
 use tokio::sync::OnceCell;
 use zeroclaw_api::model_provider::ModelPricing;
 
-const CATALOG_URL: &str = "https://openrouter.ai/api/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Deserialize)]
@@ -39,7 +38,11 @@ async fn fetch_catalog() -> Result<Arc<Vec<String>>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let response = client.get(CATALOG_URL).send().await?.error_for_status()?;
+    let response = client
+        .get(crate::openrouter::endpoint_url("models"))
+        .send()
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     Ok(Arc::new(parse_catalog(&bytes)?))
 }
@@ -48,7 +51,11 @@ async fn fetch_catalog_with_pricing() -> Result<Arc<Vec<ModelEntryWithPricing>>>
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let response = client.get(CATALOG_URL).send().await?.error_for_status()?;
+    let response = client
+        .get(crate::openrouter::endpoint_url("models"))
+        .send()
+        .await?
+        .error_for_status()?;
     let bytes = response.bytes().await?;
     Ok(Arc::new(parse_catalog_with_pricing(&bytes)?))
 }
@@ -105,6 +112,9 @@ fn filter_by_vendor_with_pricing(
             e.id.strip_prefix(&needle).map(|slug| ModelInfo {
                 id: slug.to_string(),
                 pricing: e.pricing.clone(),
+                // OpenRouter publishes `context_length`; wiring it is a
+                // follow-up. `None` means "unknown", never a stub value.
+                context_window: None,
             })
         })
         .collect();
@@ -145,6 +155,9 @@ fn all_models_with_pricing(
         .map(|e| ModelInfo {
             id: e.id.clone(),
             pricing: e.pricing.clone(),
+            // OpenRouter publishes `context_length`; wiring it is a follow-up.
+            // `None` means "unknown", never a stub value.
+            context_window: None,
         })
         .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));

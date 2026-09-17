@@ -32,6 +32,8 @@ Explain how the change was checked. Use the evidence that matches the changed su
 
 Fresh required CI is valid evidence when it covers the changed surface. Add extra validation only for a concrete coverage gap, such as platform-specific tests, cross-platform lint, desktop app coverage, release target builds, or stale/unavailable CI.
 
+Visual presentation changes require actual-interface evidence. If this PR changes rendered text, layout, spacing, alignment, wrapping, clipping, color, focus, selection, responsive behavior, or another visible state, exercise the supported interface on an identifiable revision and include or link privacy-safe screenshots at representative terminal or viewport dimensions. String assertions, component-only snapshots, and helper-level renderer tests do not replace this evidence. For interaction or transition changes, also record the action and observed result.
+
 ```sh
 # Rust/code examples; choose the checks that match the changed surface:
 cargo fmt --all -- --check
@@ -45,6 +47,10 @@ Docs-only changes: replace with markdown lint (`scripts/ci/docs_quality_gate.sh`
 - **Known CI coverage gap, if any:** (for example, `None after the docs and links gates`)
 - **Commands run and tail output:**
 - **Beyond CI, what did you manually verify?** (functional scenarios, edge cases, and any security-relevant behavior; also what you did NOT verify)
+- **Visual interface changed?** (`Yes` / `N/A`; if `Yes`, provide the remaining fields; if `N/A`, remove them)
+- **Tested revision, interface, and terminal or viewport dimensions:**
+- **Screenshot evidence:** (attach or link one or more screenshots showing the changed state and enough surrounding layout to judge it)
+- **Action or changed state and observed result:**
 - **If any command was intentionally skipped, why:**
 
 ## Security & Privacy Impact (required)
@@ -84,7 +90,7 @@ Medium/high-risk PRs must fill:
 
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment. Canonical colon-scoped labels use no-space spelling; during migration, copy exact live label spelling from the GitHub UI.
+**Labels** live in the GitHub label UI, not in the body. The PR path labeler owns path/scope labels from `.github/labeler.yml`, and the PR size labeler owns canonical `size:*` labels. Maintainers and reviewers with label permissions still set `risk:*` and any missing manual labels via the sidebar. Contributors without label permission can note obvious label mismatches in a comment. Canonical colon-scoped labels use no-space spelling; during migration, copy exact live label spelling from the GitHub UI.
 
 **Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
 or `Created with Claude Code` to the PR body or commit-message tail. Human

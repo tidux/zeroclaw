@@ -34,7 +34,7 @@ pub async fn process_file_entry(
     use sha2::{Digest, Sha256};
 
     // 1. Resolve bytes + filename + mime_type.
-    let (bytes, filename, mime_type, original_path) = if let Some(ref b64) = entry.data_b64 {
+    let (bytes, filename, mime_type) = if let Some(ref b64) = entry.data_b64 {
         let decoded = STANDARD
             .decode(b64)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid base64: {e}")))?;
@@ -53,7 +53,7 @@ pub async fn process_file_entry(
             .mime_type
             .clone()
             .unwrap_or_else(|| mime_from_filename(&fname));
-        (decoded, fname, mime, None)
+        (decoded, fname, mime)
     } else if let Some(ref path) = entry.path {
         if is_wss {
             return Err(rpc_err(
@@ -86,7 +86,7 @@ pub async fn process_file_entry(
             .mime_type
             .clone()
             .unwrap_or_else(|| mime_from_filename(&fname));
-        (bytes, fname, mime, Some(path.clone()))
+        (bytes, fname, mime)
     } else {
         return Err(rpc_err(
             INVALID_PARAMS,
@@ -110,42 +110,29 @@ pub async fn process_file_entry(
         });
     }
 
-    // 4. Sanitize filename.
+    // 4. Sanitize filename (display only; the on-disk name is the content hash).
     let sanitized = sanitize_filename(&filename);
 
-    // 5. Determine extension + write to workspace.
+    // 5. Persist through the shared hardened content-addressed writer: full-digest
+    // storage name and a directory-handle-bound, no-follow atomic write. This makes
+    // the RPC attachment path and the ACP/MCP blob path share one filesystem owner
+    // instead of duplicating decode/hash/naming/persistence with a plain,
+    // symlink-following `fs::write`. Marker and session dedup stay RPC-specific.
     let ext = std::path::Path::new(&sanitized)
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_default();
-    let storage_name = if ext.is_empty() {
-        hex[..16].to_string()
-    } else {
-        format!("{}.{ext}", &hex[..16])
-    };
-    let upload_dir = std::path::Path::new(upload_root).join("uploads");
-    tokio::fs::create_dir_all(&upload_dir)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot create upload dir: {e}")))?;
-    let dest = upload_dir.join(&storage_name);
-    tokio::fs::write(&dest, &bytes)
-        .await
-        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cannot write upload: {e}")))?;
-
-    // Canonicalize so the marker always contains an absolute path —
-    // upload_root may be relative (e.g. ".") when no path was provided.
-    let canonical = tokio::fs::canonicalize(&dest)
-        .await
-        .unwrap_or_else(|_| dest.clone());
-    let canonical_display = canonical.to_string_lossy();
-    let workspace_path = strip_windows_verbatim_prefix(&canonical_display).into_owned();
+    let dest = zeroclaw_tools::embedded_resource::persist_content_addressed(
+        std::path::Path::new(upload_root),
+        &bytes,
+        &ext,
+    )
+    .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
+    let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
 
     let kind = attachment_kind(&mime_type);
-    let is_clipboard = matches!(entry.source, FileSource::Clipboard);
     let marker = if kind == "IMAGE" {
-        let display_path =
-            image_marker_display_path(original_path.as_deref(), &workspace_path, is_clipboard);
-        format!("[IMAGE:{display_path}]")
+        format!("[IMAGE:{workspace_path}]")
     } else {
         // Non-image: prose format with workspace path so the agent can
         // read the file with its tools regardless of transport.
@@ -191,18 +178,6 @@ fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(rest);
     }
     std::borrow::Cow::Borrowed(path)
-}
-
-fn image_marker_display_path<'a>(
-    original_path: Option<&'a str>,
-    workspace_path: &'a str,
-    is_clipboard: bool,
-) -> std::borrow::Cow<'a, str> {
-    if is_clipboard {
-        std::borrow::Cow::Borrowed(workspace_path)
-    } else {
-        strip_windows_verbatim_prefix(original_path.unwrap_or(workspace_path))
-    }
 }
 
 /// Derive MIME type from filename extension via `mime_guess`.
@@ -285,22 +260,6 @@ mod tests {
     }
 
     #[test]
-    fn path_mode_image_marker_display_path_strips_original_verbatim_prefix() {
-        let workspace_path = r"C:\Users\me\.zeroclaw\uploads\copy.png";
-        let display_path = image_marker_display_path(
-            Some(r"\\?\C:\Users\me\Pictures\source.png"),
-            workspace_path,
-            false,
-        );
-        let marker = format!("[IMAGE:{display_path}]");
-
-        assert_eq!(display_path, r"C:\Users\me\Pictures\source.png");
-        assert_eq!(marker, r"[IMAGE:C:\Users\me\Pictures\source.png]");
-        assert!(!marker.contains(r"\\?\"));
-        assert!(!workspace_path.contains(r"\\?\"));
-    }
-
-    #[test]
     fn file_source_default_is_file() {
         let source: FileSource = Default::default();
         assert!(matches!(source, FileSource::File));
@@ -367,7 +326,9 @@ mod tests {
 
         crate::agent::agent::Agent::builder()
             .model_provider(Box::new(StubProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(std::sync::Arc::new(crate::observability::NoopObserver {})
                 as std::sync::Arc<dyn crate::observability::Observer>)
@@ -511,6 +472,51 @@ mod tests {
         assert!(!r.deduplicated);
     }
 
+    // Consolidation: the RPC attachment writer now persists through the shared
+    // hardened content-addressed writer, so the on-disk name is the FULL SHA-256
+    // digest, not a 64-bit prefix. Proves the single-filesystem-owner delegation
+    // and that RPC no longer uses a collision-feasible truncated identity. The
+    // no-follow/handle-bound write property is covered by the shared writer's own
+    // regressions in `zeroclaw-tools`.
+    #[tokio::test]
+    async fn rpc_attachment_stores_under_full_digest_name() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let bytes = b"rpc-consolidation-bytes";
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(bytes)),
+            filename: Some("doc.pdf".into()),
+            mime_type: Some("application/pdf".into()),
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+
+        let full_hex = format!("{:x}", Sha256::digest(bytes));
+        let name = Path::new(&r.workspace_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            name,
+            format!("{full_hex}.pdf"),
+            "RPC storage name must be the full digest"
+        );
+        assert_ne!(
+            name,
+            format!("{}.pdf", &full_hex[..16]),
+            "must not use the old 64-bit prefix identity"
+        );
+    }
+
     #[tokio::test]
     async fn deduplication() {
         use base64::{Engine, engine::general_purpose::STANDARD};
@@ -648,5 +654,44 @@ mod tests {
         assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
         assert!(Path::new(&r.workspace_path).exists());
+    }
+
+    #[tokio::test]
+    async fn path_mode_image_marker_survives_original_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(&ws).unwrap();
+        let ws = ws.to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let source_path = tmp.path().join("temporary.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&source_path, png).unwrap();
+        let entry = FileEntry {
+            path: Some(source_path.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+
+        let result = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+        std::fs::remove_file(&source_path).unwrap();
+
+        assert_eq!(result.marker, format!("[IMAGE:{}]", result.workspace_path));
+        assert_eq!(std::fs::read(&result.workspace_path).unwrap(), png);
+        assert!(Path::new(&result.workspace_path).exists());
+
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[zeroclaw_api::model_provider::ChatMessage::user(
+                result.marker,
+            )],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.contains_images);
     }
 }

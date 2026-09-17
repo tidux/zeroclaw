@@ -428,10 +428,7 @@ impl SopMetricsCollector {
             }
             if let Some(sop_key) = best_key {
                 let suffix = &rest[sop_key.len() + 1..];
-                match state.per_sop.get(sop_key) {
-                    Some(c) => (c, suffix),
-                    None => return None,
-                }
+                (state.per_sop.get(sop_key)?, suffix)
             } else {
                 // No matching SOP name prefix — treat as global metric
                 // (handles case where metric name contains dots but isn't per-SOP)
@@ -713,6 +710,7 @@ mod tests {
             total_steps,
             started_at: started,
             completed_at: Some(completed),
+            failure_reason: None,
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
@@ -1287,6 +1285,7 @@ mod tests {
             total_steps: 3,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
@@ -1401,6 +1400,7 @@ mod tests {
             total_steps: 3,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,

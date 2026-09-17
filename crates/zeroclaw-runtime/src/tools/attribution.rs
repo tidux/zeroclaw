@@ -1,4 +1,4 @@
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
 use crate::tools::ArcToolRef;
@@ -9,6 +9,7 @@ use crate::tools::cron_run::CronRunTool;
 use crate::tools::cron_runs::CronRunsTool;
 use crate::tools::cron_update::CronUpdateTool;
 use crate::tools::delegate::DelegateTool;
+use crate::tools::deliver_file::DeliverFileTool;
 use crate::tools::file_read::FileReadTool;
 use crate::tools::model_switch::ModelSwitchTool;
 use crate::tools::read_skill::ReadSkillTool;
@@ -34,6 +35,7 @@ tool_attribution!(CronRunTool, ToolKind::Plugin);
 tool_attribution!(CronRunsTool, ToolKind::Plugin);
 tool_attribution!(CronUpdateTool, ToolKind::Plugin);
 tool_attribution!(DelegateTool, ToolKind::Plugin);
+tool_attribution!(DeliverFileTool, ToolKind::Plugin);
 tool_attribution!(FileReadTool, ToolKind::Plugin);
 tool_attribution!(ModelSwitchTool, ToolKind::Plugin);
 tool_attribution!(ReadSkillTool, ToolKind::Plugin);
@@ -41,12 +43,11 @@ tool_attribution!(ScheduleTool, ToolKind::Plugin);
 tool_attribution!(SecurityOpsTool, ToolKind::Plugin);
 tool_attribution!(SendMessageToPeerTool, ToolKind::Plugin);
 tool_attribution!(ShellTool, ToolKind::Shell);
-tool_attribution!(SkillHttpTool, ToolKind::Plugin);
+tool_attribution!(SkillHttpTool, ToolKind::Plugin, ToolProvenance::Extension);
 tool_attribution!(SkillsListTool, ToolKind::Plugin);
 tool_attribution!(SkillViewTool, ToolKind::Plugin);
 tool_attribution!(SkillManageTool, ToolKind::Plugin);
-tool_attribution!(SkillBuiltinTool, ToolKind::Plugin);
-tool_attribution!(SkillShellTool, ToolKind::Plugin);
+tool_attribution!(SkillShellTool, ToolKind::Plugin, ToolProvenance::Extension);
 tool_attribution!(SopAdvanceTool, ToolKind::SopAdvance);
 tool_attribution!(SopApproveTool, ToolKind::SopApprove);
 tool_attribution!(SopExecuteTool, ToolKind::SopExecute);
@@ -55,11 +56,31 @@ tool_attribution!(SopStatusTool, ToolKind::SopStatus);
 tool_attribution!(SpawnSubagentTool, ToolKind::SpawnSubagent);
 tool_attribution!(VerifiableIntentTool, ToolKind::Plugin);
 
+impl Attributable for SkillBuiltinTool {
+    fn role(&self) -> Role {
+        Role::Tool(ToolKind::Plugin)
+    }
+
+    fn alias(&self) -> &str {
+        zeroclaw_api::tool::Tool::name(self)
+    }
+
+    // A skill controls this callable's public name, schema, and locked
+    // arguments. It is therefore an extension presentation boundary even
+    // when it delegates execution to a native target.
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
+    }
+}
+
 impl Attributable for ArcToolRef {
     fn role(&self) -> Role {
         self.0.role()
     }
     fn alias(&self) -> &str {
         self.0.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.0.tool_provenance()
     }
 }

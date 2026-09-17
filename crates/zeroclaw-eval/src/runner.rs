@@ -75,9 +75,39 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     let replay_handle = replay.handle();
     let provider: Box<dyn ModelProvider> = Box::new(replay);
 
+    // The engine's tool registry is sealed (`ScopedToolRegistry`), mintable only
+    // through the one assembly seam. Route the eval harness's fixed tool set
+    // through it with a permissive default policy so `assemble` is an identity
+    // over `default_tools()` (nothing added, nothing dropped): the eval agent
+    // sees exactly the same tools as before the seal. Every assembly divergence
+    // is off (no peripherals / MCP / skills / memory-strip), so the config,
+    // alias, and runtime are never read beyond satisfying the signature.
+    let eval_config = zeroclaw_config::schema::Config::default();
+    let eval_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+    let eval_registry = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+        zeroclaw_runtime::tools::scoped::ScopedAssembly {
+            config: &eval_config,
+            agent_alias: "eval",
+            security: &eval_security,
+            built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(default_tools()),
+            skills: &[],
+            runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        },
+    )
+    .await
+    .registry;
+
     let mut agent = Agent::builder()
         .model_provider(provider)
-        .tools(default_tools())
+        .tools(eval_registry)
         .memory(memory)
         .observer(observer.clone())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -153,6 +183,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = run_suite(dir.path(), Mode::Live).await.unwrap_err();
         assert!(err.to_string().contains("live mode is not implemented"));
+    }
+
+    #[tokio::test]
+    async fn run_suite_rejects_a_zero_turn_fixture_instead_of_reporting_it_green() {
+        // The turn loop below runs zero times for such a fixture, so the empty
+        // initial response and empty tool record grade `max_tool_calls: 0` as
+        // passed. Admission has to stop the fixture before the suite can
+        // certify a case that never drove the agent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("zero_turns.json"),
+            r#"{"model_name":"empty-turns","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+
+        let err = run_suite(dir.path(), Mode::Replay)
+            .await
+            .expect_err("a suite holding a zero-turn fixture must not report a pass");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("declares no conversation turns"),
+            "the suite must fail on the zero-turn fixture, got: {rendered}"
+        );
     }
 
     const MULTI_TURN: &str = r#"{

@@ -1,18 +1,23 @@
+use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::approval::ApprovalManager;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
@@ -32,6 +37,24 @@ fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
 }
 
+fn invalid_semantic_completion_error(agent_name: &str) -> String {
+    crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
+}
+
+fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|source| source.is::<zeroclaw_providers::ReliableProviderTerminalFailure>())
+    {
+        // Reliable's aggregate is the durable retry diagnostic for delegated
+        // task records; other typed terminal failures use the delivery projection.
+        return format!("Agent '{agent_name}' failed: {error}");
+    }
+
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
+}
+
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
 where
     F: std::future::Future,
@@ -49,6 +72,26 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+}
+
+/// Output artifact written by current background delegates.
+///
+/// Lifecycle status intentionally lives only in the control-plane task row.
+/// `BackgroundDelegateResult` remains the compatibility shape for legacy files
+/// that embedded their own status.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BackgroundDelegateOutput {
+    task_id: String,
+    output: Option<String>,
+}
+
+struct StoredBackgroundOutput {
+    output: BackgroundDelegateOutput,
+    legacy_agent: Option<String>,
+    legacy_status: Option<BackgroundTaskStatus>,
+    legacy_error: Option<String>,
+    legacy_started_at: Option<String>,
+    legacy_finished_at: Option<String>,
 }
 
 /// Status of a background delegate task.
@@ -78,6 +121,18 @@ impl BackgroundResultState {
             BackgroundTaskStatus::Completed => Self::Completed,
             BackgroundTaskStatus::Failed => Self::Failed,
             BackgroundTaskStatus::Cancelled => Self::Cancelled,
+        }
+    }
+
+    fn from_task_status(status: crate::control_plane::TaskStatus) -> Self {
+        match status {
+            crate::control_plane::TaskStatus::Running
+            | crate::control_plane::TaskStatus::Paused => Self::Running,
+            crate::control_plane::TaskStatus::Completed => Self::Completed,
+            crate::control_plane::TaskStatus::Failed => Self::Failed,
+            crate::control_plane::TaskStatus::Cancelled => Self::Cancelled,
+            crate::control_plane::TaskStatus::Lost => Self::Lost,
+            crate::control_plane::TaskStatus::TimedOut => Self::TimedOut,
         }
     }
 
@@ -142,10 +197,23 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// The daemon's shared live-config handle, when the registry that built
+    /// this tool had one. `root_config` above is a *snapshot* taken at
+    /// construction; every nested registry this tool builds must additionally
+    /// receive this handle so the target's per-execution resolvers (plugin
+    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
+    /// config reloads and credential rotation instead of the startup snapshot.
+    /// `None` for one-shot / non-daemon callers, which keep the documented
+    /// snapshot fallback.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
     caller_alias: String,
+    /// Optional per-tree override for background task lifecycle storage. A
+    /// daemon-provided control plane wins; non-daemon surfaces share a
+    /// process-local handle keyed by `root_config.data_dir`.
+    task_control_plane: Arc<tokio::sync::OnceCell<crate::control_plane::ControlPlaneHandle>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,8 +267,8 @@ impl DelegateAction {
     }
 }
 
-struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+pub(crate) struct IndependentTargetTools {
+    pub(crate) tools: crate::tools::scoped::ScopedToolRegistry,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
@@ -217,6 +285,10 @@ impl DelegateTool {
     pub const NAME: &'static str = "delegate";
     const MAX_AWAIT_SESSIONS_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_AWAIT_SESSION_TASK_IDS: usize = 128;
+    const TERMINAL_TRANSITION_ATTEMPTS: usize = 3;
+    const TERMINAL_TRANSITION_RETRY_DELAY: Duration = Duration::from_millis(25);
+    const TERMINAL_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+    const OUTPUT_ARTIFACT_PREFIX: &'static str = "artifact:";
     const INDEPENDENT_ALWAYS_ASK_DOC_REF: &'static str =
         "ZeroClaw docs, \"Delegation & SubAgents\" > \"What's not supported\"";
 
@@ -257,7 +329,9 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
+            task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -304,7 +378,9 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
+            task_control_plane: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -407,6 +483,30 @@ impl DelegateTool {
         self
     }
 
+    #[cfg(test)]
+    fn with_task_control_plane(self, handle: crate::control_plane::ControlPlaneHandle) -> Self {
+        assert!(
+            self.task_control_plane.set(handle).is_ok(),
+            "task control plane is set only once in tests"
+        );
+        self
+    }
+
+    /// Attach the daemon's shared live-config handle alongside
+    /// [`Self::with_root_config`].
+    ///
+    /// `with_root_config` supplies the snapshot this tool reads synchronously
+    /// (reachability, target mode, per-target policy). This supplies the handle
+    /// that every *nested* registry built for a delegated target needs so its
+    /// per-execution resolvers follow reloads. Passing `None` is the documented
+    /// one-shot behavior and keeps the snapshot fallback; dropping the handle
+    /// when the caller has one silently pins delegated plugin tools to startup
+    /// config for the parent's whole lifetime.
+    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+        self.live_config = live_config;
+        self
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -415,7 +515,10 @@ impl DelegateTool {
         self
     }
 
-    fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+    pub(crate) fn policy_for_target(
+        &self,
+        target_alias: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -636,24 +739,17 @@ impl DelegateTool {
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
-    ) -> anyhow::Result<Box<dyn ModelProvider>> {
-        if let Some(config) = self.root_config.as_deref()
-            && let Some((family, alias)) = model_provider.split_once('.')
-        {
-            let mut options =
-                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
-            if options.zeroclaw_dir.is_none() {
-                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
-            }
-            return zeroclaw_providers::create_model_provider_for_alias(
-                config, family, alias, credential, &options,
-            );
+    ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
+        if let Some(config) = self.root_config.as_deref() {
+            return crate::agent::agent::build_session_model_provider(config, model_provider, None);
         }
-        zeroclaw_providers::create_model_provider_with_options(
+        let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
             credential,
             &self.provider_runtime_options,
-        )
+        )?;
+        let (_, _, model, _) = self.resolve_brain(model_provider);
+        Ok((provider, provider_type.to_string(), model))
     }
 
     async fn memory_for_target_agent(
@@ -685,7 +781,7 @@ impl DelegateTool {
         ]
     }
 
-    async fn independent_agentic_tools_for_target(
+    pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
@@ -749,7 +845,15 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // The delegated target's registry is built once, here, but its
+            // plugin tools and `send_via` authority resolve per execution. They
+            // must resolve against the daemon's shared handle, not the
+            // `root_config` snapshot this DelegateTool captured at
+            // construction - otherwise a reload or credential rotation is
+            // invisible to every delegated plugin tool for the parent's whole
+            // lifetime. `None` only when the parent registry itself had no live
+            // handle (one-shot callers), which keeps the snapshot fallback.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -767,6 +871,7 @@ impl DelegateTool {
                 connect_mcp: true,
                 connect_peripherals: false,
                 exclude_memory: false,
+                acp_delivery: false,
                 list_deferred_mcp_specs: false,
                 emit_assembly_logs: true,
                 // Delegate: targets are short-lived independent chat
@@ -784,14 +889,16 @@ impl DelegateTool {
         // destructure could (see `ScopedAssembled::combined_mcp_prompt_section`).
         let deferred_section = assembled.combined_mcp_prompt_section();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             activated_handle,
             ..
         } = assembled;
-        let mut tools = registry.into_inner();
-        tools.retain(|tool| tool.name() != Self::NAME);
+        // Strip the delegate tool from the ALREADY-sealed registry via the
+        // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
+        // Same set removed as before (`tool.name() != Self::NAME`).
+        registry.retain(|tool| tool.name() != Self::NAME);
         Ok(IndependentTargetTools {
-            tools,
+            tools: registry,
             deferred_section,
             activated_handle,
             workspace_dir: target_workspace,
@@ -958,15 +1065,457 @@ impl DelegateTool {
         self.workspace_dir.join("delegate_results")
     }
 
-    async fn write_result_atomic(
-        result_path: &Path,
-        result: &BackgroundDelegateResult,
-    ) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec_pretty(result)?;
+    async fn background_control_plane(
+        &self,
+    ) -> anyhow::Result<crate::control_plane::ControlPlaneHandle> {
+        #[cfg(test)]
+        if let Some(handle) = self.task_control_plane.get() {
+            return Ok(handle.clone());
+        }
+        if let Some(handle) = crate::control_plane::control_plane() {
+            return Ok(handle.clone());
+        }
+        #[cfg(not(test))]
+        if let Some(handle) = self.task_control_plane.get() {
+            return Ok(handle.clone());
+        }
+
+        let Some(data_dir) = self
+            .root_config
+            .as_ref()
+            .map(|config| config.data_dir.clone())
+        else {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "background delegation rejected because the durable task store is unavailable"
+            );
+            return Err(anyhow::Error::msg(
+                "background delegation requires a durable task store; root config is unavailable",
+            ));
+        };
+        type ControlPlaneCell =
+            tokio::sync::OnceCell<crate::control_plane::ControlPlaneRecoveryOwner>;
+        static CONTROL_PLANES: std::sync::OnceLock<
+            parking_lot::Mutex<HashMap<PathBuf, Arc<ControlPlaneCell>>>,
+        > = std::sync::OnceLock::new();
+        let cell = CONTROL_PLANES
+            .get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            .lock()
+            .entry(data_dir.clone())
+            .or_insert_with(|| Arc::new(ControlPlaneCell::new()))
+            .clone();
+        cell.get_or_try_init(|| async {
+            let owner = crate::control_plane::ControlPlaneRecoveryOwner::start(&data_dir).await?;
+            std::mem::drop(owner.spawn_reaper(
+                crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
+                CancellationToken::new(),
+            ));
+            Ok::<_, anyhow::Error>(owner)
+        })
+        .await
+        .map(|owner| owner.handle().clone())
+    }
+
+    fn serialize_result<T: serde::Serialize>(result: &T) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec_pretty(result)?)
+    }
+
+    async fn write_bytes_atomic(result_path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp_path, &bytes).await?;
-        tokio::fs::rename(&tmp_path, result_path).await?;
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .await?;
+            file.write_all(bytes).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, result_path).await?;
+            Self::sync_parent_directory(result_path).await
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(error);
+        }
         Ok(())
+    }
+
+    async fn write_result_atomic<T: serde::Serialize>(
+        result_path: &Path,
+        result: &T,
+    ) -> anyhow::Result<()> {
+        let bytes = Self::serialize_result(result)?;
+        Self::write_bytes_atomic(result_path, &bytes).await
+    }
+
+    fn durable_artifact_path(result_path: &Path) -> anyhow::Result<PathBuf> {
+        if result_path.is_absolute() {
+            return Ok(result_path.to_path_buf());
+        }
+        Ok(std::env::current_dir()?.join(result_path))
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "delegate output path has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+
+        #[cfg(unix)]
+        {
+            let directory = tokio::fs::File::open(parent).await?;
+            directory.sync_all().await?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            // std does not expose a portable directory-sync primitive here.
+            let _ = parent;
+        }
+
+        Ok(())
+    }
+
+    async fn settle_background_task(
+        store: &dyn crate::control_plane::TaskRegistry,
+        result_path: &Path,
+        result: BackgroundDelegateOutput,
+        terminal_status: crate::control_plane::TaskStatus,
+        terminal_error: Option<String>,
+        owner_pid: u32,
+        owner_boot_id: String,
+    ) -> anyhow::Result<bool> {
+        let task_id = result.task_id.clone();
+        let bytes = match Self::serialize_result(&result) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let error = format!("failed to prepare delegate settlement: {error:#}");
+                return Ok(Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                    error,
+                )
+                .await);
+            }
+        };
+        if !result_path.is_absolute() {
+            let error = format!(
+                "failed to prepare delegate settlement: output path is not absolute: {}",
+                result_path.display()
+            );
+            return Ok(Self::supervise_pre_intent_failure(
+                store,
+                &task_id,
+                owner_pid,
+                &owner_boot_id,
+                error,
+            )
+            .await);
+        }
+        let file_name = match result_path.file_name() {
+            Some(file_name) => file_name.to_string_lossy(),
+            None => {
+                let error = format!(
+                    "failed to prepare delegate settlement: delegate output path has no file \
+                     name: {}",
+                    result_path.display()
+                );
+                return Ok(Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &owner_boot_id,
+                    error,
+                )
+                .await);
+            }
+        };
+        let artifact_path = result_path.to_path_buf();
+        let output_ref = (terminal_status == crate::control_plane::TaskStatus::Completed)
+            .then(|| format!("{}{}", Self::OUTPUT_ARTIFACT_PREFIX, file_name));
+        let intent = crate::control_plane::task_registry::TerminalSettlementIntent {
+            task_id: task_id.clone(),
+            owner_pid,
+            owner_boot_id,
+            desired_status: terminal_status,
+            artifact_path: artifact_path.to_string_lossy().into_owned(),
+            artifact_ref: output_ref,
+            artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+            terminal_error,
+        };
+
+        if !Self::supervise_settlement_intent(store, &task_id, &intent).await {
+            return Ok(false);
+        }
+
+        if let Err(error) = Self::write_bytes_atomic(&artifact_path, &bytes).await {
+            let persistence_error = format!("failed to persist delegate output: {error:#}");
+            return Ok(Self::supervise_terminal_transition(&task_id, || {
+                store.promote_terminal_settlement(
+                    &intent,
+                    crate::control_plane::TaskStatus::Failed,
+                    None,
+                    Some(persistence_error.clone()),
+                )
+            })
+            .await);
+        }
+
+        let settled_error = intent.terminal_error.clone();
+        let output_ref = intent.artifact_ref.clone();
+        Ok(Self::supervise_terminal_transition(&task_id, || {
+            store.promote_terminal_settlement(
+                &intent,
+                intent.desired_status,
+                output_ref.clone(),
+                settled_error.clone(),
+            )
+        })
+        .await)
+    }
+
+    async fn supervise_pre_intent_failure(
+        store: &dyn crate::control_plane::TaskRegistry,
+        task_id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+        error: String,
+    ) -> bool {
+        Self::supervise_terminal_transition(task_id, || {
+            store.transition_terminal_if_owner(
+                task_id,
+                owner_pid,
+                owner_boot_id,
+                crate::control_plane::TaskStatus::Failed,
+                None,
+                Some(error.clone()),
+            )
+        })
+        .await
+    }
+
+    async fn complete_background_task(
+        store: &dyn crate::control_plane::TaskRegistry,
+        result_path: &Path,
+        result: BackgroundDelegateOutput,
+        terminal_status: crate::control_plane::TaskStatus,
+        terminal_error: Option<String>,
+        owner_pid: u32,
+        owner_boot_id: String,
+    ) -> bool {
+        let task_id = result.task_id.clone();
+        let fallback_owner_boot_id = owner_boot_id.clone();
+        let settled = Self::settle_background_task(
+            store,
+            result_path,
+            result,
+            terminal_status,
+            terminal_error,
+            owner_pid,
+            owner_boot_id,
+        )
+        .await;
+        let won = match settled {
+            Ok(won) => won,
+            Err(error) => {
+                let error = format!("failed to settle background delegate task: {error:#}");
+                Self::supervise_pre_intent_failure(
+                    store,
+                    &task_id,
+                    owner_pid,
+                    &fallback_owner_boot_id,
+                    error,
+                )
+                .await
+            }
+        };
+
+        Self::background_task_cancels().lock().remove(&task_id);
+        won
+    }
+
+    async fn supervise_settlement_intent(
+        store: &dyn crate::control_plane::TaskRegistry,
+        task_id: &str,
+        intent: &crate::control_plane::task_registry::TerminalSettlementIntent,
+    ) -> bool {
+        let mut failures = 0_u32;
+        loop {
+            match store
+                .persist_terminal_settlement_intent(intent.clone())
+                .await
+            {
+                Ok(ready) => {
+                    if failures > 0 {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempts": failures + 1,
+                                "intent_persisted": ready,
+                            })),
+                            "background delegate settlement intent recovered"
+                        );
+                    }
+                    return ready;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_power_of_two() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempt": failures,
+                                "error": format!("{error:#}"),
+                            })),
+                            "background delegate settlement intent will retry"
+                        );
+                    }
+                }
+            }
+
+            let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+            let delay = Self::TERMINAL_TRANSITION_RETRY_DELAY
+                .saturating_mul(multiplier)
+                .min(Self::TERMINAL_SETTLEMENT_MAX_RETRY_DELAY);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    async fn supervise_terminal_transition<F, Fut>(task_id: &str, mut transition: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<bool>>,
+    {
+        let mut failures = 0_u32;
+        loop {
+            match transition().await {
+                Ok(won) => {
+                    if failures > 0 {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempts": failures + 1,
+                                "transition_won": won,
+                            })),
+                            "background delegate terminal transition recovered"
+                        );
+                    }
+                    return won;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures.is_power_of_two() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Write
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "task_id": task_id,
+                                "attempt": failures,
+                                "error": format!("{error:#}"),
+                            })),
+                            "background delegate terminal transition will retry"
+                        );
+                    }
+                }
+            }
+
+            let multiplier = 1_u32 << failures.saturating_sub(1).min(8);
+            let delay = Self::TERMINAL_TRANSITION_RETRY_DELAY
+                .saturating_mul(multiplier)
+                .min(Self::TERMINAL_SETTLEMENT_MAX_RETRY_DELAY);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    async fn retry_terminal_transition<F, Fut>(mut transition: F) -> anyhow::Result<bool>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<bool>>,
+    {
+        let mut last_error = None;
+        for attempt in 1..=Self::TERMINAL_TRANSITION_ATTEMPTS {
+            match transition().await {
+                Ok(won) => return Ok(won),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < Self::TERMINAL_TRANSITION_ATTEMPTS {
+                tokio::time::sleep(Self::TERMINAL_TRANSITION_RETRY_DELAY * attempt as u32).await;
+            }
+        }
+        Err(last_error
+            .expect("terminal transition loop always records an error")
+            .context("terminal task transition failed after bounded retries"))
+    }
+
+    async fn settle_background_cancellation<F, Fut>(
+        task_id: &str,
+        transition: F,
+    ) -> anyhow::Result<(bool, bool)>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = anyhow::Result<bool>>,
+    {
+        let won = Self::retry_terminal_transition(transition).await?;
+        if !won {
+            return Ok((false, false));
+        }
+
+        let aborted = Self::background_task_cancels()
+            .lock()
+            .remove(task_id)
+            .inspect(CancellationToken::cancel)
+            .is_some();
+        Ok((true, aborted))
+    }
+
+    fn owns_delegate_task(&self, task: &crate::control_plane::TaskRecord) -> bool {
+        task.kind == crate::control_plane::TaskKind::Delegate
+            && self
+                .caller_identity()
+                .is_some_and(|caller| task.originator_route.as_deref() == Some(caller))
+    }
+
+    fn can_read_delegate_task(&self, task: &crate::control_plane::TaskRecord) -> bool {
+        self.owns_delegate_task(task)
+            || (task.kind == crate::control_plane::TaskKind::Delegate
+                && task.originator_route.is_none()
+                && task.status.is_terminal())
+    }
+
+    fn caller_identity(&self) -> Option<&str> {
+        let alias = self.caller_alias.trim();
+        (!alias.is_empty()).then_some(alias)
     }
 
     /// Validate that a user-provided task_id is a valid UUID to prevent
@@ -1195,6 +1744,60 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
+        let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
+            let result = self
+                .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
+                .await;
+            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
+            (result, fallback)
+        })
+        .await;
+
+        let mut result = result?;
+        if result.success
+            && let Some(fallback) = fallback
+        {
+            let agentic = self
+                .agents
+                .get(agent_name)
+                .is_some_and(|config| self.resolve_agentic(&config.runtime_profile));
+            let warning =
+                crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+            let header_key = if agentic {
+                "delegate-provider-fallback-header-agentic"
+            } else {
+                "delegate-provider-fallback-header"
+            };
+            let header = crate::i18n::get_required_cli_string_with_args(
+                header_key,
+                &[
+                    ("agent", agent_name),
+                    ("requested_provider", &fallback.requested_candidate),
+                    ("requested_model", &fallback.fallback.requested_model),
+                    ("actual_provider", &fallback.actual_candidate),
+                    ("actual_model", &fallback.fallback.actual_model),
+                ],
+            );
+            // Successful delegate results are always headed by one generated line. Re-rendering
+            // it here keeps the caller-visible provenance accurate without exposing rejected
+            // provider diagnostics, endpoints, or credentials.
+            let rendered = result
+                .output
+                .split_once('\n')
+                .map_or(result.output.as_str(), |(_, rendered)| rendered);
+            result.output = format!("{header}\n{rendered}\n\n{warning}").into();
+        }
+        Ok(result)
+    }
+
+    async fn execute_sync_with_admission_inner(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -1224,7 +1827,7 @@ impl DelegateTool {
 
         // Resolve profile references
         let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
-        let (provider_type, credential, model, temperature) =
+        let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
 
@@ -1267,18 +1870,18 @@ impl DelegateTool {
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+        let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
-            &provider_type,
+            &legacy_provider_type,
             credential.as_deref(),
         ) {
-            Ok(p) => p,
+            Ok(provider) => provider,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                        "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -1343,26 +1946,41 @@ impl DelegateTool {
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            &provider_type,
+            &model,
+            result,
+        ))
+    }
 
-                Ok(ToolResult {
-                    success: true,
-                    output:
-                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
-                            .into(),
-                    error: None,
-                })
+    fn render_non_agentic_result(
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        result: anyhow::Result<String>,
+    ) -> ToolResult {
+        match result {
+            Ok(response)
+                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+            {
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(invalid_semantic_completion_error(agent_name)),
+                }
             }
-            Err(e) => Ok(ToolResult {
+            Ok(response) => ToolResult {
+                success: true,
+                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                    .into(),
+                error: None,
+            },
+            Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+                error: Some(delegate_failure_error(agent_name, &e)),
+            },
         }
     }
 }
@@ -1454,6 +2072,27 @@ impl DelegateTool {
             });
         }
 
+        let Some(caller_identity) = self.caller_identity().map(str::to_owned) else {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "Cannot start background delegation: caller identity is unavailable".into(),
+                ),
+            });
+        };
+
+        let task_control_plane = match self.background_control_plane().await {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Cannot start background delegation: {error:#}")),
+                });
+            }
+        };
+
         let task_id = uuid::Uuid::new_v4().to_string();
         let results_dir = self.results_dir();
         tokio::fs::create_dir_all(&results_dir).await?;
@@ -1472,43 +2111,45 @@ impl DelegateTool {
         let started_at = chrono::Utc::now().to_rfc3339();
         let agent_name_owned = agent_name.to_string();
 
-        // Write initial "running" status
-        let initial_result = BackgroundDelegateResult {
+        // The workspace artifact scopes listing and stores output, but never owns
+        // lifecycle status. Status is created atomically in the task store below.
+        let initial_result = BackgroundDelegateOutput {
             task_id: task_id.clone(),
-            agent: agent_name_owned.clone(),
-            status: BackgroundTaskStatus::Running,
             output: None,
-            error: None,
-            started_at: started_at.clone(),
-            finished_at: None,
         };
-        let result_path = results_dir.join(format!("{task_id}.json"));
+        let result_path =
+            Self::durable_artifact_path(&results_dir.join(format!("{task_id}.json")))?;
         Self::write_result_atomic(&result_path, &initial_result).await?;
 
-        // EPIC-A supervision: register the task in the durable control-plane BEFORE the
-        // spawn, so a crash between here and the spawn is recoverable by the reaper. A
-        // no-op when not running under a booted daemon (the plane is absent).
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .create(crate::control_plane::TaskRecord {
-                    id: task_id.clone(),
-                    kind: crate::control_plane::TaskKind::Delegate,
-                    agent: agent_name_owned.clone(),
-                    status: crate::control_plane::TaskStatus::Running,
-                    owner_pid: std::process::id(),
-                    owner_boot_id: cp.boot_id.clone(),
-                    heartbeat_at: None,
-                    depth: self.depth,
-                    parent_id: None,
-                    originator_route: None,
-                    delivered: false,
-                    idem_key: None,
-                    principal_id: None,
-                    started_at: started_at.clone(),
-                    finished_at: None,
-                })
-                .await;
+        if let Err(error) = task_control_plane
+            .store
+            .create(crate::control_plane::TaskRecord {
+                id: task_id.clone(),
+                kind: crate::control_plane::TaskKind::Delegate,
+                agent: agent_name_owned.clone(),
+                status: crate::control_plane::TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: task_control_plane.boot_id.clone(),
+                heartbeat_at: None,
+                depth: self.depth,
+                parent_id: None,
+                originator_route: Some(caller_identity),
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: started_at.clone(),
+                finished_at: None,
+            })
+            .await
+        {
+            let _ = tokio::fs::remove_file(&result_path).await;
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Cannot start background delegation: task registration failed: {error:#}"
+                )),
+            });
         }
 
         let agents = Arc::clone(&self.agents);
@@ -1537,7 +2178,14 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        // Carried, not dropped: the background task rebuilds a DelegateTool that
+        // will construct its own nested registries.
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
+        let nested_task_control_plane = Arc::clone(&self.task_control_plane);
+        let terminal_store = Arc::clone(&task_control_plane.store);
+        let terminal_owner_pid = std::process::id();
+        let terminal_owner_boot_id = task_control_plane.boot_id.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let __zc_delegate_alias = agent_name_owned.clone();
@@ -1562,7 +2210,9 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
+                    task_control_plane: nested_task_control_plane,
                 };
 
                 let args_inner = json!({
@@ -1594,64 +2244,48 @@ impl DelegateTool {
                     }
                 };
 
-                let finished_at = chrono::Utc::now().to_rfc3339();
-                let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
-                        task_id: task_id_clone.clone(),
-                        agent: agent_name_owned,
-                        status: BackgroundTaskStatus::Completed,
-                        output: Some(output),
-                        error: None,
-                        started_at,
-                        finished_at: Some(finished_at),
-                    },
+                drop(inner);
+                drop(args_inner);
+                drop(agent_name_owned);
+                drop(full_prompt);
+                drop(workspace_dir);
+                drop(child_token);
+                let (terminal_status, terminal_error, final_result) = match outcome {
+                    Ok(output) => (
+                        crate::control_plane::TaskStatus::Completed,
+                        None,
+                        BackgroundDelegateOutput {
+                            task_id: task_id_clone.clone(),
+                            output: Some(output),
+                        },
+                    ),
                     Err(err) => {
                         let status = if err.contains("Cancelled") {
-                            BackgroundTaskStatus::Cancelled
+                            crate::control_plane::TaskStatus::Cancelled
                         } else {
-                            BackgroundTaskStatus::Failed
+                            crate::control_plane::TaskStatus::Failed
                         };
-                        BackgroundDelegateResult {
-                            task_id: task_id_clone.clone(),
-                            agent: agent_name_owned,
+                        (
                             status,
-                            output: None,
-                            error: Some(err),
-                            started_at,
-                            finished_at: Some(finished_at),
-                        }
+                            Some(err),
+                            BackgroundDelegateOutput {
+                                task_id: task_id_clone.clone(),
+                                output: None,
+                            },
+                        )
                     }
                 };
 
-                let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
-
-                if let Some(cp) = crate::control_plane::control_plane() {
-                    let cp_status = match final_result.status {
-                        BackgroundTaskStatus::Completed => {
-                            crate::control_plane::TaskStatus::Completed
-                        }
-                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
-                        BackgroundTaskStatus::Cancelled => {
-                            crate::control_plane::TaskStatus::Cancelled
-                        }
-                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
-                    };
-                    let _ = cp
-                        .store
-                        .update_status(
-                            &task_id_clone,
-                            cp_status,
-                            final_result.output.clone(),
-                            final_result.error.clone(),
-                        )
-                        .await;
-                }
-
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
+                let _won = DelegateTool::complete_background_task(
+                    terminal_store.as_ref(),
+                    &result_path,
+                    final_result,
+                    terminal_status,
+                    terminal_error,
+                    terminal_owner_pid,
+                    terminal_owner_boot_id,
+                )
+                .await;
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1785,9 +2419,13 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            // Carried, not dropped: each fan-out task rebuilds a DelegateTool
+            // that will construct its own nested registries.
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
+            let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
 
             handles.push(zeroclaw_spawn::spawn!(
@@ -1810,7 +2448,9 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
+                        task_control_plane,
                     };
                     let agent_name_for_return = agent_name.clone();
                     let result = scope_delegate_session_key(session_key, async move {
@@ -1879,69 +2519,149 @@ impl DelegateTool {
 
     // ── Result Retrieval ────────────────────────────────────────────
 
-    async fn reconciled_loss_label(
-        task_id: &str,
-        file_status: &BackgroundTaskStatus,
-    ) -> Option<&'static str> {
-        let cp = crate::control_plane::control_plane()?;
-        Self::reconciled_loss_label_with(task_id, file_status, cp.store.as_ref()).await
-    }
-
-    /// Store-injected core of [`Self::reconciled_loss_label`] — kept separate from the
-    /// process-global accessor so it is unit-testable against an in-memory store.
-    async fn reconciled_loss_label_with(
-        task_id: &str,
-        file_status: &BackgroundTaskStatus,
-        store: &dyn crate::control_plane::TaskRegistry,
-    ) -> Option<&'static str> {
-        if *file_status != BackgroundTaskStatus::Running {
-            return None;
-        }
-        match store.get(task_id).await.ok().flatten()?.status {
-            crate::control_plane::TaskStatus::Lost => Some("lost"),
-            crate::control_plane::TaskStatus::TimedOut => Some("timed_out"),
-            _ => None,
-        }
-    }
-
-    async fn read_background_result(
+    async fn read_stored_background_output(
         &self,
         task_id: &str,
-    ) -> anyhow::Result<Option<BackgroundDelegateResult>> {
+    ) -> anyhow::Result<Option<StoredBackgroundOutput>> {
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         let content = match tokio::fs::read_to_string(&result_path).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let result = serde_json::from_str(&content)?;
-        Ok(Some(result))
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        if value.get("status").is_some() {
+            let legacy: BackgroundDelegateResult = serde_json::from_value(value)?;
+            anyhow::ensure!(
+                legacy.task_id == task_id,
+                "delegate output task id does not match its filename"
+            );
+            return Ok(Some(StoredBackgroundOutput {
+                output: BackgroundDelegateOutput {
+                    task_id: legacy.task_id,
+                    output: legacy.output,
+                },
+                legacy_agent: Some(legacy.agent),
+                legacy_status: Some(legacy.status),
+                legacy_error: legacy.error,
+                legacy_started_at: Some(legacy.started_at),
+                legacy_finished_at: legacy.finished_at,
+            }));
+        }
+        let output: BackgroundDelegateOutput = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            output.task_id == task_id,
+            "delegate output task id does not match its filename"
+        );
+        Ok(Some(StoredBackgroundOutput {
+            output,
+            legacy_agent: None,
+            legacy_status: None,
+            legacy_error: None,
+            legacy_started_at: None,
+            legacy_finished_at: None,
+        }))
     }
 
-    async fn background_result_view(
+    async fn read_background_view(
+        &self,
         task_id: &str,
-        result: BackgroundDelegateResult,
-    ) -> anyhow::Result<(BackgroundResultState, serde_json::Value)> {
-        if let Some(label) = Self::reconciled_loss_label(task_id, &result.status).await {
-            let state = match label {
-                "lost" => BackgroundResultState::Lost,
-                "timed_out" => BackgroundResultState::TimedOut,
-                _ => BackgroundResultState::from_file_status(&result.status),
+        allow_legacy_terminal: bool,
+    ) -> anyhow::Result<Option<(BackgroundResultState, serde_json::Value, Option<String>)>> {
+        let control_plane = self.background_control_plane().await?;
+        if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            if !(self.owns_delegate_task(&snapshot.task)
+                || allow_legacy_terminal && self.can_read_delegate_task(&snapshot.task))
+            {
+                return Ok(None);
+            }
+            let state = BackgroundResultState::from_task_status(snapshot.task.status);
+            let mut task_error = snapshot.error;
+            let output = if state == BackgroundResultState::Completed {
+                match snapshot.output {
+                    Some(output_ref) => {
+                        if let Some(filename) =
+                            output_ref.strip_prefix(Self::OUTPUT_ARTIFACT_PREFIX)
+                        {
+                            let expected = format!("{task_id}.json");
+                            if filename != expected {
+                                task_error.get_or_insert_with(|| {
+                                    format!(
+                                        "delegate output reference '{filename}' does not match task '{task_id}'"
+                                    )
+                                });
+                                None
+                            } else {
+                                match self.read_stored_background_output(task_id).await {
+                                    Ok(Some(stored)) => stored.output.output,
+                                    Ok(None) => {
+                                        task_error.get_or_insert_with(|| {
+                                            format!(
+                                                "delegate output artifact '{filename}' is missing"
+                                            )
+                                        });
+                                        None
+                                    }
+                                    Err(error) => {
+                                        task_error.get_or_insert_with(|| {
+                                            format!(
+                                                "delegate output artifact '{filename}' is unreadable: {error:#}"
+                                            )
+                                        });
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            Some(output_ref)
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
             };
-            return Ok((
+            let note = matches!(state, BackgroundResultState::Lost | BackgroundResultState::TimedOut)
+                .then_some(
+                    "the owning daemon exited or the task exceeded its max runtime; reconciled by the supervision reaper",
+                );
+            return Ok(Some((
                 state,
                 json!({
                     "task_id": task_id,
-                    "agent": result.agent,
-                    "status": label,
-                    "started_at": result.started_at,
-                    "note": "the owning daemon exited or the task exceeded its max runtime; \
-                             reconciled by the supervision reaper",
+                    "agent": snapshot.task.agent,
+                    "status": state.as_str(),
+                    "output": output,
+                    "error": task_error.clone(),
+                    "started_at": snapshot.task.started_at,
+                    "finished_at": snapshot.task.finished_at,
+                    "note": note,
                 }),
-            ));
+                task_error,
+            )));
         }
-        let state = BackgroundResultState::from_file_status(&result.status);
-        Ok((state, serde_json::to_value(result)?))
+
+        let stored = self.read_stored_background_output(task_id).await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let Some(status) = stored.legacy_status else {
+            return Ok(None);
+        };
+        let state = BackgroundResultState::from_file_status(&status);
+        Ok(Some((
+            state,
+            json!({
+                "task_id": stored.output.task_id,
+                "agent": stored.legacy_agent,
+                "status": state.as_str(),
+                "output": stored.output.output,
+                "error": stored.legacy_error,
+                "started_at": stored.legacy_started_at,
+                "finished_at": stored.legacy_finished_at,
+            }),
+            stored.legacy_error,
+        )))
     }
 
     fn task_ids_from_args(args: &serde_json::Value) -> anyhow::Result<Vec<String>> {
@@ -2019,24 +2739,23 @@ impl DelegateTool {
             });
         }
 
-        let Some(result) = self.read_background_result(task_id).await? else {
+        let Some((state, value, task_error)) = self.read_background_view(task_id, true).await?
+        else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("No result found for task_id '{task_id}'")),
             });
         };
-        let error = result.error.clone();
-        let (state, value) = Self::background_result_view(task_id, result).await?;
-        let success = state.is_success();
+        let success = state.is_success() && task_error.is_none();
 
         Ok(ToolResult {
             success,
             output: serde_json::to_string_pretty(&value)?.into(),
-            error: if success {
-                None
-            } else if let Some(error) = error {
+            error: if let Some(error) = task_error {
                 Some(error)
+            } else if success {
+                None
             } else if state.is_failure() {
                 Some(format!(
                     "background task is {} and will not complete",
@@ -2078,14 +2797,15 @@ impl DelegateTool {
             let mut failed = Vec::new();
 
             for task_id in &task_ids {
-                let Some(result) = self.read_background_result(task_id).await? else {
+                let Some((state, value, task_error)) =
+                    self.read_background_view(task_id, true).await?
+                else {
                     missing.push(task_id.clone());
                     continue;
                 };
-                let (state, value) = Self::background_result_view(task_id, result).await?;
                 if state.is_pending() {
                     pending.push(task_id.clone());
-                } else if state.is_failure() {
+                } else if state.is_failure() || task_error.is_some() {
                     failed.push(task_id.clone());
                 }
                 results.push(value);
@@ -2104,7 +2824,10 @@ impl DelegateTool {
                 } else if timed_out {
                     Some("one or more background tasks are still pending or missing".into())
                 } else {
-                    Some("one or more background tasks failed or were cancelled".into())
+                    Some(
+                        "one or more background tasks failed, were cancelled, or have unreadable output"
+                            .into(),
+                    )
                 };
                 return Ok(ToolResult {
                     success,
@@ -2142,22 +2865,17 @@ impl DelegateTool {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json")
-                && let Ok(content) = tokio::fs::read_to_string(&path).await
-                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
+                && let Some(task_id) = path.file_stem().and_then(|value| value.to_str())
+                && Self::validate_task_id(task_id).is_ok()
+                && let Some((_, result, _)) = self.read_background_view(task_id, false).await?
             {
-                // Surface the reconciled loss state (lost/timed_out) for a task whose flat
-                // file still says `Running` but whose owning daemon died / timed out.
-                let status =
-                    match Self::reconciled_loss_label(&result.task_id, &result.status).await {
-                        Some(label) => json!(label),
-                        None => json!(result.status),
-                    };
                 results.push(json!({
-                    "task_id": result.task_id,
-                    "agent": result.agent,
-                    "status": status,
-                    "started_at": result.started_at,
-                    "finished_at": result.finished_at,
+                    "task_id": result.get("task_id"),
+                    "agent": result.get("agent"),
+                    "status": result.get("status"),
+                    "error": result.get("error"),
+                    "started_at": result.get("started_at"),
+                    "finished_at": result.get("finished_at"),
                 }));
             }
         }
@@ -2221,19 +2939,84 @@ impl DelegateTool {
             });
         }
 
-        let result_path = self.results_dir().join(format!("{task_id}.json"));
-        if !result_path.exists() {
+        let control_plane = self.background_control_plane().await?;
+        if let Some(snapshot) = control_plane.store.get_snapshot(task_id).await? {
+            if !self.owns_delegate_task(&snapshot.task) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
+            if snapshot.task.status != crate::control_plane::TaskStatus::Running {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Task '{task_id}' is not running (status: {:?})",
+                        snapshot.task.status
+                    )),
+                });
+            }
+
+            let (won, aborted) = Self::settle_background_cancellation(task_id, || {
+                control_plane.store.transition_terminal(
+                    task_id,
+                    crate::control_plane::TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled by user request".into()),
+                )
+            })
+            .await?;
+            if !won {
+                let status = control_plane
+                    .store
+                    .get(task_id)
+                    .await?
+                    .map(|task| format!("{:?}", task.status))
+                    .unwrap_or_else(|| "missing".into());
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Task '{task_id}' is not running (status: {status})"
+                    )),
+                });
+            }
             return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("No task found for task_id '{task_id}'")),
+                success: true,
+                output: if aborted {
+                    format!("Task '{task_id}' cancelled: the running task was aborted.").into()
+                } else {
+                    format!("Task '{task_id}' marked cancelled (it had already settled).").into()
+                },
+                error: None,
             });
         }
 
-        // Read current status
-        let content = tokio::fs::read_to_string(&result_path).await?;
-        let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
-
+        // Compatibility path for legacy result files without a task row.
+        let result_path = self.results_dir().join(format!("{task_id}.json"));
+        let content = match tokio::fs::read_to_string(&result_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut result: BackgroundDelegateResult = match serde_json::from_str(&content) {
+            Ok(result) => result,
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("No task found for task_id '{task_id}'")),
+                });
+            }
+        };
         if result.status != BackgroundTaskStatus::Running {
             return Ok(ToolResult {
                 success: false,
@@ -2244,10 +3027,6 @@ impl DelegateTool {
                 )),
             });
         }
-
-        // Actually abort the running task by signalling its registered cancel token —
-        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
-        // Falls back to file-marking when the task already settled (token absent).
         let aborted = Self::background_task_cancels()
             .lock()
             .remove(task_id)
@@ -2258,19 +3037,6 @@ impl DelegateTool {
         result.error = Some("Cancelled by user request".into());
         result.finished_at = Some(chrono::Utc::now().to_rfc3339());
         Self::write_result_atomic(&result_path, &result).await?;
-
-        // Reconcile the durable supervision registry so the supervised view agrees.
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .update_status(
-                    task_id,
-                    crate::control_plane::TaskStatus::Cancelled,
-                    None,
-                    Some("cancelled by user request".into()),
-                )
-                .await;
-        }
 
         Ok(ToolResult {
             success: true,
@@ -2325,6 +3091,10 @@ impl DelegateTool {
         sends_native_tool_specs: bool,
         skills_override: Option<&[crate::skills::Skill]>,
     ) -> Option<String> {
+        let mut resolved_agent_config = agent_config.clone();
+        resolved_agent_config.resolved = self.resolve_loop_runtime(agent_alias, agent_config);
+        let agent_config = &resolved_agent_config;
+
         let resolved_skills: Vec<crate::skills::Skill>;
         let skills: &[crate::skills::Skill] = match skills_override {
             Some(s) => s,
@@ -2349,8 +3119,6 @@ impl DelegateTool {
             }
         };
 
-        // Determine shell policy instructions when the `shell` tool is in the
-        // effective tool list.
         let empty_tools: &[Box<dyn Tool>] = &[];
         let expose_text_tools =
             sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
@@ -2359,47 +3127,41 @@ impl DelegateTool {
         } else {
             empty_tools
         };
-        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
-        let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
-        } else {
-            String::new()
-        };
+
+        let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
+        let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
+            String::new()
+        } else {
+            XmlToolDispatcher.prompt_instructions(prompt_tools)
+        };
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
             model_name,
             tools: prompt_tools,
             skills,
-            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
-            dispatcher_instructions: "",
+            interaction: None,
+            dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
-
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            shell_profile,
         };
 
         let builder = SystemPromptBuilder::default()
             .add_section(Box::new(crate::agent::prompt::ToolsSection))
             .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
             .add_section(Box::new(crate::agent::prompt::DateTimeSection));
 
         let mut enriched = builder.build(&ctx).unwrap_or_default();
-
-        if !shell_policy.is_empty() {
-            enriched.push_str(&shell_policy);
-            enriched.push_str("\n\n");
-        }
 
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
@@ -2489,6 +3251,18 @@ impl DelegateTool {
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
+        // Independent delegates are fresh, non-interactive target turns. Give the
+        // nested loop a fresh manager from the target profile so prompt-required
+        // tools fail closed before dispatch; built-in shell remains ungated here
+        // and receives approved=false for its own command-policy enforcement.
+        let approval_manager = if target_mode == DelegateExecutionMode::Independent {
+            self.root_config
+                .as_ref()
+                .and_then(|config| config.risk_profile_for_agent(agent_name))
+                .map(ApprovalManager::for_non_interactive)
+        } else {
+            None
+        };
         // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
         // inject the deferred-tools prompt section and thread the activated set, exactly as
         // a fresh target turn does. Bounded delegation leaves these empty (it starts from
@@ -2504,7 +3278,7 @@ impl DelegateTool {
         // describes exactly the assembled skill tools rather than the local bundle resolver's
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
-        let sub_tools: Vec<Box<dyn Tool>> = match target_mode {
+        let sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
@@ -2559,24 +3333,82 @@ impl DelegateTool {
                     HashMap::new()
                 };
 
-                let parent_tools = self.parent_tools.read();
-                parent_tools
-                    .iter()
-                    .filter(|tool| tool.name() != Self::NAME)
-                    .filter(|tool| self.security.is_tool_allowed(tool.name()))
-                    .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
-                    .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                // Build the bounded tool set exactly as before: the parent's
+                // tools, filtered by the caller's own `is_tool_allowed` +
+                // `delegate_admits_with_mcp`, with the target's memory tools
+                // substituted in. The `parent_tools` read guard is scoped to
+                // this block so it drops BEFORE the `assemble().await` below - a
+                // parking_lot guard held across an await would make the delegate
+                // future `!Send`.
+                let filtered: Vec<Box<dyn Tool>> = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools
+                        .iter()
+                        .filter(|tool| tool.name() != Self::NAME)
+                        .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                        .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        .map(|tool| {
+                            target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
+                                Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                            })
                         })
-                    })
-                    .collect()
+                        .collect()
+                };
+                // Seal the already-filtered set through the one assembly seam.
+                // The policy is `SecurityPolicy::default()` (no allow/deny
+                // lists), so `assemble`'s built-in filter is a provable identity
+                // over `filtered`: it drops nothing the delegate filter kept.
+                // Re-applying `self.security` here would double-filter and could
+                // REGRESS delegate scoping, so it is deliberately NOT reused. No
+                // peripherals / MCP / skills / memory-strip. A default config is
+                // load-bearing here: the caller's config could synthesize pipeline
+                // tools and violate the bounded parent-registry ceiling.
+                let bounded_default_config = Config::default();
+                let bounded_security = Arc::new(SecurityPolicy::default());
+                let assembled_bounded = crate::tools::scoped::ScopedToolRegistry::assemble(
+                    crate::tools::scoped::ScopedAssembly {
+                        config: &bounded_default_config,
+                        agent_alias: agent_name,
+                        security: &bounded_security,
+                        built: crate::tools::AllToolsResult::from_prebuilt_tools(filtered),
+                        // Empty is load-bearing: bounded children inherit no target skill
+                        // tools, and a non-empty list would make this default policy active.
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: None,
+                        connect_mcp: false,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: None,
+                    },
+                )
+                .await;
+                assembled_bounded.registry
             }
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
-        let mut prompt_agent_config = agent_config.clone();
-        prompt_agent_config.resolved = loop_runtime.clone();
+        let native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+
+        // Independent delegates execute as target-owned turns, so their thinking policy
+        // must override the parent task-local scope for the child loop. Bounded delegates
+        // deliberately retain the caller's turn context.
+        let thinking_params = (target_mode == DelegateExecutionMode::Independent).then(|| {
+            crate::agent::thinking::apply_thinking_level_with_config(
+                loop_runtime.thinking.default_level,
+                &loop_runtime.thinking,
+            )
+        });
+        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
+            temperature.map(|value| {
+                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
+            })
+        });
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2585,11 +3417,11 @@ impl DelegateTool {
         let prompt_workspace = sub_workspace.as_deref().unwrap_or(&self.workspace_dir);
         let enriched_system_prompt = self.build_enriched_system_prompt(
             agent_name,
-            &prompt_agent_config,
+            agent_config,
             model,
             &sub_tools,
             prompt_workspace,
-            model_provider.supports_native_tools(),
+            native_tools,
             sub_skills.as_deref(),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
@@ -2599,9 +3431,19 @@ impl DelegateTool {
         let enriched_system_prompt = Self::compose_independent_system_prompt(
             enriched_system_prompt,
             sub_deferred_section,
-            model_provider.supports_native_tools(),
+            native_tools,
             loop_runtime.strict_tool_parsing,
         );
+        let enriched_system_prompt = match (
+            enriched_system_prompt,
+            thinking_params
+                .as_ref()
+                .and_then(|params| params.system_prompt_prefix.as_deref()),
+        ) {
+            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+            (None, Some(prefix)) => Some(prefix.to_string()),
+            (prompt, None) => prompt,
+        };
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -2621,7 +3463,9 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let result = tokio::time::timeout(
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let loop_knobs = LoopKnobs::default();
+        let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
@@ -2630,13 +3474,13 @@ impl DelegateTool {
                         model_provider,
                         provider_name: provider_type,
                         model,
-                        temperature,
+                        temperature: effective_temperature,
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
                         observer: &noop_observer,
                         silent: true,
-                        approval: None,
+                        approval: approval_manager.as_ref(),
                         multimodal_config: &self.multimodal_config,
                         // Full config so the delegated sub-agent's vision route
                         // resolves the configured `vision_model_provider`'s alias
@@ -2650,21 +3494,20 @@ impl DelegateTool {
                         // an independent target with granted deferred-MCP bundles).
                         activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
-                        // delegate subagents don't support approval
                         receipt_generator,
                     },
                     ResolvedRuntimeKnobs {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
+                        knobs: &loop_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2691,30 +3534,34 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
-        )
-        .await;
+        );
+        let result = match thinking_params {
+            Some(params) => {
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(params.native_thinking, execution)
+                    .await
+            }
+            None => execution.await,
+        };
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
-                    "[Empty response]".to_string()
-                } else {
-                    response
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    )
-                    .into(),
-                    error: None,
-                })
-            }
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(invalid_semantic_completion_error(agent_name)),
+            }),
+            Ok(Ok(response)) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                )
+                .into(),
+                error: None,
+            }),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                error: Some(delegate_failure_error(agent_name, &e)),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -2744,6 +3591,9 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -2766,6 +3616,17 @@ impl Tool for ToolArcRef {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
+    // schemas; the trait default would rebuild the spec from
+    // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2792,104 +3653,1040 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::RuntimeAdapter;
+    use crate::control_plane::{
+        ControlPlaneHandle, SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+    };
+    use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
+    use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
-        ModelProviderConfig,
+        ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
-    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+    use zeroclaw_providers::{
+        ChatRequest, ChatResponse, ReliableProviderTerminalFailure,
+        ReliableProviderTerminalFailureKind, ToolCall,
+    };
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
-    #[tokio::test]
-    async fn reconciled_loss_label_surfaces_registry_truth() {
-        use crate::control_plane::{
-            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
-        };
-        let store = SqliteTaskStore::new_in_memory().unwrap();
-        let rec = |id: &str, status: TaskStatus| TaskRecord {
+    fn task_record(id: &str, status: TaskStatus) -> TaskRecord {
+        TaskRecord {
             id: id.into(),
             kind: TaskKind::Delegate,
             agent: "main".into(),
             status,
             owner_pid: 0,
-            owner_boot_id: "b".into(),
+            owner_boot_id: "test-boot".into(),
             heartbeat_at: None,
             depth: 0,
             parent_id: None,
-            originator_route: None,
+            originator_route: Some("caller".into()),
             delivered: false,
             idem_key: None,
             principal_id: None,
             started_at: "2026-06-21T00:00:00Z".into(),
             finished_at: None,
-        };
-        store.create(rec("lost", TaskStatus::Lost)).await.unwrap();
+        }
+    }
+
+    fn task_control_plane(store: Arc<dyn TaskRegistry>) -> ControlPlaneHandle {
+        ControlPlaneHandle {
+            store,
+            boot_id: "test-boot".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_store_status_overrides_legacy_result_status() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "11111111-1111-1111-1111-111111111111";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut task = task_record(task_id, TaskStatus::Lost);
+        task.finished_at = Some("2026-06-21T00:01:00Z".into());
+        store.create(task).await.unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        DelegateTool::write_result_atomic(
+            &tool.results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateResult {
+                task_id: task_id.into(),
+                agent: "main".into(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some("stale output".into()),
+                error: None,
+                started_at: "2026-06-21T00:00:00Z".into(),
+                finished_at: Some("2026-06-21T00:00:30Z".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (state, view, _) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, BackgroundResultState::Lost);
+        assert_eq!(view["status"], "lost");
+        assert!(view["output"].is_null());
+    }
+
+    #[tokio::test]
+    async fn legacy_result_status_remains_readable_without_task_row() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "22222222-2222-2222-2222-222222222222";
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+                .with_workspace_dir(temp.path().into()),
+        );
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        DelegateTool::write_result_atomic(
+            &tool.results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateResult {
+                task_id: task_id.into(),
+                agent: "main".into(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some("legacy output".into()),
+                error: None,
+                started_at: "2026-06-21T00:00:00Z".into(),
+                finished_at: Some("2026-06-21T00:00:30Z".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (state, view, _) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["output"], "legacy output");
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_task_output_remains_readable_without_an_artifact() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "66666666-6666-6666-6666-666666666666";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut legacy_task = task_record(task_id, TaskStatus::Running);
+        legacy_task.originator_route = None;
+        store.create(legacy_task).await.unwrap();
         store
-            .create(rec("timed", TaskStatus::TimedOut))
+            .update_status(
+                task_id,
+                TaskStatus::Completed,
+                Some("legacy inline output".into()),
+                None,
+            )
             .await
             .unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+
+        let (state, view, _) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["output"], "legacy inline output");
+
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(checked.success);
+        assert!(checked.output.contains("legacy inline output"));
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [task_id], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(awaited.success);
+        assert!(awaited.output.contains("legacy inline output"));
+    }
+
+    #[tokio::test]
+    async fn nonterminal_legacy_task_without_an_origin_remains_hidden() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "67676767-6767-6767-6767-676767676767";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut legacy_task = task_record(task_id, TaskStatus::Running);
+        legacy_task.originator_route = None;
+        store.create(legacy_task).await.unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+
+        assert!(
+            tool.read_background_view(task_id, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_legacy_artifact_is_readable_only_by_exact_task_id() {
+        let temp = TempDir::new().unwrap();
+        let task_id = "68686868-6868-6868-6868-686868686868";
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let mut legacy_task = task_record(task_id, TaskStatus::Running);
+        legacy_task.originator_route = None;
+        store.create(legacy_task).await.unwrap();
         store
-            .create(rec("alive", TaskStatus::Running))
+            .transition_terminal(
+                task_id,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{task_id}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
+            )
             .await
             .unwrap();
 
-        // Flat file says Running + registry reconciled to a loss state → surface the loss.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "lost",
-                &BackgroundTaskStatus::Running,
-                &store
-            )
-            .await,
-            Some("lost")
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        DelegateTool::write_result_atomic(
+            &tool.results_dir().join(format!("{task_id}.json")),
+            &BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("legacy output".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (_, view, _) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view["output"], "legacy output");
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(checked.success);
+        assert!(checked.output.contains("legacy output"));
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [task_id], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(awaited.success);
+        assert!(awaited.output.contains("legacy output"));
+        assert!(
+            tool.read_background_view(task_id, false)
+                .await
+                .unwrap()
+                .is_none()
         );
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "timed",
-                &BackgroundTaskStatus::Running,
-                &store
-            )
-            .await,
-            Some("timed_out")
+        assert!(
+            !tool
+                .handle_list_results()
+                .await
+                .unwrap()
+                .output
+                .contains(task_id)
         );
-        // Registry still Running → nothing to overlay.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "alive",
-                &BackgroundTaskStatus::Running,
-                &store
-            )
-            .await,
-            None
+        let cancelled = tool
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!cancelled.success);
+        assert!(
+            cancelled
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("No task found"))
         );
-        // The flat file already wrote a terminal state → it is authoritative, no overlay.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "lost",
-                &BackgroundTaskStatus::Completed,
-                &store
+    }
+
+    #[tokio::test]
+    async fn background_lifecycle_reports_artifact_errors_without_changing_terminal_status() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let missing = "77777777-7777-7777-7777-777777777777";
+        let corrupt = "88888888-8888-8888-8888-888888888888";
+        let mismatched = "99999999-9999-9999-9999-999999999999";
+        for task_id in [missing, corrupt, mismatched] {
+            store
+                .create(task_record(task_id, TaskStatus::Running))
+                .await
+                .unwrap();
+        }
+        store
+            .transition_terminal(
+                missing,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{missing}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
             )
-            .await,
-            None
-        );
-        // Unknown task → None.
-        assert_eq!(
-            DelegateTool::reconciled_loss_label_with(
-                "missing",
-                &BackgroundTaskStatus::Running,
-                &store
+            .await
+            .unwrap();
+        store
+            .transition_terminal(
+                corrupt,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}{corrupt}.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
             )
-            .await,
-            None
+            .await
+            .unwrap();
+        store
+            .transition_terminal(
+                mismatched,
+                TaskStatus::Completed,
+                Some(format!(
+                    "{}wrong-task.json",
+                    DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(temp.path().join("delegate_results"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            temp.path()
+                .join("delegate_results")
+                .join(format!("{corrupt}.json")),
+            b"{not-json",
+        )
+        .await
+        .unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+
+        for (task_id, expected_error) in [
+            (missing, "is missing"),
+            (corrupt, "is unreadable"),
+            (mismatched, "does not match task"),
+        ] {
+            let (state, view, error) = tool
+                .read_background_view(task_id, true)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state, BackgroundResultState::Completed);
+            assert_eq!(view["status"], "completed");
+            assert!(view["output"].is_null());
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected_error))
+            );
+        }
+
+        let check = tool
+            .handle_check_result(&json!({"task_id": missing}))
+            .await
+            .unwrap();
+        assert!(!check.success);
+        assert!(check.output.contains("\"status\": \"completed\""));
+
+        let awaited = tool
+            .handle_await_sessions(&json!({"task_ids": [missing], "timeout_ms": 0}))
+            .await
+            .unwrap();
+        assert!(!awaited.success);
+        assert!(awaited.output.contains(missing));
+        assert!(awaited.output.contains("\"failed\""));
+    }
+
+    #[test]
+    fn current_background_output_artifact_has_no_lifecycle_status() {
+        let value = serde_json::to_value(BackgroundDelegateOutput {
+            task_id: "33333333-3333-3333-3333-333333333333".into(),
+            output: Some("done".into()),
+        })
+        .unwrap();
+        assert!(value.get("status").is_none());
+        assert!(value.get("error").is_none());
+        assert!(value.get("started_at").is_none());
+        assert!(value.get("finished_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn output_failure_is_recorded_as_the_terminal_task_failure() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "44444444-4444-4444-4444-444444444444";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let missing_parent = temp.path().join("missing").join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+
+        assert!(
+            DelegateTool::settle_background_task(
+                &store,
+                &missing_parent,
+                result,
+                TaskStatus::Completed,
+                None,
+                0,
+                "test-boot".into(),
+            )
+            .await
+            .unwrap()
         );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert!(snapshot.output.is_none());
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("failed to persist delegate output:"))
+        );
+    }
+
+    #[test]
+    fn background_result_path_is_resolved_before_registration() {
+        let result_path =
+            DelegateTool::durable_artifact_path(Path::new("delegate_results/task.json")).unwrap();
+        assert!(result_path.is_absolute());
+        assert_eq!(
+            result_path.file_name().and_then(|name| name.to_str()),
+            Some("task.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_intent_settlement_failure_is_terminal_and_cleans_token() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "45454545-4545-4545-4545-454545454545";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let won = DelegateTool::complete_background_task(
+            store.as_ref(),
+            Path::new("relative-delegate-results/task.json"),
+            BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("done".into()),
+            },
+            TaskStatus::Completed,
+            None,
+            0,
+            "test-boot".into(),
+        )
+        .await;
+
+        assert!(won);
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Failed);
+        assert!(snapshot.error.as_deref().is_some_and(|error| {
+            error.contains("failed to prepare delegate settlement")
+                && error.contains("not absolute")
+        }));
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_none(),
+            "the live cancellation token is removed only after terminal settlement"
+        );
+        assert!(!token.is_cancelled());
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(Arc::clone(&store)));
+        let checked = tool
+            .handle_check_result(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!checked.success);
+        let checked_value: serde_json::Value = serde_json::from_str(&checked.output).unwrap();
+        assert_eq!(checked_value["status"], "failed");
+        assert!(!checked.output.contains("pending"));
+        assert!(checked.error.as_deref().is_some_and(|error| {
+            error.contains("failed to prepare delegate settlement")
+                && error.contains("not absolute")
+        }));
+    }
+
+    #[tokio::test]
+    async fn stale_owner_pre_intent_failure_does_not_mutate_transferred_task() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "46464646-4646-4646-4646-464646464646";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = 7;
+        task.owner_boot_id = "boot-old".into();
+        store.create(task).await.unwrap();
+        store.claim_owner(task_id, 42, "boot-new").await.unwrap();
+
+        let settled = DelegateTool::settle_background_task(
+            store.as_ref(),
+            Path::new("relative-delegate-results/task.json"),
+            BackgroundDelegateOutput {
+                task_id: task_id.into(),
+                output: Some("stale output".into()),
+            },
+            TaskStatus::Completed,
+            None,
+            7,
+            "boot-old".into(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!settled);
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Running);
+        assert_eq!(snapshot.task.owner_pid, 42);
+        assert_eq!(snapshot.task.owner_boot_id, "boot-new");
+        assert!(snapshot.output.is_none());
+        assert!(snapshot.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn successful_in_process_settlement_removes_its_intent() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "settlement-success";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        let temp = TempDir::new().unwrap();
+        let result_path = temp.path().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+
+        assert!(
+            DelegateTool::settle_background_task(
+                &store,
+                &result_path,
+                result,
+                TaskStatus::Completed,
+                None,
+                0,
+                "test-boot".into(),
+            )
+            .await
+            .unwrap()
+        );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(
+            snapshot.output.as_deref(),
+            Some("artifact:settlement-success.json")
+        );
+        assert!(
+            store
+                .list_terminal_settlement_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_settlement_is_readable_through_the_background_view() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "settlement-recovered";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = 999_999;
+        task.owner_boot_id = "boot-old".into();
+        store.create(task).await.unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let results_dir = temp.path().join("delegate_results");
+        tokio::fs::create_dir_all(&results_dir).await.unwrap();
+        let result_path = results_dir.join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("done".into()),
+        };
+        let bytes = DelegateTool::serialize_result(&result).unwrap();
+        tokio::fs::write(&result_path, &bytes).await.unwrap();
+        store
+            .persist_terminal_settlement_intent(
+                crate::control_plane::task_registry::TerminalSettlementIntent {
+                    task_id: task_id.into(),
+                    owner_pid: 999_999,
+                    owner_boot_id: "boot-old".into(),
+                    desired_status: TaskStatus::Completed,
+                    artifact_path: result_path.display().to_string(),
+                    artifact_ref: Some(format!(
+                        "{}{task_id}.json",
+                        DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                    )),
+                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                    terminal_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::control_plane::reaper::recovery_pass(store.as_ref(), "boot-new")
+                .await
+                .unwrap(),
+            1
+        );
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        let (state, view, error) = tool
+            .read_background_view(task_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(state, BackgroundResultState::Completed);
+        assert_eq!(view["output"], "done");
+        assert!(error.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "real child process and production 60-second recovery interval"]
+    async fn non_daemon_reaper_recovers_exited_child_settlement_for_await_sessions() {
+        struct ChildGuard(std::process::Child);
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut child = ChildGuard(
+            std::process::Command::new(current_exe)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "control_plane::boot::tests::live_owner_process_helper",
+                ])
+                .env("ZEROCLAW_LIVE_OWNER_TEST_HELPER", "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let child_pid = child.0.id();
+        let pid = sysinfo::Pid::from_u32(child_pid);
+        let mut child_started_at = None;
+        for _ in 0..50 {
+            let mut system = sysinfo::System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            child_started_at = system
+                .process(pid)
+                .map(sysinfo::Process::start_time)
+                .filter(|value| *value > 0);
+            if child_started_at.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_started_at = child_started_at.expect("child process should be visible");
+        let child_identity = format!("zc-process-v1:{child_pid}:{child_started_at}:test-owner");
+
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace_dir = temp.path().join("workspace");
+        let root_config = Arc::new(Config {
+            data_dir,
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        });
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace_dir)
+            .with_caller_alias("caller");
+        let control_plane = tool.background_control_plane().await.unwrap();
+        let task_id = "66666666-6666-4666-8666-666666666666";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.owner_pid = child_pid;
+        task.owner_boot_id = child_identity.clone();
+        control_plane.store.create(task).await.unwrap();
+
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        let result_path = tool.results_dir().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("recovered child output".into()),
+        };
+        let bytes = DelegateTool::serialize_result(&result).unwrap();
+        DelegateTool::write_bytes_atomic(&result_path, &bytes)
+            .await
+            .unwrap();
+        control_plane
+            .store
+            .persist_terminal_settlement_intent(
+                crate::control_plane::task_registry::TerminalSettlementIntent {
+                    task_id: task_id.into(),
+                    owner_pid: child_pid,
+                    owner_boot_id: child_identity,
+                    desired_status: TaskStatus::Completed,
+                    artifact_path: result_path.display().to_string(),
+                    artifact_ref: Some(format!(
+                        "{}{task_id}.json",
+                        DelegateTool::OUTPUT_ARTIFACT_PREFIX
+                    )),
+                    artifact_sha256: hex::encode(Sha256::digest(&bytes)),
+                    terminal_error: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Let the reaper's immediate first tick observe the still-live owner. The
+        // next production interval must recover only after that process exits.
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            control_plane
+                .store
+                .get(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+
+        let awaited = tool
+            .handle_await_sessions(&json!({
+                "task_ids": [task_id],
+                "timeout_ms": 65_000,
+            }))
+            .await
+            .unwrap();
+        assert!(awaited.success, "await failed: {:?}", awaited.error);
+        let payload: serde_json::Value = serde_json::from_str(&awaited.output).unwrap();
+        assert_eq!(payload["status"], "complete");
+        assert_eq!(payload["completed"], 1);
+        assert_eq!(payload["results"][0]["status"], "completed");
+        assert_eq!(payload["results"][0]["output"], "recovered child output");
+    }
+
+    #[tokio::test]
+    async fn earlier_terminal_status_wins_even_when_output_writes_later() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let task_id = "55555555-5555-5555-5555-555555555555";
+        store
+            .create(task_record(task_id, TaskStatus::Running))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .transition_terminal(
+                    task_id,
+                    TaskStatus::Cancelled,
+                    None,
+                    Some("cancelled first".into()),
+                )
+                .await
+                .unwrap()
+        );
+        let temp = TempDir::new().unwrap();
+        let result_path = temp.path().join(format!("{task_id}.json"));
+        let result = BackgroundDelegateOutput {
+            task_id: task_id.into(),
+            output: Some("late output".into()),
+        };
+
+        assert!(
+            !DelegateTool::settle_background_task(
+                &store,
+                &result_path,
+                result,
+                TaskStatus::Completed,
+                None,
+                0,
+                "test-boot".into(),
+            )
+            .await
+            .unwrap()
+        );
+        let snapshot = store.get_snapshot(task_id).await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
+        assert!(snapshot.output.is_none());
+        assert_eq!(snapshot.error.as_deref(), Some("cancelled first"));
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_retries_transient_store_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let won = DelegateTool::retry_terminal_transition(|| {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    anyhow::bail!("transient store error");
+                }
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(won);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_stops_after_bounded_store_errors() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = DelegateTool::retry_terminal_transition(|| {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { anyhow::bail!("persistent store error") }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(error.to_string().contains("after bounded retries"));
+    }
+
+    #[tokio::test]
+    async fn completion_supervisor_retries_beyond_the_old_bounded_window() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let won = DelegateTool::supervise_terminal_transition("task", || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if attempt < 4 {
+                    anyhow::bail!("persistent store error");
+                }
+                Ok(true)
+            }
+        })
+        .await;
+
+        assert!(won);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_worker_live_when_terminal_write_fails() {
+        let task_id = "test-cancel-persistent-store-error";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let error = DelegateTool::settle_background_cancellation(task_id, || async {
+            anyhow::bail!("persistent store error")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("after bounded retries"));
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_worker_only_after_terminal_write_wins() {
+        let task_id = "test-cancel-after-terminal-write";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        let (won, aborted) = DelegateTool::settle_background_cancellation(task_id, || {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let token = token.clone();
+            async move {
+                assert!(!token.is_cancelled());
+                if attempt == 0 {
+                    anyhow::bail!("transient store error");
+                }
+                Ok(true)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(won);
+        assert!(aborted);
+        assert!(token.is_cancelled());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_worker_live_when_terminal_write_loses() {
+        let task_id = "test-cancel-lost-terminal-race";
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+
+        let (won, aborted) =
+            DelegateTool::settle_background_cancellation(task_id, || async { Ok(false) })
+                .await
+                .unwrap();
+
+        assert!(!won);
+        assert!(!aborted);
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_views_reject_foreign_kinds_callers_and_missing_origins() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let authorized = "10101010-1010-1010-1010-101010101010";
+        let wrong_kind = "20202020-2020-2020-2020-202020202020";
+        let wrong_caller = "30303030-3030-3030-3030-303030303030";
+        let missing_origin = "40404040-4040-4040-4040-404040404040";
+
+        store
+            .create(task_record(authorized, TaskStatus::Running))
+            .await
+            .unwrap();
+        let mut task = task_record(wrong_kind, TaskStatus::Running);
+        task.kind = TaskKind::Subagent;
+        store.create(task).await.unwrap();
+        let mut task = task_record(wrong_caller, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let mut task = task_record(missing_origin, TaskStatus::Running);
+        task.originator_route = None;
+        store.create(task).await.unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        assert!(
+            tool.read_background_view(authorized, true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for task_id in [wrong_kind, wrong_caller, missing_origin] {
+            assert!(
+                tool.read_background_view(task_id, true)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_delegate_cancellation_does_not_touch_its_token() {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let task_id = "50505050-5050-5050-5050-505050505050";
+        let mut task = task_record(task_id, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let token = CancellationToken::new();
+        DelegateTool::background_task_cancels()
+            .lock()
+            .insert(task_id.into(), token.clone());
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+
+        let result = tool
+            .handle_cancel_task(&json!({"task_id": task_id}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!token.is_cancelled());
+        assert!(
+            DelegateTool::background_task_cancels()
+                .lock()
+                .remove(task_id)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn list_results_filters_foreign_delegate_rows() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let authorized = "60606060-6060-6060-6060-606060606060";
+        let foreign = "70707070-7070-7070-7070-707070707070";
+        store
+            .create(task_record(authorized, TaskStatus::Running))
+            .await
+            .unwrap();
+        let mut task = task_record(foreign, TaskStatus::Running);
+        task.originator_route = Some("other".into());
+        store.create(task).await.unwrap();
+        let tool = DelegateTool::new(HashMap::new(), None, Arc::new(SecurityPolicy::default()))
+            .with_workspace_dir(temp.path().into())
+            .with_caller_alias("caller")
+            .with_task_control_plane(task_control_plane(store));
+        tokio::fs::create_dir_all(tool.results_dir()).await.unwrap();
+        for task_id in [authorized, foreign] {
+            DelegateTool::write_result_atomic(
+                &tool.results_dir().join(format!("{task_id}.json")),
+                &BackgroundDelegateOutput {
+                    task_id: task_id.into(),
+                    output: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let listed = tool.handle_list_results().await.unwrap();
+        assert!(listed.success);
+        assert!(listed.output.contains(authorized));
+        assert!(!listed.output.contains(foreign));
     }
 
     #[tokio::test]
@@ -2943,10 +4740,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -2957,6 +4750,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -3004,33 +4801,75 @@ mod tests {
     }
 
     async fn wait_for_terminal_background_result(
-        workspace: &Path,
+        tool: &DelegateTool,
         task_id: &str,
     ) -> BackgroundDelegateResult {
-        let result_path = workspace
-            .join("delegate_results")
-            .join(format!("{task_id}.json"));
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut last_result = None;
+        let mut last_status = None;
 
         loop {
-            if let Ok(content) = std::fs::read_to_string(&result_path)
-                && let Ok(result) = serde_json::from_str::<BackgroundDelegateResult>(&content)
-            {
-                if result.status != BackgroundTaskStatus::Running {
-                    return result;
+            if let Ok(Some((state, view, error))) = tool.read_background_view(task_id, true).await {
+                if !state.is_pending() {
+                    if state == BackgroundResultState::Completed {
+                        let artifact_path = tool.results_dir().join(format!("{task_id}.json"));
+                        let artifact = std::fs::read_to_string(&artifact_path)
+                            .unwrap_or_else(|read_error| {
+                                panic!(
+                                    "completed background task {task_id} has no readable output artifact at {artifact_path:?}: {read_error}"
+                                )
+                            });
+                        let artifact: BackgroundDelegateOutput = serde_json::from_str(&artifact)
+                            .unwrap_or_else(|parse_error| {
+                                panic!(
+                                    "completed background task {task_id} has an invalid output artifact: {parse_error}"
+                                )
+                            });
+                        assert_eq!(artifact.task_id, task_id);
+                        assert_eq!(artifact.output.as_deref(), view["output"].as_str());
+                        assert!(
+                            error.is_none(),
+                            "completed task has retrieval error: {error:?}"
+                        );
+                    }
+                    let status = match state {
+                        BackgroundResultState::Completed => BackgroundTaskStatus::Completed,
+                        BackgroundResultState::Cancelled => BackgroundTaskStatus::Cancelled,
+                        BackgroundResultState::Failed
+                        | BackgroundResultState::Lost
+                        | BackgroundResultState::TimedOut => BackgroundTaskStatus::Failed,
+                        BackgroundResultState::Running => unreachable!(),
+                    };
+                    return BackgroundDelegateResult {
+                        task_id: task_id.to_string(),
+                        agent: view["agent"].as_str().unwrap_or_default().to_string(),
+                        status,
+                        output: view["output"].as_str().map(str::to_string),
+                        error,
+                        started_at: view["started_at"].as_str().unwrap_or_default().to_string(),
+                        finished_at: view["finished_at"].as_str().map(str::to_string),
+                    };
                 }
-                last_result = Some(result);
+                last_status = Some(state);
             }
 
             if Instant::now() >= deadline {
                 panic!(
-                    "Background task {task_id} did not finish before timeout; last result: {last_result:?}"
+                    "Background task {task_id} did not finish before timeout; last status: {last_status:?}"
                 );
             }
 
             sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    fn with_in_memory_task_store(tool: DelegateTool) -> DelegateTool {
+        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        let tool = if tool.caller_alias.is_empty() {
+            tool.with_caller_alias("caller")
+        } else {
+            tool
+        };
+        tool.with_task_control_plane(task_control_plane(store))
     }
 
     fn background_result(
@@ -3155,6 +4994,89 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct IndependentRiskPolicyModelProvider {
+        tool_messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl IndependentRiskPolicyModelProvider {
+        fn tool_messages(&self) -> Vec<String> {
+            self.tool_messages.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for IndependentRiskPolicyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages: Vec<String> = request
+                .messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .map(|message| message.content.clone())
+                .collect();
+            if !tool_messages.is_empty() {
+                self.tool_messages.lock().unwrap().extend(tool_messages);
+                return Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_skill_rm".to_string(),
+                        name: "rm_marker__remove".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "call_shell_rm".to_string(),
+                        name: "shell".to_string(),
+                        arguments:
+                            r#"{"command":"rm independent-delegate-marker","approved":true}"#
+                                .to_string(),
+                        extra_content: None,
+                    },
+                ],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for IndependentRiskPolicyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "IndependentRiskPolicyModelProvider"
         }
     }
 
@@ -3401,7 +5323,6 @@ mod tests {
         inner_memory: Arc<SqliteMemory>,
         caller_uuid: String,
         target_uuid: String,
-        workspace_dir: PathBuf,
         tool: DelegateTool,
         target_config: AliasedAgentConfig,
     }
@@ -3515,7 +5436,6 @@ mod tests {
             inner_memory,
             caller_uuid,
             target_uuid,
-            workspace_dir,
             tool,
             target_config,
         }
@@ -3659,6 +5579,16 @@ mod tests {
         buf
     }
 
+    fn http_request_json(request: &[u8]) -> serde_json::Value {
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("captured HTTP request has a header terminator");
+        serde_json::from_slice(&request[body_start..])
+            .expect("captured HTTP request body is valid JSON")
+    }
+
     async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
         use tokio::io::AsyncWriteExt;
 
@@ -3669,6 +5599,148 @@ mod tests {
             body
         );
         socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_failing_chat_server(
+        status: u16,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        start_failing_chat_server_with_error(status, "synthetic primary failure").await
+    }
+
+    async fn start_failing_chat_server_with_error(
+        status: u16,
+        error_message: &'static str,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = format!(r#"{{"error":{{"message":"{error_message}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 {status} Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_primary_failure_then_final_chat_server()
+    -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut first_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            first_socket.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut second_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut second_socket,
+                serde_json::json!({
+                    "choices": [{"message": {"content": "final primary reply"}}]
+                }),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut socket,
+                chat_completion_tool_call(
+                    "echo_tool",
+                    "fallback_tool",
+                    serde_json::json!({"value": "ping"}),
+                ),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_text_tool_then_final_chat_server() -> (
+        LocalChatServer,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let request_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_bodies = Arc::clone(&request_bodies);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let responses = [
+                serde_json::json!({
+                    "choices": [{"message": {"content": "<tool_call>{\"name\":\"echo_tool\",\"arguments\":{\"value\":\"fallback\"}}</tool_call>"}}]
+                }),
+                serde_json::json!({
+                    "choices": [{"message": {"content": "fallback final reply"}}]
+                }),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                captured_bodies.lock().unwrap().push(request);
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        (
+            LocalChatServer { uri, _task: task },
+            requests,
+            request_bodies,
+        )
+    }
+
+    async fn start_slow_chat_server(
+        delay: Duration,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -4490,7 +6562,7 @@ mod tests {
             .unwrap()
             .trim_start_matches("task_id: ")
             .trim();
-        let bg_result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&fixture.tool, task_id).await;
         assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
         assert!(
             bg_result
@@ -4500,6 +6572,48 @@ mod tests {
                 .contains("memory workflow done")
         );
         assert_stored_for_target_only(&fixture, "background-key").await;
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
+        // The configured Reliable wrapper retries a semantic-empty completion
+        // twice before terminal delivery. Supply one empty response per
+        // attempt so this boundary test proves the final semantic-empty cause,
+        // not a connection error after the fixture exhausts its responses.
+        let server = start_final_chat_server(vec!["", "", ""]).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "return a final answer",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background = wait_for_terminal_background_result(&fixture.tool, task_id).await;
+
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "{background:?}"
+        );
+        assert!(background.output.is_none(), "{background:?}");
+        assert_eq!(
+            background.error.as_deref(),
+            Some(invalid_semantic_completion_error("target").as_str()),
+            "{background:?}"
+        );
     }
 
     #[tokio::test]
@@ -4739,7 +6853,7 @@ mod tests {
             .unwrap()
             .trim_start_matches("task_id: ")
             .trim();
-        let bg_result = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
 
         assert_eq!(
             bg_result.status,
@@ -4836,7 +6950,7 @@ mod tests {
                 test_security(),
             ))])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4921,6 +7035,163 @@ mod tests {
             "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
             tool_message
         );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_empty_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok(" \n\t".to_string()),
+        );
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok("<think>internal reasoning</think>".to_string()),
+        );
+
+        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+        );
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let expected = invalid_semantic_completion_error("delegate");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_retains_provider_terminal_diagnostic() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "custom",
+            "model",
+            Err(anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Connection,
+                None,
+                "All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+                    .to_string(),
+            ))),
+        );
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'delegate' failed: All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+            )
+        );
+    }
+
+    #[test]
+    fn delegate_failure_projects_provider_tools_terminal_category() {
+        let error = anyhow::Error::new(
+            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse { usage: None },
+        );
+        let expected = crate::agent::turn::outcome::terminal_completion_error_message(
+            &error,
+            Some("delegate"),
+        )
+        .expect("provider-tools terminal category must project");
+
+        assert_eq!(delegate_failure_error("delegate", &error), expected);
+        assert_ne!(
+            expected,
+            "Agent 'delegate' failed: provider stream ended after provider-executed tools without a final response"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_terminal_completion() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &EmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenEmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
     }
 
     #[tokio::test]
@@ -5148,6 +7419,10 @@ mod tests {
 
     struct FinalOnlyModelProvider;
 
+    struct EmptyTerminalModelProvider;
+
+    struct ToolThenEmptyTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -5184,6 +7459,108 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: Some("reasoning only".to_string()),
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenEmptyTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: Some("reasoning only".to_string()),
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenEmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolThenEmptyTerminalModelProvider"
         }
     }
 
@@ -5239,6 +7616,334 @@ mod tests {
         fn alias(&self) -> &str {
             "ToolCountModelProvider"
         }
+    }
+
+    #[derive(Debug)]
+    struct RecordedThinkingRequest {
+        thinking_budget: Option<u32>,
+        thinking_display: Option<zeroclaw_api::model_provider::ThinkingDisplay>,
+        system_prompt: Option<String>,
+        temperature: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct ThinkingRecordingModelProvider {
+        requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
+    }
+
+    impl ThinkingRecordingModelProvider {
+        fn request(&self) -> RecordedThinkingRequest {
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "expected exactly one provider request");
+            requests.pop().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("tool loop must use ChatRequest")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let thinking = request.thinking.as_ref();
+            let thinking_budget = thinking.map(|params| params.budget_tokens);
+            let thinking_display = thinking.and_then(|params| params.display);
+            let system_prompt = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone());
+            self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                thinking_budget,
+                thinking_display,
+                system_prompt,
+                temperature,
+            });
+            Ok(ChatResponse {
+                text: Some("delegate complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingRecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkingRecordingModelProvider"
+        }
+    }
+
+    fn thinking_delegate_fixture(
+        mode: DelegateExecutionMode,
+        thinking: ThinkingConfig,
+    ) -> (DelegateTool, AliasedAgentConfig) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target-runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                thinking,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "custom.unused".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target = AliasedAgentConfig {
+            risk_profile: "target".into(),
+            runtime_profile: "target-runtime".into(),
+            model_provider: "custom.unused".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("target".to_string(), target.clone());
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+        (tool, target)
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "the target scope must not leak into the parent turn"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(50_000));
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_propagates_display_mode_to_target_request() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            display: ThinkingDisplayMode::Updates,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(
+            request.thinking_display,
+            Some(ThinkingDisplay::Updates),
+            "the target agent's display mode must reach the provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prepends_target_non_native_thinking_prompt() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "a non-native target must clear the override only inside its child scope"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, None);
+        assert!(
+            request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("Think very carefully and exhaustively.")),
+            "target thinking prefix must precede the delegated system prompt: {request:?}"
+        );
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retains_parent_thinking_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+            display: None,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(10_000));
+        assert_eq!(request.temperature, Some(0.2));
     }
 
     #[tokio::test]
@@ -5408,6 +8113,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
         };
         let handle = Arc::clone(&parent_tools);
         let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
@@ -5503,6 +8209,60 @@ mod tests {
     }
 
     #[test]
+    fn enriched_prompt_resolves_explicit_global_full_skill_mode() {
+        let mut root_config = Config::default();
+        root_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        root_config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let root_config = Arc::new(root_config);
+        let config = root_config.agents.get("alpha").unwrap().clone();
+        let workspace = std::env::temp_dir();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let skills = vec![crate::skills::Skill {
+            name: "deploy".into(),
+            description: "Release safely".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Run <smoke> & release checks.".into()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let tool = DelegateTool::new(root_config.agents.clone(), None, test_security())
+            .with_root_config(root_config)
+            .with_workspace_dir(workspace.to_path_buf());
+        assert_eq!(
+            tool.resolve_loop_runtime("alpha", &config)
+                .prompt_injection_mode,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+        );
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                Some(&skills),
+            )
+            .unwrap();
+
+        assert!(prompt.contains("<instructions>"));
+        assert!(
+            prompt.contains("<instruction>Run &lt;smoke&gt; &amp; release checks.</instruction>")
+        );
+        assert!(!prompt.contains("read_skill"));
+        assert!(!prompt.contains("loaded on demand"));
+    }
+
+    #[test]
     fn enriched_prompt_includes_shell_policy_when_shell_present() {
         let config = AliasedAgentConfig::default();
 
@@ -5537,11 +8297,40 @@ mod tests {
             }
         }
 
+        struct PosixRuntime;
+        impl crate::platform::RuntimeAdapter for PosixRuntime {
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::Posix
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
         let workspace = std::env::temp_dir();
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_workspace_dir(workspace.to_path_buf());
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PosixRuntime));
 
         let prompt = tool
             .build_enriched_system_prompt(
@@ -5556,8 +8345,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            prompt.contains("## Shell Policy"),
-            "should contain shell policy when shell tool is present"
+            prompt.contains("## Shell"),
+            "should contain shell section when shell tool is present"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -5616,6 +8409,112 @@ mod tests {
         assert!(
             !prompt.contains("## Shell Policy"),
             "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_reports_powershell_dialect_for_delegate_with_shell_tool() {
+        let config = AliasedAgentConfig::default();
+
+        struct MockShellTool;
+        impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        struct PsRuntime;
+        impl crate::platform::RuntimeAdapter for PsRuntime {
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::PowerShell
+            }
+            fn shell_profile(&self) -> Option<zeroclaw_api::runtime_traits::ShellProfile> {
+                Some(zeroclaw_api::runtime_traits::ShellProfile {
+                    name: "powershell".to_string(),
+                    dialect: crate::platform::ShellDialect::PowerShell,
+                })
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-Command", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PsRuntime));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prompt.contains("Shell: powershell") || prompt.contains("powershell"),
+            "prompt must identify powershell dialect; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("trash"),
+            "POSIX deletion advice must not appear in a PowerShell delegate prompt"
+        );
+        assert!(
+            prompt.contains("Get-ChildItem") || prompt.contains("Remove-Item"),
+            "PowerShell deletion guidance must appear; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -5752,8 +8651,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "agent": "researcher",
@@ -5786,8 +8687,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "agent": "nonexistent",
@@ -5811,8 +8714,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool.execute(json!({"action": "check_result"})).await;
 
         assert!(result.is_err());
@@ -5828,8 +8733,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         // Use a valid UUID format that doesn't correspond to any real task
         let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
@@ -5893,8 +8800,10 @@ mod tests {
             ),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -5932,8 +8841,10 @@ mod tests {
             ),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -5976,8 +8887,10 @@ mod tests {
             &background_result(&pending, BackgroundTaskStatus::Running, None, None),
         );
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -6012,8 +8925,10 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let missing = uuid::Uuid::new_v4().to_string();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         let result = tool
             .execute(json!({
                 "action": "await_sessions",
@@ -6257,8 +9172,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
         // Use a valid UUID format that doesn't correspond to any real task
         let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
@@ -6304,8 +9221,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         let result = tool
             .execute(json!({
@@ -6337,7 +9256,7 @@ mod tests {
         );
 
         // Read and parse the result
-        let bg_result = wait_for_terminal_background_result(&workspace, task_id).await;
+        let bg_result = wait_for_terminal_background_result(&tool, task_id).await;
         assert_eq!(bg_result.task_id, task_id);
         assert_eq!(bg_result.agent, "researcher");
         // The task will have failed because ollama isn't running, but it should be persisted
@@ -6358,8 +9277,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         // Start background task
         let result = tool
@@ -6381,7 +9302,7 @@ mod tests {
             .to_string();
 
         // Wait for background task
-        let _ = wait_for_terminal_background_result(&workspace, &task_id).await;
+        let _ = wait_for_terminal_background_result(&tool, &task_id).await;
 
         // Check result
         let check = tool
@@ -6407,8 +9328,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&workspace).unwrap();
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_workspace_dir(workspace.clone());
+        let tool = with_in_memory_task_store(
+            DelegateTool::new(sample_agents(), None, test_security())
+                .with_workspace_dir(workspace.clone()),
+        );
 
         // Start a background task
         let result = tool
@@ -6429,7 +9352,7 @@ mod tests {
             .trim();
 
         // Wait for task to complete
-        let _ = wait_for_terminal_background_result(&workspace, task_id).await;
+        let _ = wait_for_terminal_background_result(&tool, task_id).await;
 
         // List results
         let list = tool
@@ -7197,6 +10120,9 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // The bounded sealing pass must not synthesize a PipelineTool from
+        // caller config when the parent registry did not contain one.
+        config.pipeline.enabled = true;
         config.risk_profiles.insert(
             "caller".to_string(),
             RiskProfileConfig {
@@ -7262,6 +10188,132 @@ mod tests {
                 "test-model",
                 &ToolCountModelProvider { expected_tools: 0 },
                 "run shell",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn bounded_agentic_tools_drop_deliver_file_without_acp_transport() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        struct DeliverFileFixture;
+
+        impl zeroclaw_api::attribution::Attributable for DeliverFileFixture {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+
+            fn alias(&self) -> &str {
+                "deliver_file"
+            }
+        }
+
+        #[async_trait]
+        impl Tool for DeliverFileFixture {
+            fn name(&self) -> &str {
+                "deliver_file"
+            }
+
+            fn description(&self) -> &str {
+                "Test-only ACP delivery capability"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                unreachable!("the fixture must be removed before child execution")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["deliver_file".to_string(), DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["deliver_file".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        assert!(caller_policy.is_tool_allowed("deliver_file"));
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(DeliverFileFixture)])));
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+        let target_tool_policy = tool
+            .resolve_tool_policy(&target_config.risk_profile)
+            .expect("target tool policy resolves");
+        assert!(DelegateTool::delegate_admits_with_mcp(
+            &target_tool_policy,
+            "deliver_file"
+        ));
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "deliver a file",
                 None,
             )
             .await
@@ -7588,6 +10640,143 @@ command = "echo hi"
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_denies_prompt_required_skill_tools_without_approval_route() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        let marker = target_ws.join("independent-delegate-marker");
+        std::fs::create_dir_all(target_ws.join("skills/rm_marker")).unwrap();
+        std::fs::write(&marker, b"must survive").unwrap();
+        std::fs::write(
+            target_ws.join("skills/rm_marker/SKILL.toml"),
+            r#"[skill]
+name = "rm_marker"
+description = "test skill for independent approval policy"
+version = "0.1.0"
+
+[[tools]]
+name = "remove"
+description = "remove the marker"
+kind = "shell"
+command = "rm independent-delegate-marker"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Supervised,
+                allowed_commands: vec!["rm".to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                block_high_risk_commands: true,
+                require_approval_for_medium_risk: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let delegate = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+        let target = config.agents.get("target").unwrap();
+        let provider = IndependentRiskPolicyModelProvider::default();
+
+        let result = delegate
+            .execute_agentic(
+                "target",
+                target,
+                "test",
+                "test-model",
+                &provider,
+                "remove the marker",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "target should complete after denied calls: {result:?}"
+        );
+        assert!(
+            marker.exists(),
+            "a prompt-required skill command must not dispatch without an approval route"
+        );
+        let tool_messages = provider.tool_messages();
+        assert!(
+            tool_messages.iter().any(|message| {
+                message.contains("requires approval and no operator decision was available")
+            }),
+            "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
+        );
+        assert!(
+            tool_messages.iter().any(|message| {
+                message.contains("Command requires explicit approval (approved=true)")
+            }),
+            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
+        );
+    }
+
     // Finding: an independent delegate to a non-native, strict-tool-parsing target must
     // suppress the deferred-MCP prompt section exactly as a fresh target turn does
     // (apply_text_tool_prompt_policy clears it), instead of advertising `tool_search`
@@ -7748,58 +10937,717 @@ command = "echo hi"
         );
     }
 
-    #[tokio::test]
-    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+    fn fallback_delegate_config(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+    ) -> (Arc<Config>, TempDir) {
+        fallback_delegate_config_with_native_tools(primary_uri, backup_uri, agentic, None, None)
+    }
+
+    fn fallback_delegate_config_with_native_tools(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+        primary_native_tools: Option<bool>,
+        backup_native_tools: Option<bool>,
+    ) -> (Arc<Config>, TempDir) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
-        let mut config = Config::default();
+
+        let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         config.providers.models.custom.insert(
-            "vllm".to_string(),
+            "primary".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
-                    model: Some("Qwen3.6-27B".to_string()),
-                    wire_api: Some(WireApi::Responses),
+                    uri: Some(primary_uri),
+                    model: Some("primary-model".to_string()),
+                    native_tools: primary_native_tools,
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
                     ..ModelProviderConfig::default()
                 },
             },
         );
-        config.agents.insert(
-            "target".to_string(),
-            AliasedAgentConfig {
-                model_provider: "custom.vllm".into(),
-                ..AliasedAgentConfig::default()
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(backup_uri),
+                    // This deliberately matches the primary model. The two aliases
+                    // still represent distinct configured candidates.
+                    model: Some("primary-model".to_string()),
+                    native_tools: backup_native_tools,
+                    ..ModelProviderConfig::default()
+                },
             },
         );
-        let config = Arc::new(config);
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "review".to_string(),
+            RuntimeProfileConfig {
+                agentic,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for agent in ["caller", "target"] {
+            config.agents.insert(
+                agent.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.primary".into(),
+                    risk_profile: "delegating".into(),
+                    runtime_profile: "review".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_root_config(Arc::clone(&config));
+        (Arc::new(config), temp_dir)
+    }
 
-        // Drives the exact build path `run` takes. With root_config + a
-        // dotted model_provider, the alias-aware factory must read the
-        // target's `custom.vllm` entry and honor wire_api = responses.
-        let provider = tool
-            .build_target_provider("custom.vllm", "custom", None)
-            .expect("target provider builds offline");
+    fn fallback_delegate_tool(config: Arc<Config>, workspace_dir: Option<PathBuf>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        match workspace_dir {
+            Some(workspace_dir) => tool.with_workspace_dir(workspace_dir),
+            None => tool,
+        }
+    }
+
+    fn assert_generic_fallback_warning(output: &str, primary_uri: &str) {
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
         assert_eq!(
-            provider.default_wire_api(),
-            "responses",
-            "delegate must build the target with its declared responses wire API"
+            output.matches(&warning).count(),
+            1,
+            "recovered delegate result must include exactly one generic warning: {output:?}"
+        );
+        assert!(
+            !output.contains(primary_uri),
+            "recovered output must not expose the primary endpoint: {output:?}"
+        );
+        assert!(
+            !output.contains("synthetic primary failure"),
+            "recovered output must not expose provider error details: {output:?}"
+        );
+    }
+
+    fn assert_explicit_fallback_attribution(output: &str, agentic: bool) {
+        let header_key = if agentic {
+            "delegate-provider-fallback-header-agentic"
+        } else {
+            "delegate-provider-fallback-header"
+        };
+        let header = crate::i18n::get_required_cli_string_with_args(
+            header_key,
+            &[
+                ("agent", "target"),
+                ("requested_provider", "custom.primary"),
+                ("requested_model", "primary-model"),
+                ("actual_provider", "custom.backup"),
+                // The same model proves this is exact candidate attribution, not a model switch.
+                ("actual_model", "primary-model"),
+            ],
+        );
+        assert_eq!(
+            output.matches(&header).count(),
+            1,
+            "recovered output must identify the requested and served candidates exactly once: \
+             {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_fallback_warning_is_local_to_synchronous_call() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(result.output.contains("fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_attributes_final_primary_response_after_earlier_fallback() {
+        let (primary, primary_requests) = start_primary_failure_then_final_chat_server().await;
+        let (backup, backup_requests) = start_tool_call_chat_server().await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the primary must be retried on the post-tool model request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the backup must serve only the tool-call response"
+        );
+        assert!(result.output.contains("final primary reply"), "{result:?}");
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !result.output.contains(&warning),
+            "a final primary response must not carry stale fallback attribution: {result:?}"
+        );
+        assert!(
+            !result.output.contains("custom.backup"),
+            "the final primary response must not be labeled as backup-served: {result:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_uses_text_tools_when_only_its_fallback_supports_them() {
+        // The primary advertises native tools but fails. The text-only fallback
+        // must receive the XML protocol and execute its tool, rather than a
+        // native request that it cannot reliably interpret.
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests, backup_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must receive the initial failing request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the fallback must receive the tool request and the final response request"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = backup_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first fallback request"));
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only fallback must not receive native tool specifications: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("fallback request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "fallback prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second fallback request must contain the executed tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn routed_agentic_delegate_uses_selected_models_text_tool_protocol() {
+        let (default, default_requests) = start_failing_chat_server(503).await;
+        let (routed, routed_requests, routed_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            default.uri.clone(),
+            routed.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        let primary = &mut config
+            .providers
+            .models
+            .custom
+            .get_mut("primary")
+            .expect("primary provider")
+            .base;
+        primary.model = Some("hint:text".to_string());
+        primary.fallback.clear();
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("backup")
+            .expect("routed provider")
+            .base
+            .model = Some("routed-model".to_string());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "text".to_string(),
+            model_provider: "custom.backup".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        });
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("routed agentic delegate completes");
+
+        assert!(result.success, "routed delegate failed: {result:?}");
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Router default must not receive a hinted request"
+        );
+        assert_eq!(
+            routed_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the selected route must receive both tool-loop requests"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = routed_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first routed request"));
+        assert_eq!(first_request["model"], "routed-model");
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only selected route must not receive native tools: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("routed request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "routed prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second routed request must contain the tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn strict_mixed_agentic_delegate_fails_before_provider_dispatch() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .strict_tool_parsing = true;
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
+            .await
+            .expect("delegate returns a terminal tool result");
+
+        assert!(!result.success, "strict mixed chain must fail: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal failure has no output: {result:?}"
+        );
+        let expected =
+            crate::i18n::get_required_cli_string("turn-tool-protocol-strict-mixed-error");
+        let error = result.error.expect("strict mixed chain returns an error");
+        assert!(error.contains(&expected), "unexpected error: {error}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede the primary request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede fallback dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["non-agentic fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("non-agentic fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), false);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["background fallback reply"]).await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let (start, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let start = tool
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "respond",
+                        "background": true,
+                    }))
+                    .await
+                    .expect("background delegate starts");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (start, outer_fallback)
+            })
+            .await;
+
+        assert!(start.success, "background start failed: {start:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "background delegate fallback must not leak into its parent scope: {outer_fallback:?}"
+        );
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let result = wait_for_terminal_background_result(&tool, task_id).await;
+
+        assert_eq!(result.status, BackgroundTaskStatus::Completed, "{result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        let output = result.output.as_deref().expect("completed output");
+        assert!(output.contains("background fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(output, &primary.uri);
+        assert_explicit_fallback_attribution(output, true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["parallel fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"parallel": ["target"], "prompt": "respond"}))
+                    .await
+                    .expect("parallel delegate completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "parallel delegate fallback must not leak into the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("parallel fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn delegate_returns_safe_ordered_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "backup failure marker").await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(!result.success, "exhaustion must be terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal error must not carry output: {result:?}"
+        );
+        assert!(
+            outer_fallback.is_none(),
+            "failed delegation must not leave recovery metadata in the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let error = result.error.expect("terminal delegate error");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)"),
+            "terminal error summarizes every failure event: {error}"
+        );
+        assert!(
+            error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "summary preserves event order: {error}"
+        );
+        assert!(
+            !error.contains("primary failure marker") && !error.contains("backup failure marker"),
+            "provider-controlled response bodies must not reach the caller: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal errors must remain errors rather than recovery warnings: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
+        let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .delegation_timeout_secs = Some(1);
+        let tool = fallback_delegate_tool(Arc::new(config), None);
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .expect("delegate call completes");
+
+        assert!(!result.success, "timeout must remain terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "timeout must not carry output: {result:?}"
+        );
+        let error = result.error.expect("timeout error");
+        assert_eq!(error, "Agent 'target' timed out after 1s");
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "outer timeout must not be converted into fallback exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_safe_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "background primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "background backup failure marker").await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let start = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "respond",
+                "background": true,
+            }))
+            .await
+            .expect("background delegate starts");
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let persisted = wait_for_terminal_background_result(&tool, task_id).await;
+
+        assert_eq!(
+            persisted.status,
+            BackgroundTaskStatus::Failed,
+            "{persisted:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let persisted_error = persisted
+            .error
+            .as_deref()
+            .expect("persisted failure detail");
+        assert!(
+            persisted_error.contains("All model providers/models failed after 2 failure event(s)")
+                && persisted_error.contains("event 1 (retry 1/1): retryable")
+                && persisted_error.contains("event 2 (retry 1/1): retryable"),
+            "persisted error must contain the safe ordered summary: {persisted_error}"
+        );
+        assert!(
+            !persisted_error.contains("background primary failure marker")
+                && !persisted_error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not persist: {persisted_error}"
         );
 
-        let stale = zeroclaw_providers::create_model_provider_with_options(
-            "custom",
-            None,
-            &tool.provider_runtime_options,
-        );
-        let stale_is_responses = stale
-            .map(|p| p.default_wire_api() == "responses")
-            .unwrap_or(false);
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .expect("check_result completes");
         assert!(
-            !stale_is_responses,
-            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+            !result.success,
+            "terminal background failure is not success: {result:?}"
+        );
+        let error = result
+            .error
+            .expect("caller receives background failure detail");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)")
+                && error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "check_result returns the same safe summary: {error}"
+        );
+        assert!(
+            !error.contains("background primary failure marker")
+                && !error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not reach check_result: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal background errors must not become recovery warnings: {error}"
         );
     }
 
@@ -8184,6 +12032,141 @@ command = "echo hi"
             credential.as_deref(),
             Some("sk-ant-global-coordinator-key"),
             "non-OAuth target without api_key must fall back to global credential"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_arc_ref_spec_tests {
+    use super::*;
+    use zeroclaw_api::tool::ToolSpec;
+
+    struct ArcSchemaTool {
+        schema: Arc<serde_json::Value>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ArcSchemaTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "arc-schema-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ArcSchemaTool {
+        fn name(&self) -> &str {
+            "arc_schema_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with Arc-shared schema"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            (*self.schema).clone()
+        }
+
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                parameters: Arc::clone(&self.schema),
+                output: None,
+                param_domains: std::collections::BTreeMap::new(),
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_spec_arc_identity() {
+        let inner: Arc<dyn Tool> = Arc::new(ArcSchemaTool {
+            schema: Arc::new(serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            })),
+        });
+        let inner_params = inner.spec().parameters;
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert!(
+            Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
+            "ToolArcRef must forward spec() so the inner Arc-shared schema \
+             survives; the trait default deep-clones it every call"
+        );
+    }
+
+    /// Trigger-owning tool standing in for `send_via` behind bounded
+    /// delegation's `ToolArcRef` wrapper.
+    struct TriggerOwningTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "trigger-owning-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TriggerOwningTool {
+        fn name(&self) -> &str {
+            "trigger_owning_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with invocation triggers"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn invocation_triggers(&self) -> Vec<String> {
+            vec!["send this to".into(), "as a voice message".into()]
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_invocation_triggers() {
+        // Regression: bounded delegation re-wraps every admitted parent tool
+        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
+        // explicit forwarding the trait default returns an empty vocabulary,
+        // silently erasing a trigger-owning tool's metadata for any consumer
+        // scanning a delegate's assembled tools.
+        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert_eq!(
+            wrapped.invocation_triggers(),
+            inner.invocation_triggers(),
+            "ToolArcRef must forward invocation_triggers(); the trait \
+             default erases the inner tool's vocabulary"
+        );
+        assert!(
+            wrapped
+                .invocation_triggers()
+                .iter()
+                .any(|t| t == "send this to"),
+            "wrapped trigger vocabulary must survive bounded delegation"
         );
     }
 }

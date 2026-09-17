@@ -1138,6 +1138,7 @@ mod cost_usd_regression_tests {
                 input_tokens: None,
                 output_tokens: Some(12),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -1222,6 +1223,7 @@ mod cost_usd_regression_tests {
                 input_tokens: Some(1234),
                 output_tokens: Some(56),
                 cached_input_tokens: Some(10),
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };

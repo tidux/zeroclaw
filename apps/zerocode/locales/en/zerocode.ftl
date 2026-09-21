@@ -470,8 +470,10 @@ zc-chat-resync-failed = Live updates were missed and the session could not be re
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
 zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
+zc-chat-code-cwd-not-absolute = The selected directory is not an absolute path ({ $path }), so the new Code session was not created. Pick a directory from the root of the filesystem the session runs on.
 zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
 zc-chat-change-directory-invalid-path = The selected directory cannot be represented as UTF-8, so the new Code session was not created.
+zc-chat-change-directory-chat-only = Chat sessions follow the selected agent's workspace, so there is no directory to choose here. Use the Code pane to start a session in a different directory.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden

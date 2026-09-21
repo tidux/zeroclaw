@@ -126,20 +126,18 @@ pub(crate) enum PaneKind {
     Acp,
 }
 
-/// Why pinning a local Code session to the launch directory failed.
+/// Why converting an explicitly selected session root into a JSON-RPC `cwd`
+/// failed.
 ///
-/// A local Code session promises that file and shell tools operate on the
-/// project zerocode was launched from. If that directory cannot be captured we
-/// must not silently fall through to an omitted cwd: `session/new` would then
-/// resolve the selected agent's workspace and the session would look healthy
-/// while acting on a different project tree.
+/// An explicit selection is a promise that the session's file and shell tools
+/// operate on *that* directory. If the selection cannot be represented
+/// faithfully we must not fall through to an omitted cwd: `session/new` would
+/// then resolve the selected agent's workspace and the session would look
+/// healthy while acting on a different project tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LocalCodeCwdError {
-    /// `std::env::current_dir()` failed (e.g. the directory was deleted or is
-    /// unreadable). Carries the OS error text.
-    Unavailable(String),
-    /// The launch directory is not valid UTF-8, so it cannot be represented in
-    /// the JSON-RPC `cwd` string. Carries the lossy rendering for diagnosis.
+    /// The selected directory is not valid UTF-8, so it cannot be represented
+    /// in the JSON-RPC `cwd` string. Carries the lossy rendering for display.
     NotUtf8(String),
     /// An explicitly selected root is not absolute. A relative `cwd` would be
     /// resolved against the daemon's process directory, not the directory the
@@ -148,12 +146,9 @@ pub(crate) enum LocalCodeCwdError {
 }
 
 impl LocalCodeCwdError {
-    /// Localized, user-facing text for this capture failure.
+    /// Localized, user-facing text for this conversion failure.
     fn localized(&self) -> String {
         match self {
-            LocalCodeCwdError::Unavailable(error) => {
-                crate::i18n::t_args("zc-chat-code-cwd-unavailable", &[("error", error.as_str())])
-            }
             LocalCodeCwdError::NotUtf8(path) => {
                 crate::i18n::t_args("zc-chat-code-cwd-not-utf8", &[("path", path.as_str())])
             }
@@ -161,38 +156,6 @@ impl LocalCodeCwdError {
                 crate::i18n::t_args("zc-chat-code-cwd-not-absolute", &[("path", path.as_str())])
             }
         }
-    }
-}
-
-/// Process cwd for a fresh local Code session. Chat and remote transports
-/// return `Ok(None)` to deliberately omit cwd so the daemon uses the agent
-/// workspace or an explicit picker.
-///
-/// Returns `Err` when a local Code session *should* pin the launch directory
-/// but cannot. Callers must surface that error rather than starting a session
-/// against a different project.
-fn local_code_session_cwd(
-    pane_kind: PaneKind,
-    transport: crate::client::Transport,
-) -> Result<Option<String>, LocalCodeCwdError> {
-    if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
-        resolve_local_code_cwd(std::env::current_dir()).map(Some)
-    } else {
-        // Deliberate omission: Chat uses the agent workspace, remote Code uses
-        // the directory picker. Neither is a failure.
-        Ok(None)
-    }
-}
-
-/// Pure capture step, split out so tests can inject both failure modes without
-/// mutating global process state.
-fn resolve_local_code_cwd(
-    current_dir: std::io::Result<std::path::PathBuf>,
-) -> Result<String, LocalCodeCwdError> {
-    let path = current_dir.map_err(|e| LocalCodeCwdError::Unavailable(e.to_string()))?;
-    match path.to_str() {
-        Some(s) => Ok(s.to_string()),
-        None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
     }
 }
 
@@ -1952,37 +1915,20 @@ impl Chat {
         } else {
             EntryRetrySessionOwnership::RetryCreated
         };
-        // A resume must not re-point the session at the TUI's launch directory:
-        // pass no cwd so the daemon keeps the retained session's own cwd.
+        // A resume must not re-point the session at a new root: pass no cwd so
+        // the daemon keeps the retained session's own saved cwd, whatever this
+        // process's directory or the agent's workspace is now.
         //
-        // Fresh Chat sessions omit cwd so the daemon uses the selected agent's
-        // workspace. Fresh local Code sessions pin the process cwd so file and
-        // shell tools operate on the project zerocode was launched from. An
-        // explicit caller-supplied cwd (the remote ACP picker) still wins.
-        //
-        // If a local Code session cannot capture its launch directory we fail
-        // the creation instead of omitting cwd: a silent fallback would start a
-        // healthy-looking session rooted at the agent workspace, letting file
-        // and shell tools act on a different project.
-        let explicit_cwd = cwd_override
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+        // A fresh session sends a root only when one was explicitly selected
+        // (the startup picker or `/change-directory`). Otherwise cwd is
+        // omitted so the daemon resolves the selected agent's configured
+        // workspace — the default session root for Chat and Code alike.
         let cwd_str: Option<String> = if resume_id.is_some() {
             None
-        } else if let Some(cwd) = explicit_cwd {
-            Some(cwd)
         } else {
-            match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
-                Ok(cwd) => cwd,
-                Err(e) => {
-                    let error = e.localized();
-                    self.phase = ChatPhase::Error(crate::i18n::t_args(
-                        "zc-chat-error-create-session",
-                        &[("error", &error)],
-                    ));
-                    return SessionStartOutcome::Failed(error);
-                }
-            }
+            cwd_override
+                .filter(|cwd| !cwd.trim().is_empty())
+                .map(str::to_owned)
         };
         if is_cancelled(cancellation) {
             return SessionStartOutcome::Cancelled;
@@ -2353,27 +2299,14 @@ impl Chat {
             });
         }
 
-        // Chat restarts omit cwd so the daemon keeps the agent workspace.
-        // Local Code restarts pin the process cwd. Remote ACP re-prompts via
-        // the picker above.
-        //
-        // A capture failure aborts the restart and keeps the existing session
-        // rather than minting one rooted at the agent workspace, which would
-        // silently move file and shell tools to a different project.
-        let cwd_str = match local_code_session_cwd(pane_kind, rpc.transport()) {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-chat-session-restart-error",
-                    &[("error", &e.localized())],
-                ));
-                return None;
-            }
-        };
+        // A restart mints a *fresh* session, so it follows the fresh-session
+        // default: omit cwd and let the daemon root the replacement at the
+        // selected agent's workspace. Remote ACP re-prompts via the picker
+        // above, which supplies an explicit root through `start_session`.
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
+            rpc.session_new_acp(&alias, None, None).await
         } else {
-            rpc.session_new(&alias, cwd_str.as_deref()).await
+            rpc.session_new(&alias, None).await
         };
         match new_session {
             Ok(s) => {
@@ -15469,76 +15402,6 @@ mod tests {
     }
 
     #[test]
-    fn local_code_session_cwd_only_pins_local_acp() {
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
-            Ok(None)
-        );
-        let expected = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
-        assert_eq!(
-            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
-            Ok(Some(expected))
-        );
-    }
-
-    #[test]
-    fn local_code_cwd_capture_failure_is_an_error_not_an_omission() {
-        // A failed capture must never look like the deliberate `None` used by
-        // Chat and remote Code: omitting cwd here would silently root the
-        // session at the agent workspace, i.e. a different project.
-        let err = resolve_local_code_cwd(Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no such file or directory",
-        )))
-        .expect_err("cwd capture failure must be reported");
-        let LocalCodeCwdError::Unavailable(msg) = &err else {
-            panic!("expected Unavailable, got {err:?}");
-        };
-        assert!(msg.contains("no such file or directory"), "got {msg}");
-        // And it renders as real localized text, not a `{key}` placeholder.
-        let shown = err.localized();
-        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
-        assert!(shown.contains("no such file or directory"), "got {shown}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_code_cwd_rejects_non_utf8_launch_path() {
-        use std::os::unix::ffi::OsStrExt;
-        // 0xFF is never valid UTF-8, so this models a launch directory that
-        // cannot be sent as a JSON-RPC `cwd` string.
-        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
-        let err = resolve_local_code_cwd(Ok(std::path::PathBuf::from(raw)))
-            .expect_err("non-UTF-8 cwd must be reported");
-        let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
-            panic!("expected NotUtf8, got {err:?}");
-        };
-        assert!(shown_path.contains("proj-"), "got {shown_path}");
-        let shown = err.localized();
-        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
-    }
-
-    #[test]
-    fn local_code_cwd_accepts_utf8_launch_path() {
-        assert_eq!(
-            resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
-            Ok("/tmp/project".to_string())
-        );
-    }
-
-    #[test]
     fn explicit_cwd_accepts_utf8_selection() {
         assert_eq!(
             explicit_cwd(std::path::Path::new("/tmp/project")),
@@ -16179,16 +16042,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_sends_process_cwd() {
+    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -16228,11 +16086,121 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        // Code sessions pin the directory zerocode was launched from so file
-        // and shell tools operate on that project, not the agent workspace.
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a fresh Code session must not send the TUI's
+        // launch directory. Omitting cwd lets the daemon root the session at
+        // the selected agent's configured workspace.
+        assert!(params["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
+        );
 
-        start.abort();
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        // The daemon-selected workspace is the session root of record.
+        assert_eq!(chat.current_cwd(), Some("/agents/alpha/workspace"));
+    }
+
+    #[tokio::test]
+    async fn fresh_local_acp_session_sends_explicit_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", Some("/selected/project")).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "explicit local Code session should start").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert!(request["params"]["session_id"].is_null());
+        // An explicit selection is sent verbatim: the daemon must root the
+        // session exactly where the picker confirmed.
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-selected",
+                "workspace_dir": "/selected/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "new session refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("start should finish")
+            .unwrap();
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn resumed_local_acp_session_keeps_saved_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.set_resume_sessions(vec![resume_entry("sess-saved", "alpha", true)]);
+        let task = tokio::spawn(async move {
+            chat.start_session("alpha", None).await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "resume should reattach the saved session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        // A resume must send no replacement cwd: the daemon keeps the root the
+        // retained session was created with, whatever this process's directory
+        // or the agent's workspace is now.
+        assert!(request["params"]["cwd"].is_null());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-saved",
+                "workspace_dir": "/saved/project"
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "resume refreshes identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request = next_rpc_request(&mut rx, "resume replays the retained transcript").await;
+        assert_eq!(request["method"], method::SESSION_MESSAGES);
+        assert_eq!(request["params"]["session_id"], "sess-saved");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "messages": [], "total": 0 }),
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("resume should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-saved"));
+        assert_eq!(chat.current_cwd(), Some("/saved/project"));
     }
 
     #[tokio::test]
@@ -16281,15 +16249,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_local_acp_session_sends_process_cwd() {
+    async fn restart_local_acp_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
-        let expected_cwd = std::env::current_dir()
-            .expect("process cwd")
-            .to_str()
-            .expect("utf-8 cwd")
-            .to_string();
         let mut state = ChatState::new(
             "sess-old".to_string(),
             "alpha".to_string(),
@@ -16297,7 +16260,8 @@ mod tests {
         );
 
         let restart = tokio::spawn(async move {
-            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await
+            let phase = Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await;
+            (state, phase)
         });
 
         let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
@@ -16306,11 +16270,16 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        assert_eq!(params["cwd"], expected_cwd);
+        // Regression guard: a restart mints a *fresh* session, so it must not
+        // send the TUI's launch directory either.
+        assert!(params["cwd"].is_null());
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "workspace_dir": "/agents/alpha/workspace"
+            }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;
@@ -16322,11 +16291,13 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
-        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+        let (state, phase) = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+        // The replacement session adopts the daemon-selected workspace.
+        assert_eq!(state.cwd.as_deref(), Some("/agents/alpha/workspace"));
     }
 
     #[tokio::test]

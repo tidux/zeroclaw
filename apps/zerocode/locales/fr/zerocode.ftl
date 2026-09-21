@@ -424,6 +424,8 @@ zc-chat-resync-failed = Des mises à jour en direct ont été manquées et la se
 zc-chat-session-restart-error = Échec du démarrage d'une nouvelle session : { $error }
 zc-chat-code-cwd-unavailable = Impossible de déterminer le répertoire depuis lequel zerocode a été lancé : { $error }. Une session Code locale doit démarrer dans ce projet, elle n'a donc pas été créée.
 zc-chat-code-cwd-not-utf8 = Le répertoire depuis lequel zerocode a été lancé n'est pas un UTF-8 valide ({ $path }), une session Code locale ne peut donc pas y démarrer. Relancez zerocode depuis un chemin UTF-8.
+zc-chat-change-directory-error = Échec du démarrage d'une session dans le répertoire sélectionné : { $error }
+zc-chat-change-directory-invalid-path = Le répertoire sélectionné ne peut pas être représenté en UTF-8, la nouvelle session Code n'a donc pas été créée.
 zc-chat-thinking-visible = Sortie de réflexion : visible
 zc-chat-thinking-hidden = Sortie de réflexion : masquée
 zc-model-picker-hint = Tapez un nom de modèle après /model, ou Tab pour l'autocomplétion.
@@ -463,6 +465,7 @@ zc-chat-help-browse-mode = Mode navigation
 zc-chat-help-scroll-conversation = Faire défiler la conversation
 zc-chat-help-toggle-thoughts = Basculer les réflexions
 zc-chat-help-new-session = Nouvelle session
+zc-chat-help-change-directory = Choisissez un répertoire et démarrez une nouvelle session Code
 zc-chat-session-list-resume-title = Sessions enregistrées (Entrée=reprendre, Échap=nouveau)
 zc-chat-session-list-switch-title = Sessions (Entrée=changer, Échap=fermer)
 zc-elicit-help-toggle = Basculer le choix

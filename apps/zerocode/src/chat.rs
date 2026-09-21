@@ -86,10 +86,37 @@ enum ChatPhase {
         /// Interactive directory picker.
         explorer: FileExplorerState,
     },
+    /// Code-only picker opened by `/change-directory`; the current session is
+    /// stashed in `background` until the new session succeeds or the picker
+    /// closes. A running session is never re-rooted in place.
+    PickChangeDirectory {
+        /// The agent the new session starts for — the active session's agent.
+        agent_alias: String,
+        /// Interactive directory picker (local or daemon-side).
+        explorer: FileExplorerState,
+    },
     /// Active chat session.
     Active(Box<ChatState>),
     /// Unrecoverable error.
     Error(String),
+}
+
+/// Outcome of a session-start attempt.
+///
+/// `start_session_with_cancel` renders its own failure into the pane, but a
+/// caller that *frames* the start differently (`/change-directory` reports a
+/// directory selection failure, not a bare session failure) needs the
+/// underlying error text without re-deriving it from pane state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStartOutcome {
+    /// A session was created (or resumed) and is now the active phase.
+    Started,
+    /// The attempt was abandoned before creation completed, either by a
+    /// cancellation signal or because another retry owns the creation.
+    Cancelled,
+    /// Creation, or the post-creation history replay, failed. Carries the raw
+    /// error text already surfaced by the pane.
+    Failed(String),
 }
 
 /// Distinguishes which kind of chat pane this is.
@@ -160,6 +187,18 @@ fn resolve_local_code_cwd(
         Some(s) => Ok(s.to_string()),
         None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
     }
+}
+
+/// Convert an explicitly selected session root into the JSON-RPC `cwd` string.
+///
+/// A non-UTF-8 selection is rejected rather than lossily converted: a lossy
+/// string names a *different* directory, so the session would silently root
+/// somewhere the user never picked. The error carries only the lossy rendering
+/// for display.
+fn explicit_cwd(path: &std::path::Path) -> Result<String, LocalCodeCwdError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| LocalCodeCwdError::NotUtf8(path.display().to_string()))
 }
 
 impl PaneKind {
@@ -1427,6 +1466,84 @@ impl Chat {
         }
     }
 
+    /// Open the Code directory picker for `/change-directory`.
+    ///
+    /// Code-only: a Chat session follows its agent's workspace, so there is no
+    /// root for the user to re-select. The active session is stashed (never
+    /// closed or re-rooted) so cancelling, a rejected path, or a failed start
+    /// can return to it untouched.
+    fn begin_change_directory(&mut self) {
+        if self.pane_kind != PaneKind::Acp {
+            return;
+        }
+        let ChatPhase::Active(state) = &self.phase else {
+            return;
+        };
+        let agent_alias = state.agent_alias.clone();
+        // Start browsing where this session is rooted; fall back to the
+        // process cwd, then to a relative root the explorer can still list.
+        let start_dir = state
+            .cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        self.stash_active();
+        let explorer = if self.rpc.transport() == crate::client::Transport::Wss {
+            // Remote Code browses the daemon's filesystem, not this machine's.
+            FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(&self.rpc))
+        } else {
+            FileExplorerState::new_dir_picker(start_dir)
+        };
+        self.phase = ChatPhase::PickChangeDirectory {
+            agent_alias,
+            explorer,
+        };
+    }
+
+    /// Apply a confirmed `/change-directory` selection: start a new session
+    /// rooted at `path`, keeping the stashed session as the fallback.
+    ///
+    /// Both transports go through the ordinary session-start path with an
+    /// explicit cwd, so the daemon remains the authority on the resulting root.
+    async fn apply_change_directory_selection(
+        &mut self,
+        agent_alias: &str,
+        path: &std::path::Path,
+    ) {
+        let notice = match explicit_cwd(path) {
+            Ok(cwd) => match self.start_session(agent_alias, Some(&cwd)).await {
+                SessionStartOutcome::Started | SessionStartOutcome::Cancelled => return,
+                SessionStartOutcome::Failed(error) => crate::i18n::t_args(
+                    "zc-chat-change-directory-error",
+                    &[("error", error.as_str())],
+                ),
+            },
+            // A non-UTF-8 selection never reaches `session/new`: a lossy cwd
+            // would root the session in a directory the user never picked.
+            Err(_) => crate::i18n::t("zc-chat-change-directory-invalid-path"),
+        };
+        self.restore_change_directory_session(notice).await;
+    }
+
+    /// Return to the session stashed by [`Chat::begin_change_directory`] and
+    /// report why the new root was not adopted.
+    async fn restore_change_directory_session(&mut self, notice: String) {
+        // A failed start with a live background session is already restored by
+        // `after_session_start`; only a path rejected before the request (or a
+        // start that left the error screen up) still needs the restore here.
+        if !matches!(self.phase, ChatPhase::Active(_)) {
+            self.restore_last_focused().await;
+        }
+        match &mut self.phase {
+            // Replace the generic session-start notice: the user asked for a
+            // directory change, so the failure is reported in those terms.
+            ChatPhase::Active(state) => state.set_info_notice(notice),
+            _ => self.phase = ChatPhase::Error(notice),
+        }
+    }
+
     /// Public entry point for "start a session against this specific
     /// agent." Used by the Quickstart pane on Stage 2 to route the
     /// user into the freshly-created agent's chat.
@@ -1620,9 +1737,13 @@ impl Chat {
         }
     }
 
-    async fn start_session(&mut self, agent_alias: &str, cwd_override: Option<&str>) {
+    async fn start_session(
+        &mut self,
+        agent_alias: &str,
+        cwd_override: Option<&str>,
+    ) -> SessionStartOutcome {
         self.start_session_with_cancel(agent_alias, cwd_override, None, None)
-            .await;
+            .await
     }
 
     async fn start_session_with_cancel(
@@ -1631,9 +1752,9 @@ impl Chat {
         cwd_override: Option<&str>,
         cancellation: Option<&Arc<AtomicBool>>,
         phase: Option<&Arc<AtomicU8>>,
-    ) {
+    ) -> SessionStartOutcome {
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         // TodoWrite display is a ZeroCode UI concern owned by
         // `zerocode-config.toml` — the daemon holds no TodoWrite display schema
@@ -1679,24 +1800,25 @@ impl Chat {
             match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
                 Ok(cwd) => cwd,
                 Err(e) => {
+                    let error = e.localized();
                     self.phase = ChatPhase::Error(crate::i18n::t_args(
                         "zc-chat-error-create-session",
-                        &[("error", &e.localized())],
+                        &[("error", &error)],
                     ));
-                    return;
+                    return SessionStartOutcome::Failed(error);
                 }
             }
         };
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if let Some(phase) = phase
             && !claim_entry_retry_session_creation(phase)
         {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         if is_cancelled(cancellation) {
-            return;
+            return SessionStartOutcome::Cancelled;
         }
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
@@ -1707,7 +1829,7 @@ impl Chat {
                 .session_new_with_id(agent_alias, cwd_str.as_deref(), resume_id)
                 .await
         };
-        match result {
+        let outcome = match result {
             Ok(session) => {
                 let resumed_sid = resume.as_ref().map(|_| session.session_id.clone());
                 let recovery_session_id = session.session_id.clone();
@@ -1724,7 +1846,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // `todo_settings` is resolved fresh at this boundary from
                 // `zerocode-config.toml` (the canonical owner); the removed
@@ -1744,7 +1866,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 if is_cancelled(cancellation) {
@@ -1754,7 +1876,7 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
@@ -1763,12 +1885,13 @@ impl Chat {
                     let msgs = match self.rpc.session_messages(&sid).await {
                         Ok(msgs) => msgs,
                         Err(error) => {
+                            let error = error.to_string();
                             self.phase = ChatPhase::Error(crate::i18n::t_args(
                                 "zc-chat-error-resume-history",
-                                &[("error", &error.to_string())],
+                                &[("error", &error)],
                             ));
                             self.after_session_start().await;
-                            return;
+                            return SessionStartOutcome::Failed(error);
                         }
                     };
                     state.message_count = msgs.total;
@@ -1794,21 +1917,25 @@ impl Chat {
                         Some(session_ownership),
                     )
                     .await;
-                    return;
+                    return SessionStartOutcome::Cancelled;
                 }
                 self.phase = ChatPhase::Active(Box::new(state));
                 if needs_terminal_recovery {
                     self.begin_session_resync(recovery_session_id);
                 }
+                SessionStartOutcome::Started
             }
             Err(e) => {
+                let error = e.to_string();
                 self.phase = ChatPhase::Error(crate::i18n::t_args(
                     "zc-chat-error-create-session",
-                    &[("error", &e.to_string())],
+                    &[("error", &error)],
                 ));
+                SessionStartOutcome::Failed(error)
             }
-        }
+        };
         self.after_session_start().await;
+        outcome
     }
 
     /// Post-`start_session` bookkeeping for the multi-session pane:
@@ -2886,7 +3013,8 @@ impl Chat {
                     Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
-            ChatPhase::PickCwd { explorer, .. } => {
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
@@ -3011,6 +3139,34 @@ impl Chat {
                                 loading: true,
                             };
                             // Re-fetch agents asynchronously.
+                            let _ = self.init().await;
+                        }
+                    }
+                    ExplorerAction::Confirm(_) | ExplorerAction::None => {}
+                }
+                return false;
+            }
+            ChatPhase::PickChangeDirectory {
+                agent_alias,
+                explorer,
+            } => {
+                let action = explorer.handle_key(key);
+                match action {
+                    ExplorerAction::ConfirmDir(path) => {
+                        let alias = agent_alias.clone();
+                        self.apply_change_directory_selection(&alias, &path).await;
+                    }
+                    ExplorerAction::Cancel => {
+                        // The session this picker was opened from is stashed,
+                        // so cancelling returns to it without sending
+                        // `session/new`. The fallback mirrors the CWD picker
+                        // for the (unexpected) case of no stashed session.
+                        if !self.restore_last_focused().await {
+                            self.phase = ChatPhase::PickAgent {
+                                agents: Vec::new(),
+                                list_state: ListState::default(),
+                                loading: true,
+                            };
                             let _ = self.init().await;
                         }
                     }
@@ -3413,10 +3569,7 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::ChangeDirectory => {
-                    // TODO(task-2): route into the dedicated
-                    // `PickChangeDirectory` phase. For now the action is
-                    // consumed here so the command never falls through and
-                    // gets submitted to the agent as ordinary chat text.
+                    self.begin_change_directory();
                     return false;
                 }
                 InputBarAction::ResumeQueue => {
@@ -4078,7 +4231,9 @@ impl Chat {
         self.finish_transcript_drag_if_released(&mouse);
 
         // Dir-picker explorer handles its own mouse events.
-        if let ChatPhase::PickCwd { explorer, .. } = &mut self.phase {
+        if let ChatPhase::PickCwd { explorer, .. }
+        | ChatPhase::PickChangeDirectory { explorer, .. } = &mut self.phase
+        {
             explorer.handle_mouse(mouse);
             return;
         }
@@ -4590,7 +4745,8 @@ impl Chat {
     pub(crate) fn selected_agent(&self) -> Option<&str> {
         match &self.phase {
             ChatPhase::Active(s) => Some(s.agent_alias.as_str()),
-            ChatPhase::PickCwd { agent_alias, .. } => Some(agent_alias.as_str()),
+            ChatPhase::PickCwd { agent_alias, .. }
+            | ChatPhase::PickChangeDirectory { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
     }
@@ -4655,8 +4811,8 @@ impl Chat {
 
     pub(crate) fn wants_text_input(&self) -> bool {
         match &self.phase {
-            // CWD picker always captures text input.
-            ChatPhase::PickCwd { .. } => true,
+            // Directory pickers always capture text input.
+            ChatPhase::PickCwd { .. } | ChatPhase::PickChangeDirectory { .. } => true,
             ChatPhase::PickSession { .. } => false,
             ChatPhase::Active(s) => {
                 // The model picker is modal: claim text-input so global keys
@@ -4737,7 +4893,8 @@ impl crate::widgets::HelpContext for Chat {
                     HelpNode::entries(entries)
                 }
             }
-            ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
+            ChatPhase::PickCwd { explorer, .. }
+            | ChatPhase::PickChangeDirectory { explorer, .. } => explorer.help_context(),
             ChatPhase::PickSession { .. } => {
                 use crate::keymap::{ChatTabAction as C, ModalAction as M, action_key_labels};
                 let nav = action_key_labels(M::Up)
@@ -4928,6 +5085,12 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                // Code owns a session root the user can re-select; Chat
+                // sessions follow their agent's workspace, so the hint is
+                // scoped to this pane.
+                if self.pane_kind == PaneKind::Acp {
+                    pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-change-directory")));
+                }
                 let pane = HelpNode::entries(pane_entries);
                 pane.with_child(state.input_bar.help_context())
             }
@@ -10712,6 +10875,19 @@ mod tests {
     }
 
     #[test]
+    fn change_directory_command_is_a_dedicated_input_action() {
+        // `/change-directory` must reach the pane as its own action; falling
+        // back to `Submit` would send the command to the agent as chat text.
+        assert!(matches!(
+            command_action_from_initialize(
+                serde_json::json!({"server_version": env!("CARGO_PKG_VERSION")}),
+                "/change-directory",
+            ),
+            InputBarAction::ChangeDirectory
+        ));
+    }
+
+    #[test]
     fn present_empty_command_catalogue_remains_authoritative() {
         let response = serde_json::json!({
             "server_version": env!("CARGO_PKG_VERSION"),
@@ -15171,6 +15347,226 @@ mod tests {
         assert_eq!(
             resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
             Ok("/tmp/project".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_utf8_selection() {
+        assert_eq!(
+            explicit_cwd(std::path::Path::new("/tmp/project")),
+            Ok("/tmp/project".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cwd_rejects_non_utf8_selection() {
+        use std::os::unix::ffi::OsStrExt;
+        // 0xFF is never valid UTF-8: the selection cannot be sent as a
+        // JSON-RPC `cwd` string, and must be rejected rather than repaired
+        // into a lossy path that names a different directory.
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        let err = explicit_cwd(std::path::Path::new(raw))
+            .expect_err("non-UTF-8 selections must be rejected");
+        let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
+            panic!("expected NotUtf8, got {err:?}");
+        };
+        assert!(shown_path.contains("proj-"), "got {shown_path}");
+        let shown = err.localized();
+        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+    }
+
+    /// A local Code pane holding one active session rooted at `cwd`.
+    fn local_code_chat_with_session(rpc: &Arc<RpcOutbound>, session_id: &str, cwd: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        let mut state = ChatState::new(
+            session_id.to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        state.cwd = Some(cwd.to_string());
+        chat.session_order.push(session_id.to_string());
+        chat.phase = ChatPhase::Active(Box::new(state));
+        chat
+    }
+
+    fn headless_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .expect("test terminal")
+    }
+
+    fn active_info_notice(chat: &Chat) -> String {
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected an active session, got another phase");
+        };
+        state
+            .info_message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .expect("the restored session should carry a notice")
+    }
+
+    #[tokio::test]
+    async fn begin_change_directory_stashes_the_session_and_opens_a_picker() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+
+        chat.begin_change_directory();
+
+        let ChatPhase::PickChangeDirectory { agent_alias, .. } = &chat.phase else {
+            panic!("expected the change-directory picker");
+        };
+        assert_eq!(agent_alias, "alpha");
+        // The live session is parked, never closed: the picker can be
+        // cancelled without losing the running conversation.
+        assert_eq!(chat.background.len(), 1);
+        assert_eq!(chat.last_focused_sid.as_deref(), Some("sess-old"));
+    }
+
+    #[tokio::test]
+    async fn begin_change_directory_is_ignored_on_the_chat_pane() {
+        // Chat sessions follow the agent workspace; only Code owns a root the
+        // user may re-select.
+        let mut chat = active_chat();
+        chat.begin_change_directory();
+        assert!(matches!(chat.phase, ChatPhase::Active(_)));
+        assert!(chat.background.is_empty());
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_restores_existing_session() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not create or close any session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn change_directory_invalid_path_restores_existing_session() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        chat.apply_change_directory_selection("alpha", std::path::Path::new(raw))
+            .await;
+
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        assert_eq!(
+            active_info_notice(&chat),
+            crate::i18n::t("zc-chat-change-directory-invalid-path")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_failure_restores_existing_session() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection(
+                "alpha",
+                std::path::Path::new("/selected/project"),
+            )
+            .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        respond_err(&rpc, &request, -32000, "workspace unavailable");
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let notice = active_info_notice(&chat);
+        let template =
+            crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "SENTINEL")]);
+        let (prefix, suffix) = template
+            .split_once("SENTINEL")
+            .expect("the change-directory error carries an { $error } placeholder");
+        assert!(
+            notice.starts_with(prefix) && notice.ends_with(suffix),
+            "failure must be reported as a change-directory error, got {notice}"
+        );
+        assert!(
+            notice.contains("workspace unavailable"),
+            "the notice must carry the underlying failure, got {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_success_keeps_the_old_session_at_its_root() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.begin_change_directory();
+
+        let task = tokio::spawn(async move {
+            chat.apply_change_directory_selection(
+                "alpha",
+                std::path::Path::new("/selected/project"),
+            )
+            .await;
+            chat
+        });
+
+        let request =
+            next_rpc_request(&mut rx, "confirming a directory should start a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = task.await.unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        // The prior session keeps its own root; a new root never re-points a
+        // session that is already running.
+        assert_eq!(
+            chat.state_for_session("sess-old")
+                .and_then(|state| state.cwd.as_deref()),
+            Some("/old/project")
         );
     }
 

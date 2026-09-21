@@ -1504,8 +1504,17 @@ impl Chat {
     /// keeps the identity (and its queued messages) for a later retry instead
     /// of discarding it.
     ///
-    /// Callers must only demote when an explicit root will actually be sent:
-    /// a rejected selection leaves resume ownership untouched.
+    /// Callers demote at whichever point the focused slot stops being the right
+    /// target, which is not always the moment a cwd is sent:
+    ///
+    /// - `begin_change_directory` and `add_agent_session` demote up front,
+    ///   before any directory exists, because both are explicit requests for a
+    ///   *different* session than the retained one; the demotion is safe even if
+    ///   the picker is later cancelled, since the identity and its queued
+    ///   messages survive in `resume_backgrounds` for a retry.
+    /// - The `PickCwd` confirm path demotes only after `explicit_cwd` accepts
+    ///   the selection, so a rejected path leaves resume ownership untouched and
+    ///   the pending reconnect can still reattach.
     fn demote_focused_resume_to_background(&mut self) {
         if let Some(mut retained) = self.resume_focused.take() {
             retained.was_focused = false;

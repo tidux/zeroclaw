@@ -18,12 +18,25 @@ zerocode finds the daemon's local endpoint automatically: `<data_dir>/data/daemo
 on Unix, `\\.\pipe\zeroclaw-<hash>` on Windows. If the daemon isn't running,
 zerocode spawns an ephemeral one.
 
-Local **Code** sessions start in the directory you launched zerocode from, so
-file and shell tools operate on that project. If that directory cannot be
-determined, the session reports an error instead of starting somewhere else.
-Local **Chat** sessions still use the selected agent's configured workspace.
-Remote (WSS) Code sessions keep the directory picker. Existing sessions keep
-their own working directory when you resume them.
+## Session working directories
+
+Fresh **Chat** and **Code** sessions use the selected agent's configured
+workspace, so file and shell tools operate there unless you choose a directory
+yourself. The daemon resolves that root and reports it back; zerocode does not
+substitute the directory you launched it from.
+
+In the **Code** pane, `/change-directory` opens a directory picker and starts a
+new session in the selected directory. The existing session is not moved: it
+remains available at its own saved root, and you can switch back to it at any
+time. Cancelling the picker, or a selection the daemon rejects, returns you to
+that session unchanged. Remote (WSS) Code uses the same explicit-root contract
+through its daemon-side picker, which browses the daemon's filesystem rather
+than your local one.
+
+Resumed Code sessions keep the working directory they were created with, even
+if your launch directory or the agent's configured workspace changes afterwards.
+**Chat** differs here: a reattached Chat session can resolve against the selected
+agent's current workspace.
 
 ## Switching sessions
 
@@ -33,6 +46,11 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
 - **New session** starts fresh (default chord: Ctrl+N; rebindable).
+
+Switching to an existing **Code** session resumes it at its own saved root,
+while **New session** starts at the selected agent's workspace. Neither action
+changes the root of a session that is already running; use `/change-directory`
+when you want a Code session somewhere else.
 
 The in-app help overlay shows your live key bindings for these actions.
 

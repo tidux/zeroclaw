@@ -268,9 +268,15 @@ fn change_directory_start_dir(
 ///
 /// `superseded` is the generic session-start error the restore surfaced: the
 /// directory-change report carries the same underlying failure in the terms
-/// the user asked for, so repeating it is noise. Anything else the restore
-/// added — a dropped-resume count, for instance — is information the report
-/// does not carry and is preserved after it.
+/// the user asked for, so repeating it is noise. Anything else *that same
+/// restore* appended — a dropped-resume count, for instance — is information
+/// the report does not carry and is preserved after it.
+///
+/// Existing text is only ever carried over when a `superseded` notice is given
+/// *and* matches as a prefix of it: that pairing is the sole proof the text
+/// belongs to the restore this report supersedes. Without it the existing
+/// notice is unrelated or expired — an older, already-stale message that this
+/// report replaces outright — so it is dropped rather than resurrected.
 fn merge_change_directory_notice(
     notice: String,
     existing: Option<&str>,
@@ -279,10 +285,15 @@ fn merge_change_directory_notice(
     let Some(existing) = existing.map(str::trim).filter(|text| !text.is_empty()) else {
         return notice;
     };
-    let remainder = match superseded {
-        Some(superseded) => existing.strip_prefix(superseded).unwrap_or(existing).trim(),
-        None => existing,
+    // No superseded notice: nothing ties `existing` to this restore.
+    let Some(superseded) = superseded.map(str::trim).filter(|text| !text.is_empty()) else {
+        return notice;
     };
+    // A mismatched prefix means `existing` came from somewhere else entirely.
+    let Some(remainder) = existing.strip_prefix(superseded) else {
+        return notice;
+    };
+    let remainder = remainder.trim();
     if remainder.is_empty() || notice.contains(remainder) {
         return notice;
     }
@@ -1583,7 +1594,8 @@ impl Chat {
         // A confirmed directory starts an *additional* session, so the pane cap
         // applies here exactly as it does to the sidebar "+". Refusing before
         // the stash keeps the live session focused instead of parking it
-        // behind a picker whose only successful outcome is rejected later.
+        // behind a picker that cannot add the ninth tracked session it would
+        // need to honor the selection.
         if self.tracked_session_count() >= MAX_TRACKED_SESSIONS_PER_PANE {
             if let ChatPhase::Active(ref mut state) = self.phase {
                 state.set_info_notice(crate::i18n::t_args(
@@ -1628,10 +1640,12 @@ impl Chat {
         let (notice, superseded) = match explicit_cwd(path) {
             Ok(cwd) => match self.start_session(agent_alias, Some(&cwd)).await {
                 SessionStartOutcome::Started => return,
-                // The attempt was abandoned before a session existed and left
-                // the picker phase in place. Restore the stashed session:
-                // returning here would strand the pane in a picker whose
-                // session is already parked in `background`.
+                // Defensive only: this call passes no cancellation token or
+                // entry-retry phase, the two things `start_session_with_cancel`
+                // reports `Cancelled` for, so this path is unreachable today.
+                // It is kept so a future cancellable start cannot strand the
+                // pane in a picker whose session is already parked in
+                // `background` — the restore below puts it back.
                 SessionStartOutcome::Cancelled => (None, None),
                 SessionStartOutcome::Failed(error) => (
                     Some(crate::i18n::t_args(
@@ -15738,8 +15752,8 @@ mod tests {
     async fn change_directory_at_the_session_cap_reports_the_cap_and_keeps_the_session() {
         // A confirmed directory starts an *additional* session, so the picker
         // must refuse at the cap exactly like the sidebar "+": opening it
-        // would stash the live session behind a picker whose only successful
-        // outcome is rejected later.
+        // would stash the live session behind a picker that cannot add the
+        // ninth tracked session it would need to honor the selection.
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -15849,10 +15863,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_directory_cancelled_start_restores_the_stashed_session() {
-        // A start abandoned before creation leaves the picker phase in place;
-        // without a restore the pane strands in `PickChangeDirectory` with the
-        // live session parked in `background`.
+    async fn restoring_from_the_picker_without_a_notice_returns_the_stashed_session() {
+        // Exercises `restore_change_directory_session` directly — the helper
+        // the defensive `SessionStartOutcome::Cancelled` arm calls — rather
+        // than the `apply_change_directory_selection` path, which passes no
+        // cancellation token and so cannot produce `Cancelled` today. A
+        // notice-less restore must still leave the picker phase: otherwise the
+        // pane strands in `PickChangeDirectory` with the live session parked
+        // in `background`. Escape cancellation is covered separately by
+        // `change_directory_cancel_restores_existing_session`.
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -15868,7 +15887,7 @@ mod tests {
         };
         assert!(
             state.info_message.is_none(),
-            "an abandoned start has nothing to report"
+            "a restore with no notice has nothing to report"
         );
         assert!(
             rx.try_recv().is_err(),
@@ -15908,6 +15927,64 @@ mod tests {
         assert!(
             !shown.contains(&start_error),
             "the superseded generic start error must not be repeated, got {shown}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_keeps_only_the_extra_information_after_a_matching_superseded_prefix() {
+        // The restore left "<generic start error> <dropped resume count>".
+        // The report re-states the failure in directory-change terms, so only
+        // the dropped-resume tail is new information worth carrying over.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let dropped = crate::i18n::t_args("zc-chat-resume-dropped", &[("count", "1")]);
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(
+            notice.clone(),
+            Some(&format!("{start_error} {dropped}")),
+            Some(&start_error),
+        );
+
+        assert_eq!(merged, format!("{notice} {dropped}"));
+        assert!(
+            !merged.contains(&start_error),
+            "the superseded generic start error must not be repeated, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_there_is_no_superseded_notice() {
+        // Without a superseded notice nothing ties the existing text to this
+        // restore: it is an unrelated or expired message, not information the
+        // report is missing, so resurrecting it would mislead.
+        let stale = crate::i18n::t("zc-chat-change-directory-chat-only");
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged = merge_change_directory_notice(notice.clone(), Some(&stale), None);
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&stale),
+            "an unattributed prior notice must not be resurrected, got {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_notice_drops_existing_text_when_the_superseded_prefix_does_not_match() {
+        // The existing notice does not start with the notice this report
+        // supersedes, so it was left by something else entirely — keeping any
+        // of it would staple an unrelated message onto the report.
+        let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
+        let unrelated = crate::i18n::t("zc-chat-change-directory-invalid-path");
+        let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
+
+        let merged =
+            merge_change_directory_notice(notice.clone(), Some(&unrelated), Some(&start_error));
+
+        assert_eq!(merged, notice);
+        assert!(
+            !merged.contains(&unrelated),
+            "a mismatched prior notice must not survive, got {merged}"
         );
     }
 

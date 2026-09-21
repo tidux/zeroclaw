@@ -1494,6 +1494,25 @@ impl Chat {
             .await;
     }
 
+    /// Give up the focused-resume slot before a session start that must *not*
+    /// reattach to it.
+    ///
+    /// `start_session` prefers `resume_focused`'s stable id over any
+    /// `cwd_override` and deliberately sends no cwd on a resume, so a retained
+    /// failed-reconnect identity would swallow an explicitly chosen root and
+    /// silently reopen that session at its own. Demoting to a background resume
+    /// keeps the identity (and its queued messages) for a later retry instead
+    /// of discarding it.
+    ///
+    /// Callers must only demote when an explicit root will actually be sent:
+    /// a rejected selection leaves resume ownership untouched.
+    fn demote_focused_resume_to_background(&mut self) {
+        if let Some(mut retained) = self.resume_focused.take() {
+            retained.was_focused = false;
+            self.resume_backgrounds.push(retained);
+        }
+    }
+
     async fn pick_or_start_session_inner(
         &mut self,
         agent_alias: &str,
@@ -1572,10 +1591,7 @@ impl Chat {
         // `session/new`, resuming that session at *its* cwd and swallowing the
         // directory the user is about to pick. Demote it to a background
         // resume, exactly as a fresh sidebar launch does.
-        if let Some(mut retained) = self.resume_focused.take() {
-            retained.was_focused = false;
-            self.resume_backgrounds.push(retained);
-        }
+        self.demote_focused_resume_to_background();
 
         self.stash_active();
         let explorer = if self.rpc.transport() == crate::client::Transport::Wss {
@@ -1711,10 +1727,7 @@ impl Chat {
             return;
         }
         // A fresh launch must not consume a failed reconnect's stable ID or queue.
-        if let Some(mut retained) = self.resume_focused.take() {
-            retained.was_focused = false;
-            self.resume_backgrounds.push(retained);
-        }
+        self.demote_focused_resume_to_background();
         self.stash_active();
         self.pick_or_start_session(agent_alias).await;
     }
@@ -3235,12 +3248,18 @@ impl Chat {
                         let alias = agent_alias.clone();
                         match explicit_cwd(&path) {
                             Ok(cwd) => {
+                                // Only now that a valid explicit root will be
+                                // sent: release the focused-resume slot so
+                                // `session/new` carries this directory instead
+                                // of a retained session's id (and old cwd).
+                                self.demote_focused_resume_to_background();
                                 self.start_session(&alias, Some(&cwd)).await;
                             }
                             // Never fall back to an omitted cwd: the daemon
                             // would root the session at the agent workspace
                             // while the user believes they picked this
-                            // directory.
+                            // directory. A rejection sends nothing, so resume
+                            // ownership stays as it was.
                             Err(error) => {
                                 self.phase = ChatPhase::Error(crate::i18n::t_args(
                                     "zc-chat-error-create-session",
@@ -15980,6 +15999,10 @@ mod tests {
             agent_alias: "alpha".to_string(),
             explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from("relative/dir")),
         };
+        // A retained failed-reconnect identity is only demoted when a valid
+        // root will actually be sent; a rejection must leave ownership alone.
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
 
         let mut term = headless_term();
         chat.handle_key(
@@ -15999,6 +16022,148 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a rejected path must not reach session/new"
+        );
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a path that never reaches session/new must not move resume ownership"
+        );
+        assert!(
+            chat.resume_backgrounds.is_empty(),
+            "a rejected path must not demote the retained identity"
+        );
+    }
+
+    /// Helper for the startup CWD picker tests: a WSS Code pane parked in
+    /// `PickCwd`. The explorer lists locally on purpose — `ConfirmDir` returns
+    /// its `cwd` either way, and a local listing keeps `fs/list_dir` chatter
+    /// out of the RPC channel the assertions read.
+    fn wss_code_chat_in_cwd_picker(rpc: &Arc<RpcOutbound>, start_dir: &str) -> Chat {
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(rpc),
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickCwd {
+            agent_alias: "alpha".to_string(),
+            explorer: FileExplorerState::new_dir_picker(std::path::PathBuf::from(start_dir)),
+        };
+        chat
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_sends_the_selected_directory() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Happy path for the WSS Code picker: a confirmed absolute directory is
+        // the explicit root for a *fresh* session, so `session/new` carries it
+        // and no session id.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "a picked directory starts a fresh session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+    }
+
+    #[tokio::test]
+    async fn startup_cwd_picker_demotes_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // A failed reconnect leaves `resume_focused` set, and the WSS Code
+        // restart path re-opens this picker without clearing it. `start_session`
+        // prefers a resume id over `cwd_override`, so without demoting the
+        // retained entry the confirmed directory would be dropped and the old
+        // session silently resumed at *its* root — the same leak
+        // `begin_change_directory`/`add_agent_session` already guard against.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = wss_code_chat_in_cwd_picker(&rpc, "/selected/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "confirming a directory starts a session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(
+            request["params"]["cwd"], "/selected/project",
+            "the explicit root must survive the retained resume identity"
+        );
+        assert!(
+            request["params"]["session_id"].is_null(),
+            "an explicit directory choice must not resume a retained session"
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+        );
+        let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        // The demoted identity is retried separately, carrying its own stable
+        // id — proof it was preserved rather than consumed by the pick.
+        let request = next_rpc_request(&mut rx, "the demoted entry is re-attached").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-retained");
+        respond_err(&rpc, &request, -32000, "retained session gone");
+
+        let chat = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the picked directory should start a session")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-new"));
+        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert!(
+            chat.resume_focused.is_none(),
+            "the retained identity must no longer own the focused resume slot"
+        );
+        assert!(
+            chat.resume_backgrounds
+                .iter()
+                .any(|entry| entry.session_id == "sess-retained" && !entry.was_focused),
+            "a failed background retry keeps the retained identity queued"
         );
     }
 

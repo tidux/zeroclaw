@@ -3412,6 +3412,12 @@ impl Chat {
                     self.note_session_replaced(&old_sid);
                     return false;
                 }
+                InputBarAction::ChangeDirectory => {
+                    // Picker transition is wired up with the dedicated
+                    // `PickChangeDirectory` phase; until then the command is
+                    // consumed rather than submitted as chat text.
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     state.clear_info_notice();
                     if state.resume_queue() {

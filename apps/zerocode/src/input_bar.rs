@@ -37,6 +37,7 @@ enum SlashCommandId {
     Attach,
     ListAttachments,
     Detach,
+    ChangeDirectory,
     ClearQueue,
     Browse,
     Help,
@@ -75,6 +76,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
     LocalCommandDescriptor {
         id: SlashCommandId::ClearQueue,
         name: "clear-queue",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
+        id: SlashCommandId::ChangeDirectory,
+        name: "change-directory",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -172,6 +178,8 @@ impl SlashCommandRegistry {
                 // clear-all, so a typo cannot wipe the whole queue.
                 SlashCommand::ClearQueue(Some(argument.parse().unwrap_or(0)))
             }
+            (SlashCommandId::ChangeDirectory, None) => SlashCommand::ChangeDirectory,
+            (SlashCommandId::ChangeDirectory, Some(_)) => SlashCommand::NotACommand,
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,
             (SlashCommandId::Browse, None) => SlashCommand::EnterBrowseMode,
@@ -217,6 +225,10 @@ pub(crate) enum InputBarAction {
     /// User typed `/restart-session`, `/new-session`, or `/new` — parent should close
     /// the current session and open a fresh one for the same agent/workspace.
     RestartSession,
+    /// User typed `/change-directory` — parent should open a directory picker
+    /// and start a new session in the selected directory. Takes no argument:
+    /// the root is always chosen interactively.
+    ChangeDirectory,
     /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
     /// it hands removal up to the parent. None = clear all; Some(N) = the
     /// 1-based queue position (Some(0) is an invalid-index sentinel).
@@ -265,6 +277,8 @@ enum SlashCommand<'a> {
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
     RestartSession,
+    /// `/change-directory` — open the directory picker for a new session.
+    ChangeDirectory,
     EnterBrowseMode,
     OpenHelp,
     NotACommand,
@@ -1648,6 +1662,7 @@ impl InputBarState {
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
                 SlashCommand::RestartSession => InputBarAction::RestartSession,
+                SlashCommand::ChangeDirectory => InputBarAction::ChangeDirectory,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::EnterBrowseMode => InputBarAction::EnterBrowseMode,
                 SlashCommand::OpenHelp => InputBarAction::OpenHelp,
@@ -3074,6 +3089,14 @@ mod tests {
             SlashCommand::RestartSession
         ));
         assert!(matches!(
+            parse_slash_command("/change-directory"),
+            SlashCommand::ChangeDirectory
+        ));
+        assert!(matches!(
+            parse_slash_command("/change-directory /tmp/project"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
         ));
@@ -3121,11 +3144,12 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_expected_thirteen_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
+            "/change-directory",
             "/clear-queue",
             "/detach",
             "/help",
@@ -3748,6 +3772,17 @@ mod tests {
         bar.insert_text("/restart-session");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::RestartSession));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_change_directory_returns_action() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/change-directory");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::ChangeDirectory
+        ));
         assert_eq!(bar.input(), "");
     }
 

@@ -3413,9 +3413,10 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::ChangeDirectory => {
-                    // Picker transition is wired up with the dedicated
-                    // `PickChangeDirectory` phase; until then the command is
-                    // consumed rather than submitted as chat text.
+                    // TODO(task-2): route into the dedicated
+                    // `PickChangeDirectory` phase. For now the action is
+                    // consumed here so the command never falls through and
+                    // gets submitted to the agent as ordinary chat text.
                     return false;
                 }
                 InputBarAction::ResumeQueue => {

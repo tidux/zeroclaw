@@ -74,13 +74,13 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
         aliases: &[],
     },
     LocalCommandDescriptor {
-        id: SlashCommandId::ClearQueue,
-        name: "clear-queue",
+        id: SlashCommandId::ChangeDirectory,
+        name: "change-directory",
         aliases: &[],
     },
     LocalCommandDescriptor {
-        id: SlashCommandId::ChangeDirectory,
-        name: "change-directory",
+        id: SlashCommandId::ClearQueue,
+        name: "clear-queue",
         aliases: &[],
     },
     LocalCommandDescriptor {
@@ -179,6 +179,9 @@ impl SlashCommandRegistry {
                 SlashCommand::ClearQueue(Some(argument.parse().unwrap_or(0)))
             }
             (SlashCommandId::ChangeDirectory, None) => SlashCommand::ChangeDirectory,
+            // The new root is always chosen in the picker, so a path argument
+            // would be a second, conflicting source of truth. Reject it as a
+            // non-command instead of silently ignoring the text the user typed.
             (SlashCommandId::ChangeDirectory, Some(_)) => SlashCommand::NotACommand,
             (SlashCommandId::RestartSession, None) => SlashCommand::RestartSession,
             (SlashCommandId::ToggleThinking, None) => SlashCommand::ToggleThinking,

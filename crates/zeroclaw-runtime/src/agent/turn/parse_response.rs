@@ -201,7 +201,7 @@ pub(crate) async fn interpret_chat_response(
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
+    let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
@@ -334,9 +334,12 @@ pub(crate) async fn interpret_chat_response(
     }
 }
 
+use zeroclaw_providers::dispatch::AcceptedRoute;
+
 /// Emit effects which are valid only after the turn loop accepts the parsed
 /// response. Keeping this separate from interpretation prevents a malformed
 /// transport success from advancing accepted accounting or success telemetry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_accepted_chat_response(
     ctx: &TurnCtx<'_>,
     served_provider: &str,
@@ -348,12 +351,37 @@ pub(crate) async fn record_accepted_chat_response(
     history: &[ChatMessage],
     llm_started_at: Instant,
     iteration: usize,
+    accepted_route: Option<&AcceptedRoute>,
 ) {
+    // The accepted_route tuple is the canonical identity when Reliable wrapping
+    // produced an AcceptedRoute. When no AcceptedRoute exists (direct/vision
+    // routing without Reliable), fall back to ctx.serving_* overrides.
+    let (effective_provider, effective_model) = match accepted_route {
+        Some(route) => (route.provider_ref(), route.model()),
+        None => {
+            // Vision routing without Reliable: use ctx.serving_* overrides when
+            // they differ from the base provider.
+            let prov = if let Some(ref vision_provider) = ctx.serving_provider_name
+                && vision_provider != ctx.provider_name
+            {
+                vision_provider.as_str()
+            } else {
+                served_provider
+            };
+            let mdl = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+                ctx.serving_model.as_deref().unwrap_or(model)
+            } else {
+                model
+            };
+            (prov, mdl)
+        }
+    };
+
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
     let output_tokens = usage.and_then(|usage| usage.output_tokens);
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: served_provider.to_string(),
-        model: model.to_string(),
+        model_provider: effective_provider.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -366,46 +394,29 @@ pub(crate) async fn record_accepted_chat_response(
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
     let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
-    // Local OpenAI-compatible servers (llama.cpp, etc.) often omit `usage`
-    // from completions/stream chunks. Without a fallback the daemon never
-    // emits TurnEvent::Usage, so ZeroCode's context meter stays blank even
-    // though max_context_tokens is known from the runtime profile. Prefer
-    // provider-reported counts when present; otherwise estimate from the
-    // request history (~4 chars/token) so the meter still updates.
-    //
-    // This runs only on the accepted path, so a malformed/rejected response
-    // still emits no Usage event.
+    // Exactly-one per accepted response, even when the provider returned no
+    // usage data, so terminal identity and context-window accounting always
+    // describe the accepted serving provider/model. The caller settles
+    // rejected physical attempts separately and never reaches this point.
     if let Some(tx) = ctx.event_tx {
-        let estimated_input = || {
-            let n = crate::agent::history::estimate_history_tokens(history) as u64;
-            (n > 0).then_some(n)
-        };
-        let usage_event = match usage {
-            Some(usage) => {
-                // Prefer provider counts. If the body carried a usage object
-                // but left prompt/input tokens null (seen on some llama.cpp
-                // builds), fill input from the history estimate so the meter
-                // still has a numerator.
-                Some(TurnEvent::Usage {
-                    input_tokens: usage.input_tokens.or_else(estimated_input),
-                    cached_input_tokens: usage.cached_input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cost_usd,
-                })
-            }
-            None => estimated_input().map(|input_tokens| TurnEvent::Usage {
-                input_tokens: Some(input_tokens),
-                cached_input_tokens: None,
-                output_tokens: None,
-                // Estimated tokens must not invent a dollar cost.
-                cost_usd: None,
-            }),
-        };
-        if let Some(event) = usage_event {
-            let _ = tx.send(event).await;
-        }
+        let _ = tx
+            .send(TurnEvent::Usage {
+                input_tokens,
+                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                output_tokens,
+                cost_usd,
+                context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
+                model_context_window: ctx
+                    .context_limits
+                    .configured_model_context_window()
+                    .map(|tokens| tokens as u64),
+                provider_ref: effective_provider.to_string(),
+                model: effective_model.to_string(),
+                accepted: true,
+            })
+            .await;
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -414,7 +425,7 @@ pub(crate) async fn record_accepted_chat_response(
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": model,
+                "model": effective_model,
                 "iteration": iteration + 1,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -550,6 +561,7 @@ mod argument_preservation_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "test.provider",
             model: "test-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "",
@@ -565,6 +577,8 @@ mod argument_preservation_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "argument-preservation",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let name = spec.name.clone();
         let specs = IterationToolSpecs {
@@ -789,6 +803,12 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: provider,
             model,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 32_000,
+                context_token_budget: 32_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             temperature: None,
             approval: None,
             channel_name: "",
@@ -804,6 +824,8 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let specs = IterationToolSpecs {
@@ -833,7 +855,7 @@ mod cost_usd_regression_tests {
         let mut log_rx = zeroclaw_log::subscribe_or_install();
         while log_rx.try_recv().is_ok() {}
 
-        // Run interpret_chat_response inside the cost scope so
+        // Parse, then record the accepted response inside the cost scope so
         // record_tool_loop_cost_usage sees the pricing map.
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -861,6 +883,7 @@ mod cost_usd_regression_tests {
                     &[],
                     now,
                     0,
+                    None,
                 )
                 .await;
             })
@@ -869,7 +892,7 @@ mod cost_usd_regression_tests {
         // (a) The Usage event must carry the cost.
         let event = rx
             .try_recv()
-            .expect("interpret_chat_response should emit a TurnEvent::Usage");
+            .expect("record_accepted_chat_response should emit a TurnEvent::Usage");
         match event {
             TurnEvent::Usage { cost_usd, .. } => {
                 let c = cost_usd.expect("Usage event must carry cost_usd, got None");
@@ -930,6 +953,7 @@ mod cost_usd_regression_tests {
             observer: &crate::observability::NoopObserver,
             provider_name: "requested.provider",
             model: "requested-model",
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
             channel_name: "",
@@ -945,6 +969,8 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(
@@ -990,275 +1016,5 @@ mod cost_usd_regression_tests {
             rx.try_recv().is_err(),
             "malformed output must not emit accepted Usage"
         );
-    }
-
-    /// Local OpenAI-compatible servers (llama.cpp, older ollama, etc.) often
-    /// omit `usage` from chat completions / stream chunks. Without a fallback
-    /// the daemon never emits `TurnEvent::Usage`, so ZeroCode's context meter
-    /// stays blank even though the runtime-profile budget is known.
-    #[tokio::test]
-    async fn missing_provider_usage_emits_estimated_context_usage() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            parent_agent_alias: None,
-            observer: &crate::observability::NoopObserver,
-            provider_name: "llamacpp",
-            model: "local-model",
-            temperature: None,
-            approval: None,
-            channel_name: "rpc",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
-            agent_alias: Some("melfina"),
-            turn_id: "turn-no-usage",
-        };
-
-        let specs = IterationToolSpecs {
-            tool_specs: vec![],
-            known_tool_names: HashSet::new(),
-            use_native_tools: false,
-        };
-
-        // History large enough that the ~4 chars/token estimate is > 0.
-        let history = vec![
-            ChatMessage::system("You are a helpful assistant."),
-            ChatMessage::user("Explain how context windows work in local models."),
-        ];
-        let expected_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
-
-        let resp = ChatResponse {
-            text: Some("Local models often omit usage.".to_string()),
-            tool_calls: vec![],
-            usage: None,
-            reasoning_content: None,
-        };
-
-        let interpreted = interpret_chat_response(
-            &ctx,
-            "llamacpp",
-            "local-model",
-            resp,
-            &history,
-            &specs,
-            false,
-            0,
-            false,
-        )
-        .await;
-        record_accepted_chat_response(
-            &ctx,
-            "llamacpp",
-            "local-model",
-            &interpreted.response_text,
-            &interpreted.native_tool_calls,
-            interpreted.tool_calls.len(),
-            interpreted.usage.as_ref(),
-            &history,
-            std::time::Instant::now(),
-            0,
-        )
-        .await;
-
-        let event = rx.try_recv().expect(
-            "missing provider usage must still emit TurnEvent::Usage for the context meter",
-        );
-        match event {
-            TurnEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                cost_usd,
-            } => {
-                assert_eq!(
-                    input_tokens,
-                    Some(expected_estimate),
-                    "input_tokens should fall back to history estimate"
-                );
-                assert_eq!(output_tokens, None);
-                assert_eq!(cached_input_tokens, None);
-                assert_eq!(cost_usd, None, "estimated usage must not invent a cost");
-            }
-            other => panic!("expected TurnEvent::Usage, got {other:?}"),
-        }
-        assert!(rx.try_recv().is_err(), "must emit exactly one Usage event");
-    }
-
-    #[tokio::test]
-    async fn null_input_tokens_in_usage_object_falls_back_to_estimate() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            parent_agent_alias: None,
-            observer: &crate::observability::NoopObserver,
-            provider_name: "llamacpp",
-            model: "local-model",
-            temperature: None,
-            approval: None,
-            channel_name: "rpc",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
-            agent_alias: Some("melfina"),
-            turn_id: "turn-null-input",
-        };
-
-        let specs = IterationToolSpecs {
-            tool_specs: vec![],
-            known_tool_names: HashSet::new(),
-            use_native_tools: false,
-        };
-
-        let history = vec![ChatMessage::user(
-            "A somewhat longer prompt so the estimate is non-zero.",
-        )];
-        let expected = crate::agent::history::estimate_history_tokens(&history) as u64;
-
-        let resp = ChatResponse {
-            text: Some("ok".to_string()),
-            tool_calls: vec![],
-            usage: Some(TokenUsage {
-                input_tokens: None,
-                output_tokens: Some(12),
-                cached_input_tokens: None,
-                cache_creation_input_tokens: None,
-            }),
-            reasoning_content: None,
-        };
-
-        let interpreted = interpret_chat_response(
-            &ctx,
-            "llamacpp",
-            "local-model",
-            resp,
-            &history,
-            &specs,
-            false,
-            0,
-            false,
-        )
-        .await;
-        record_accepted_chat_response(
-            &ctx,
-            "llamacpp",
-            "local-model",
-            &interpreted.response_text,
-            &interpreted.native_tool_calls,
-            interpreted.tool_calls.len(),
-            interpreted.usage.as_ref(),
-            &history,
-            std::time::Instant::now(),
-            0,
-        )
-        .await;
-
-        match rx.try_recv().expect("must emit Usage") {
-            TurnEvent::Usage {
-                input_tokens,
-                output_tokens,
-                ..
-            } => {
-                assert_eq!(input_tokens, Some(expected));
-                assert_eq!(output_tokens, Some(12));
-            }
-            other => panic!("expected Usage, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn provider_usage_is_preferred_over_estimate() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let dedup_exempt_tools: Vec<String> = Vec::new();
-        let ctx = TurnCtx {
-            parent_agent_alias: None,
-            observer: &crate::observability::NoopObserver,
-            provider_name: "openai",
-            model: "gpt-test",
-            temperature: None,
-            approval: None,
-            channel_name: "rpc",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            event_tx: Some(&tx),
-            hooks: None,
-            dedup_exempt_tools: &dedup_exempt_tools,
-            pacing: &pacing,
-            strict_tool_parsing: false,
-            channel: None,
-            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
-            agent_alias: Some("melfina"),
-            turn_id: "turn-real-usage",
-        };
-
-        let specs = IterationToolSpecs {
-            tool_specs: vec![],
-            known_tool_names: HashSet::new(),
-            use_native_tools: false,
-        };
-
-        let history = vec![ChatMessage::user("hi")];
-        let resp = ChatResponse {
-            text: Some("hello".to_string()),
-            tool_calls: vec![],
-            usage: Some(TokenUsage {
-                input_tokens: Some(1234),
-                output_tokens: Some(56),
-                cached_input_tokens: Some(10),
-                cache_creation_input_tokens: None,
-            }),
-            reasoning_content: None,
-        };
-
-        let interpreted = interpret_chat_response(
-            &ctx, "openai", "gpt-test", resp, &history, &specs, false, 0, false,
-        )
-        .await;
-        record_accepted_chat_response(
-            &ctx,
-            "openai",
-            "gpt-test",
-            &interpreted.response_text,
-            &interpreted.native_tool_calls,
-            interpreted.tool_calls.len(),
-            interpreted.usage.as_ref(),
-            &history,
-            std::time::Instant::now(),
-            0,
-        )
-        .await;
-
-        let event = rx.try_recv().expect("provider usage must emit Usage");
-        match event {
-            TurnEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                ..
-            } => {
-                assert_eq!(input_tokens, Some(1234));
-                assert_eq!(output_tokens, Some(56));
-                assert_eq!(cached_input_tokens, Some(10));
-            }
-            other => panic!("expected TurnEvent::Usage, got {other:?}"),
-        }
     }
 }

@@ -255,7 +255,7 @@ fn change_directory_start_dir(
     transport: crate::client::Transport,
     current_dir: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> std::path::PathBuf {
-    if let Some(cwd) = session_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+    if let Some(cwd) = session_cwd.filter(|cwd| !cwd.trim().is_empty()) {
         return std::path::PathBuf::from(cwd);
     }
     if transport == crate::client::Transport::Wss {
@@ -15642,20 +15642,18 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
         chat.begin_change_directory();
+        let selected_root = native_absolute_root();
 
         let task = tokio::spawn(async move {
-            chat.apply_change_directory_selection(
-                "alpha",
-                std::path::Path::new("/selected/project"),
-            )
-            .await;
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
             chat
         });
 
         let request =
             next_rpc_request(&mut rx, "confirming a directory should start a session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
-        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert_eq!(request["params"]["cwd"], selected_root);
         respond_err(&rpc, &request, -32000, "workspace unavailable");
 
         let chat = task.await.unwrap();
@@ -15689,24 +15687,22 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
         chat.begin_change_directory();
+        let selected_root = native_absolute_root();
 
         let task = tokio::spawn(async move {
-            chat.apply_change_directory_selection(
-                "alpha",
-                std::path::Path::new("/selected/project"),
-            )
-            .await;
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
             chat
         });
 
         let request =
             next_rpc_request(&mut rx, "confirming a directory should start a session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
-        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert_eq!(request["params"]["cwd"], selected_root);
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
         );
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
@@ -15714,7 +15710,7 @@ mod tests {
 
         let chat = task.await.unwrap();
         assert_eq!(chat.current_session_id(), Some("sess-new"));
-        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
         // The prior session keeps its own root; a new root never re-points a
         // session that is already running.
         assert_eq!(
@@ -15767,6 +15763,7 @@ mod tests {
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
         chat.session_order.push("sess-retained".to_string());
         chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+        let selected_root = native_absolute_root();
 
         chat.begin_change_directory();
         assert!(
@@ -15780,18 +15777,15 @@ mod tests {
         );
 
         let task = tokio::spawn(async move {
-            chat.apply_change_directory_selection(
-                "alpha",
-                std::path::Path::new("/selected/project"),
-            )
-            .await;
+            chat.apply_change_directory_selection("alpha", std::path::Path::new(selected_root))
+                .await;
             chat
         });
 
         let request =
             next_rpc_request(&mut rx, "confirming a directory should start a session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
-        assert_eq!(request["params"]["cwd"], "/selected/project");
+        assert_eq!(request["params"]["cwd"], selected_root);
         assert!(
             request["params"]["session_id"].is_null(),
             "an explicit directory choice must not resume a retained session"
@@ -15799,7 +15793,7 @@ mod tests {
         respond_ok(
             &rpc,
             &request,
-            serde_json::json!({"session_id": "sess-new", "workspace_dir": "/selected/project"}),
+            serde_json::json!({"session_id": "sess-new", "workspace_dir": selected_root}),
         );
         let request = next_rpc_request(&mut rx, "a new session refreshes model identity").await;
         assert_eq!(request["method"], method::CONFIG_LIST);
@@ -15818,7 +15812,7 @@ mod tests {
             .expect("the directory change should finish")
             .unwrap();
         assert_eq!(chat.current_session_id(), Some("sess-new"));
-        assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert_eq!(chat.current_cwd(), Some(selected_root));
         assert!(
             chat.resume_focused.is_none(),
             "a confirmed directory releases the focused-resume slot"
@@ -16190,6 +16184,23 @@ mod tests {
                 std::path::PathBuf::from("relative/launch")
             )),
             fallback
+        );
+    }
+
+    #[test]
+    fn change_directory_start_dir_preserves_nonblank_saved_root_whitespace() {
+        let saved_root = if cfg!(windows) {
+            r"C:\\project "
+        } else {
+            "/tmp/project "
+        };
+        assert_eq!(
+            change_directory_start_dir(
+                Some(saved_root),
+                crate::client::Transport::Local,
+                || panic!("a saved root should win without probing the process cwd"),
+            ),
+            std::path::PathBuf::from(saved_root)
         );
     }
 

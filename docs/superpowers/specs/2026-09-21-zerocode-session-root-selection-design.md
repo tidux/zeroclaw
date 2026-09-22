@@ -1,7 +1,7 @@
 # ZeroCode Session Root Selection Design
 
-**Date:** 2026-09-21  
-**Follow-up issue:** [#10826](https://github.com/zeroclaw-labs/zeroclaw/issues/10826)  
+**Date:** 2026-09-21
+**Follow-up issue:** [#10826](https://github.com/zeroclaw-labs/zeroclaw/issues/10826)
 **Parent decision:** [PR #10565](https://github.com/zeroclaw-labs/zeroclaw/pull/10565)
 
 ## Context

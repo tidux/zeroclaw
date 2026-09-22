@@ -471,7 +471,6 @@ zc-chat-session-restart-error = Failed to start a new session: { $error }
 zc-chat-code-cwd-not-utf8 = The selected directory is not valid UTF-8 ({ $path }), so the Code session was not created. Pick a directory whose path is valid UTF-8.
 zc-chat-code-cwd-not-absolute = The selected directory is not an absolute path ({ $path }), so the new Code session was not created. Pick a directory from the root of the filesystem the session runs on.
 zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
-zc-chat-change-directory-invalid-path = The selected directory cannot be represented as UTF-8, so the new Code session was not created.
 zc-chat-change-directory-chat-only = Chat sessions follow the selected agent's workspace, so there is no directory to choose here. Use the Code pane to start a session in a different directory.
 
 zc-chat-thinking-visible = Thinking output: visible

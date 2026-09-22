@@ -425,7 +425,6 @@ zc-chat-session-restart-error = 无法启动新会话：{ $error }
 zc-chat-code-cwd-not-utf8 = 所选目录不是有效的 UTF-8（{ $path }），因此未创建 Code 会话。请选择路径为有效 UTF-8 的目录。
 zc-chat-code-cwd-not-absolute = 所选目录不是绝对路径（{ $path }），因此未创建新的 Code 会话。请从会话所在文件系统的根目录开始选择。
 zc-chat-change-directory-error = 无法在所选目录中启动会话：{ $error }
-zc-chat-change-directory-invalid-path = 所选目录无法用 UTF-8 表示，因此未创建新的 Code 会话。
 zc-chat-change-directory-chat-only = Chat 会话跟随所选代理的工作区，因此这里没有可选择的目录。若要在其他目录中启动会话，请使用 Code 面板。
 zc-chat-thinking-visible = 思考输出：可见
 zc-chat-thinking-hidden = 思考输出：已隐藏

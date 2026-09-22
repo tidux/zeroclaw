@@ -168,34 +168,55 @@ impl LocalCodeCwdError {
 ///
 /// A non-absolute selection is rejected for the same reason: the daemon would
 /// resolve it against *its* process directory rather than the picked one.
-fn explicit_cwd(path: &std::path::Path) -> Result<String, LocalCodeCwdError> {
+/// "Absolute" is judged for `transport`'s daemon, not for this client — see
+/// [`is_absolute_session_root`].
+fn explicit_cwd(
+    path: &std::path::Path,
+    transport: crate::client::Transport,
+) -> Result<String, LocalCodeCwdError> {
     let cwd = path
         .to_str()
         .map(str::to_owned)
         .ok_or_else(|| LocalCodeCwdError::NotUtf8(path.display().to_string()))?;
-    if !is_absolute_session_root(&cwd) {
+    if !is_absolute_session_root(&cwd, transport) {
         return Err(LocalCodeCwdError::NotAbsolute(cwd));
     }
     Ok(cwd)
 }
 
 /// Whether `root` is an absolute path *on the machine that will run the
-/// session*.
+/// session*, which `transport` identifies.
 ///
-/// `Path::is_absolute` answers for the platform zerocode was compiled for,
-/// which is not authoritative here: a WSS picker browses the daemon's
-/// filesystem, so a Unix client can legitimately confirm a Windows drive
-/// (`C:\project`) or UNC (`\\host\share`) root. Those forms are accepted in
-/// addition to the native rule rather than rejected by Unix rules alone.
-fn is_absolute_session_root(root: &str) -> bool {
-    if std::path::Path::new(root).is_absolute() {
+/// `Path::is_absolute` answers for the platform zerocode was compiled for, and
+/// that is authoritative only for a local session. A WSS picker browses the
+/// *daemon's* filesystem, so the client's platform says nothing about the
+/// selection: a Windows client can legitimately confirm a POSIX root
+/// (`/srv/project`) on a Unix daemon, and a Unix client can confirm a drive
+/// (`C:\project`) or UNC (`\\host\share`) root on a Windows one. Remote
+/// validation therefore accepts every wire form and leaves the final ruling to
+/// the daemon, which is the only party that can make it.
+///
+/// Local validation stays native: a Windows form is not a root on a Unix
+/// machine, it is a relative directory name that would resolve against the
+/// daemon's process directory.
+fn is_absolute_session_root(root: &str, transport: crate::client::Transport) -> bool {
+    match transport {
+        crate::client::Transport::Local => std::path::Path::new(root).is_absolute(),
+        crate::client::Transport::Wss => is_remote_absolute_session_root(root),
+    }
+}
+
+/// Whether `root` is absolute in any wire form a remote daemon can report.
+///
+/// Deliberately `cfg`-neutral: the answer depends on the daemon's platform,
+/// which this build knows nothing about.
+fn is_remote_absolute_session_root(root: &str) -> bool {
+    // POSIX root (which also covers `//server/share`), and UNC / device roots.
+    if root.starts_with('/') || root.starts_with(r"\\") {
         return true;
     }
-    // UNC / device roots, in either slash style.
-    if root.starts_with("\\\\") || root.starts_with("//") {
-        return true;
-    }
-    // Drive-letter root: `C:\...` or `C:/...`.
+    // Drive-letter root: `C:\...` or `C:/...`. A bare `C:` is drive-relative,
+    // not absolute, so the separator is required.
     matches!(
         root.as_bytes(),
         [drive, b':', separator, ..]
@@ -203,27 +224,49 @@ fn is_absolute_session_root(root: &str) -> bool {
     )
 }
 
+/// Root a remote picker opens at when the session has no directory to lead
+/// with.
+///
+/// The daemon exposes no "where should a picker start" RPC, so this is the
+/// existing daemon-side picker convention rather than a discovered root: the
+/// remote explorer lists `/` and the user navigates from there. It is a
+/// protocol root, not a local path, and is kept identical for the startup and
+/// restart pickers so a remote session never browses this machine.
+const WSS_PICKER_ROOT: &str = "/";
+
+/// Filesystem root of the machine zerocode itself runs on.
+///
+/// Used only as the last-resort start directory for a *local* picker, where a
+/// POSIX `/` would name nothing on Windows.
+fn local_picker_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+}
+
 /// Directory the `/change-directory` picker opens at.
 ///
 /// The session's own root leads. The fallback is transport-aware: a WSS picker
 /// lists the *daemon's* filesystem, where this process's directory names
-/// nothing, so it starts at the daemon root. The local fallback stays absolute
-/// because a relative root is rejected at confirmation.
+/// nothing, so it starts at [`WSS_PICKER_ROOT`]. A local picker falls back to
+/// this machine's root. Either way the start directory satisfies the same
+/// absoluteness rule confirmation applies, so the picker never opens on a
+/// directory the user could not select.
 fn change_directory_start_dir(
     session_cwd: Option<&str>,
     transport: crate::client::Transport,
     current_dir: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> std::path::PathBuf {
-    let root = std::path::PathBuf::from("/");
     if let Some(cwd) = session_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
         return std::path::PathBuf::from(cwd);
     }
     if transport == crate::client::Transport::Wss {
-        return root;
+        return std::path::PathBuf::from(WSS_PICKER_ROOT);
     }
     current_dir()
-        .filter(|dir| dir.is_absolute())
-        .unwrap_or(root)
+        .filter(|dir| {
+            dir.to_str()
+                .is_some_and(|dir| is_absolute_session_root(dir, crate::client::Transport::Local))
+        })
+        .unwrap_or_else(local_picker_root)
 }
 
 /// Combine a directory-change report with the notice the session restore
@@ -1505,16 +1548,15 @@ impl Chat {
     /// of discarding it.
     ///
     /// Callers demote at whichever point the focused slot stops being the right
-    /// target, which is not always the moment a cwd is sent:
+    /// target, which is the moment a valid explicit cwd is about to be sent:
     ///
-    /// - `begin_change_directory` and `add_agent_session` demote up front,
-    ///   before any directory exists, because both are explicit requests for a
-    ///   *different* session than the retained one; the demotion is safe even if
-    ///   the picker is later cancelled, since the identity and its queued
-    ///   messages survive in `resume_backgrounds` for a retry.
-    /// - The `PickCwd` confirm path demotes only after `explicit_cwd` accepts
-    ///   the selection, so a rejected path leaves resume ownership untouched and
-    ///   the pending reconnect can still reattach.
+    /// - `add_agent_session` demotes up front: adding a session is by
+    ///   definition a request for a *different* session than the retained one,
+    ///   and no path can be rejected on the way there.
+    /// - The `PickCwd` and `/change-directory` confirm paths demote only after
+    ///   `explicit_cwd` accepts the selection, so a cancelled picker or a
+    ///   rejected path leaves resume ownership untouched and the pending
+    ///   reconnect can still reattach.
     fn demote_focused_resume_to_background(&mut self) {
         if let Some(mut retained) = self.resume_focused.take() {
             retained.was_focused = false;
@@ -1542,7 +1584,7 @@ impl Chat {
         if self.pane_kind == PaneKind::Acp && self.rpc.transport() == crate::client::Transport::Wss
         {
             // Remote ACP: start from the daemon root, not a local path.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             self.phase = ChatPhase::PickCwd {
                 agent_alias: agent_alias.to_string(),
                 explorer: FileExplorerState::new_dir_picker_remote(
@@ -1596,11 +1638,11 @@ impl Chat {
             }
             return;
         }
-        // A retained failed-reconnect identity would be consumed by the next
-        // `session/new`, resuming that session at *its* cwd and swallowing the
-        // directory the user is about to pick. Demote it to a background
-        // resume, exactly as a fresh sidebar launch does.
-        self.demote_focused_resume_to_background();
+        // A retained failed-reconnect identity is *not* given up here: the user
+        // has only asked to browse. Demotion happens at confirmation, once a
+        // valid explicit root exists to replace it, so cancelling the picker or
+        // choosing an unusable path leaves the pending reconnect able to
+        // reattach.
 
         self.stash_active();
         let explorer = if self.rpc.transport() == crate::client::Transport::Wss {
@@ -1625,35 +1667,38 @@ impl Chat {
         agent_alias: &str,
         path: &std::path::Path,
     ) {
-        let (notice, superseded) = match explicit_cwd(path) {
-            Ok(cwd) => match self.start_session(agent_alias, Some(&cwd)).await {
-                SessionStartOutcome::Started => return,
-                // Defensive only: this call passes no cancellation token or
-                // entry-retry phase, the two things `start_session_with_cancel`
-                // reports `Cancelled` for, so this path is unreachable today.
-                // It is kept so a future cancellable start cannot strand the
-                // pane in a picker whose session is already parked in
-                // `background` — the restore below puts it back.
-                SessionStartOutcome::Cancelled => (None, None),
-                SessionStartOutcome::Failed(error) => (
-                    Some(crate::i18n::t_args(
-                        "zc-chat-change-directory-error",
-                        &[("error", error.as_str())],
-                    )),
-                    Some(crate::i18n::t_args(
-                        "zc-chat-error-create-session",
-                        &[("error", error.as_str())],
-                    )),
-                ),
-            },
-            // A non-UTF-8 selection never reaches `session/new`: a lossy cwd
-            // would root the session in a directory the user never picked.
-            Err(LocalCodeCwdError::NotUtf8(_)) => (
-                Some(crate::i18n::t("zc-chat-change-directory-invalid-path")),
-                None,
-            ),
-            // A relative (or otherwise unusable) root is reported in its own
-            // terms so the user can tell it apart from an encoding problem.
+        let (notice, superseded) = match explicit_cwd(path, self.rpc.transport()) {
+            Ok(cwd) => {
+                // Only now that a valid explicit root will be sent: release the
+                // focused-resume slot so `session/new` carries this directory
+                // instead of a retained session's id (and old cwd).
+                self.demote_focused_resume_to_background();
+                match self.start_session(agent_alias, Some(&cwd)).await {
+                    SessionStartOutcome::Started => return,
+                    // Defensive only: this call passes no cancellation token or
+                    // entry-retry phase, the two things `start_session_with_cancel`
+                    // reports `Cancelled` for, so this path is unreachable today.
+                    // It is kept so a future cancellable start cannot strand the
+                    // pane in a picker whose session is already parked in
+                    // `background` — the restore below puts it back.
+                    SessionStartOutcome::Cancelled => (None, None),
+                    SessionStartOutcome::Failed(error) => (
+                        Some(crate::i18n::t_args(
+                            "zc-chat-change-directory-error",
+                            &[("error", error.as_str())],
+                        )),
+                        Some(crate::i18n::t_args(
+                            "zc-chat-error-create-session",
+                            &[("error", error.as_str())],
+                        )),
+                    ),
+                }
+            }
+            // A selection that cannot be sent faithfully never reaches
+            // `session/new`: a lossy or relative cwd would root the session in
+            // a directory the user never picked. Each rejection is reported in
+            // its own terms, naming the path, so an encoding problem is
+            // distinguishable from a non-absolute one.
             Err(error) => (Some(error.localized()), None),
         };
         self.restore_change_directory_session(notice, superseded)
@@ -1687,7 +1732,10 @@ impl Chat {
                     state.info_message.as_ref().map(|msg| msg.text.as_str()),
                     superseded.as_deref(),
                 );
-                state.set_info_notice(merged);
+                // A directory change that did not happen is a failure, not a
+                // completed action: the neutral note styling reads as "done".
+                state.info_message = Some(crate::widgets::InfoMessage::error(merged));
+                state.mark_dirty_full();
             }
             _ => match notice {
                 Some(notice) => self.phase = ChatPhase::Error(notice),
@@ -2314,7 +2362,7 @@ impl Chat {
                 return None;
             }
             // Remote ACP picker must start from a path the daemon understands.
-            let start_dir = std::path::PathBuf::from("/");
+            let start_dir = std::path::PathBuf::from(WSS_PICKER_ROOT);
             return Some(ChatPhase::PickCwd {
                 agent_alias: alias,
                 explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
@@ -3255,7 +3303,7 @@ impl Chat {
                 match action {
                     ExplorerAction::ConfirmDir(path) => {
                         let alias = agent_alias.clone();
-                        match explicit_cwd(&path) {
+                        match explicit_cwd(&path, self.rpc.transport()) {
                             Ok(cwd) => {
                                 // Only now that a valid explicit root will be
                                 // sent: release the focused-resume slot so
@@ -15429,11 +15477,22 @@ mod tests {
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
+    /// A path that is absolute for the platform these tests run on, so local
+    /// transport assertions stay meaningful on Windows as well as Unix.
+    fn native_absolute_root() -> &'static str {
+        if cfg!(windows) {
+            r"C:\tmp\project"
+        } else {
+            "/tmp/project"
+        }
+    }
+
     #[test]
     fn explicit_cwd_accepts_utf8_selection() {
+        let root = native_absolute_root();
         assert_eq!(
-            explicit_cwd(std::path::Path::new("/tmp/project")),
-            Ok("/tmp/project".to_string())
+            explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local),
+            Ok(root.to_string())
         );
     }
 
@@ -15445,7 +15504,7 @@ mod tests {
         // JSON-RPC `cwd` string, and must be rejected rather than repaired
         // into a lossy path that names a different directory.
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
-        let err = explicit_cwd(std::path::Path::new(raw))
+        let err = explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
             .expect_err("non-UTF-8 selections must be rejected");
         let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
             panic!("expected NotUtf8, got {err:?}");
@@ -15483,15 +15542,18 @@ mod tests {
         .expect("test terminal")
     }
 
-    fn active_info_notice(chat: &Chat) -> String {
+    fn active_info_message(chat: &Chat) -> crate::widgets::InfoMessage {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected an active session, got another phase");
         };
         state
             .info_message
-            .as_ref()
-            .map(|m| m.text.clone())
+            .clone()
             .expect("the restored session should carry a notice")
+    }
+
+    fn active_info_notice(chat: &Chat) -> String {
+        active_info_message(chat).text
     }
 
     #[tokio::test]
@@ -15547,9 +15609,26 @@ mod tests {
 
         assert_eq!(chat.current_session_id(), Some("sess-old"));
         assert_eq!(chat.current_cwd(), Some("/old/project"));
+        let message = active_info_message(&chat);
+        // The rejected path is named: "not valid UTF-8" with no path leaves
+        // the user guessing which selection failed.
+        let LocalCodeCwdError::NotUtf8(shown_path) =
+            explicit_cwd(std::path::Path::new(raw), crate::client::Transport::Local)
+                .expect_err("the fixture path is not UTF-8")
+        else {
+            panic!("expected NotUtf8 for a non-UTF-8 fixture path");
+        };
         assert_eq!(
-            active_info_notice(&chat),
-            crate::i18n::t("zc-chat-change-directory-invalid-path")
+            message.text,
+            crate::i18n::t_args(
+                "zc-chat-code-cwd-not-utf8",
+                &[("path", shown_path.as_str())]
+            )
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a refused directory change is a failure, not a neutral note"
         );
         assert!(
             rx.try_recv().is_err(),
@@ -15582,7 +15661,13 @@ mod tests {
         let chat = task.await.unwrap();
         assert_eq!(chat.current_session_id(), Some("sess-old"));
         assert_eq!(chat.current_cwd(), Some("/old/project"));
-        let notice = active_info_notice(&chat);
+        let message = active_info_message(&chat);
+        let notice = message.text.clone();
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Error,
+            "a failed directory change is a failure, not a neutral note"
+        );
         let template =
             crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "SENTINEL")]);
         let (prefix, suffix) = template
@@ -15685,14 +15770,13 @@ mod tests {
 
         chat.begin_change_directory();
         assert!(
-            chat.resume_focused.is_none(),
-            "the retained identity must be demoted before the picker opens"
+            chat.resume_focused.is_some(),
+            "opening the picker must not give up the retained identity: the \
+             user has not confirmed a directory yet"
         );
         assert!(
-            chat.resume_backgrounds
-                .iter()
-                .any(|entry| entry.session_id == "sess-retained" && !entry.was_focused),
-            "the retained identity must survive as a background resume"
+            chat.resume_backgrounds.is_empty(),
+            "nothing is demoted before a directory is confirmed"
         );
 
         let task = tokio::spawn(async move {
@@ -15735,6 +15819,70 @@ mod tests {
             .unwrap();
         assert_eq!(chat.current_session_id(), Some("sess-new"));
         assert_eq!(chat.current_cwd(), Some("/selected/project"));
+        assert!(
+            chat.resume_focused.is_none(),
+            "a confirmed directory releases the focused-resume slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_cancel_preserves_a_retained_resume_identity() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Cancelling the picker is not a request for a different session, so
+        // the pending reconnect must still own the focused slot and be able to
+        // reattach.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        let mut term = headless_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a cancelled picker must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "a cancelled picker must not talk to the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_directory_invalid_path_preserves_a_retained_resume_identity() {
+        // A rejected selection sends no cwd, so the retained identity is still
+        // the right target for the pending reconnect.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        chat.session_order.push("sess-retained".to_string());
+        chat.resume_focused = Some(resume_entry("sess-retained", "alpha", true));
+
+        chat.begin_change_directory();
+        chat.apply_change_directory_selection("alpha", std::path::Path::new("relative/project"))
+            .await;
+
+        assert_eq!(
+            chat.resume_focused
+                .as_ref()
+                .map(|entry| entry.session_id.as_str()),
+            Some("sess-retained"),
+            "a rejected path must leave resume ownership untouched"
+        );
+        assert!(chat.resume_backgrounds.is_empty());
+        assert_eq!(chat.current_session_id(), Some("sess-old"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected path must not reach session/new"
+        );
     }
 
     #[tokio::test]
@@ -15747,9 +15895,15 @@ mod tests {
 
         assert!(matches!(chat.phase, ChatPhase::Active(_)));
         assert!(chat.background.is_empty());
+        let message = active_info_message(&chat);
         assert_eq!(
-            active_info_notice(&chat),
+            message.text,
             crate::i18n::t("zc-chat-change-directory-chat-only")
+        );
+        assert_eq!(
+            message.kind,
+            crate::widgets::InfoKind::Note,
+            "explaining where Chat is rooted is a note, not a failure"
         );
     }
 
@@ -15866,7 +16020,10 @@ mod tests {
         // supersedes, so it was left by something else entirely — keeping any
         // of it would staple an unrelated message onto the report.
         let start_error = crate::i18n::t_args("zc-chat-error-create-session", &[("error", "boom")]);
-        let unrelated = crate::i18n::t("zc-chat-change-directory-invalid-path");
+        let unrelated = crate::i18n::t_args(
+            "zc-chat-code-cwd-not-utf8",
+            &[("path", "/tmp/proj-\u{FFFD}")],
+        );
         let notice = crate::i18n::t_args("zc-chat-change-directory-error", &[("error", "boom")]);
 
         let merged =
@@ -15882,15 +16039,20 @@ mod tests {
     #[test]
     fn explicit_cwd_rejects_a_relative_selection() {
         // A relative root would be resolved against the *daemon's* process
-        // directory, not the directory the user picked.
-        let err = explicit_cwd(std::path::Path::new("relative/project"))
-            .expect_err("relative roots must be rejected");
-        let LocalCodeCwdError::NotAbsolute(shown_path) = &err else {
-            panic!("expected NotAbsolute, got {err:?}");
-        };
-        assert_eq!(shown_path, "relative/project");
-        let shown = err.localized();
-        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        // directory, not the directory the user picked — on either transport.
+        for transport in [
+            crate::client::Transport::Local,
+            crate::client::Transport::Wss,
+        ] {
+            let err = explicit_cwd(std::path::Path::new("relative/project"), transport)
+                .expect_err("relative roots must be rejected");
+            let LocalCodeCwdError::NotAbsolute(shown_path) = &err else {
+                panic!("expected NotAbsolute, got {err:?}");
+            };
+            assert_eq!(shown_path, "relative/project");
+            let shown = err.localized();
+            assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        }
     }
 
     #[test]
@@ -15898,13 +16060,79 @@ mod tests {
         // A Unix client may browse a Windows daemon: drive-letter and UNC
         // roots are absolute there and must not be rejected by Unix rules.
         assert_eq!(
-            explicit_cwd(std::path::Path::new(r"C:\Users\dev\project")),
+            explicit_cwd(
+                std::path::Path::new(r"C:\Users\dev\project"),
+                crate::client::Transport::Wss
+            ),
             Ok(r"C:\Users\dev\project".to_string())
         );
         assert_eq!(
-            explicit_cwd(std::path::Path::new(r"\\server\share\project")),
+            explicit_cwd(
+                std::path::Path::new(r"\\server\share\project"),
+                crate::client::Transport::Wss
+            ),
             Ok(r"\\server\share\project".to_string())
         );
+    }
+
+    #[test]
+    fn explicit_cwd_accepts_posix_roots_from_a_remote_daemon() {
+        // The mirror case: a Windows client browsing a Unix daemon confirms a
+        // slash-rooted wire path. `Path::is_absolute` says "no" there, but the
+        // daemon that will run the session says "yes", and it is the authority.
+        assert_eq!(
+            explicit_cwd(
+                std::path::Path::new("/srv/project"),
+                crate::client::Transport::Wss
+            ),
+            Ok("/srv/project".to_string())
+        );
+        assert_eq!(
+            explicit_cwd(std::path::Path::new("/"), crate::client::Transport::Wss),
+            Ok("/".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_absolute_roots_do_not_depend_on_the_client_platform() {
+        // The daemon's platform decides, and this build cannot know it, so the
+        // remote rule consults no `cfg` and no `Path::is_absolute`. This test
+        // therefore asserts the same answers on every client platform.
+        for root in [
+            "/",
+            "/srv/project",
+            r"C:\project",
+            "C:/project",
+            r"\\host\share",
+            "//host/share",
+        ] {
+            assert!(
+                is_remote_absolute_session_root(root),
+                "{root} is a root on some daemon platform"
+            );
+        }
+        for root in ["", "relative/project", "C:", "C:project", r"\project"] {
+            assert!(
+                !is_remote_absolute_session_root(root),
+                "{root} is absolute on no platform"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_cwd_rejects_foreign_roots_for_a_local_unix_daemon() {
+        // Local transport runs the session on *this* machine, so a Windows
+        // form is not a root here — it is a relative directory name that would
+        // resolve against the daemon's process directory.
+        for root in [r"C:\Users\dev\project", r"\\server\share\project"] {
+            let err = explicit_cwd(std::path::Path::new(root), crate::client::Transport::Local)
+                .expect_err("a foreign root must not be accepted locally");
+            assert!(
+                matches!(&err, LocalCodeCwdError::NotAbsolute(shown) if shown == root),
+                "expected NotAbsolute({root}), got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -15934,19 +16162,47 @@ mod tests {
 
     #[test]
     fn change_directory_start_dir_stays_absolute_locally() {
+        let launch = std::path::PathBuf::from(native_absolute_root());
         assert_eq!(
             change_directory_start_dir(None, crate::client::Transport::Local, || Some(
-                std::path::PathBuf::from("/local/launch")
+                launch.clone()
             )),
-            std::path::PathBuf::from("/local/launch")
+            launch
         );
         // Never `.`: a relative root is rejected at confirmation, so the
-        // picker would open on a directory the user could not select.
+        // picker would open on a directory the user could not select. The
+        // fallback is the local platform's root, not a hardcoded POSIX `/`
+        // that names nothing on Windows.
         let fallback = change_directory_start_dir(None, crate::client::Transport::Local, || None);
         assert!(
             fallback.is_absolute(),
             "the local fallback must be absolute, got {}",
             fallback.display()
+        );
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+        );
+        // A launch directory that is not a root on *this* platform is
+        // filtered by the same transport-aware rule confirmation uses.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from("relative/launch")
+            )),
+            fallback
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn change_directory_start_dir_rejects_a_foreign_root_locally() {
+        // A Windows form is not a local root on Unix; opening the picker
+        // there would strand it on a directory confirmation rejects.
+        assert_eq!(
+            change_directory_start_dir(None, crate::client::Transport::Local, || Some(
+                std::path::PathBuf::from(r"C:\Users\dev")
+            )),
+            std::path::PathBuf::from("/")
         );
     }
 

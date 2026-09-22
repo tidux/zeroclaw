@@ -21,7 +21,7 @@ The follow-up must make root selection explicit without changing the root of a r
 
 ## Non-goals
 
-- Do not reopen or undo the fail-closed CWD-capture fix from #10565 for the interim local-Code behavior.
+- Keep the fail-closed posture of the #10565 CWD-capture fix: a selected root that cannot be represented is a reported error, never a silent fallback to another directory. The interim behavior it guarded, defaulting a fresh local Code session to the launch directory, is deliberately removed here, so this is not a promise to preserve that default, only its refusal to guess.
 - Do not rewrite the saved root of an existing session.
 - Do not introduce a second ZeroCode-side persisted root store.
 - Do not broaden filesystem permissions or change sandbox policy.
@@ -32,9 +32,9 @@ The follow-up must make root selection explicit without changing the root of a r
 
 ### Fresh sessions
 
-A fresh session with no explicit directory sends an omitted `cwd` through the existing RPC client. The daemon resolves the selected agent's configured workspace. This applies to local and remote Code and to Chat unless an explicit directory is selected.
+A fresh session with no explicit directory sends an omitted `cwd` through the existing RPC client. The daemon resolves the selected agent's configured workspace. This applies to Chat and to local Code unless an explicit directory is selected. Remote (WSS) Code is never in that position: its fresh and restart paths open the daemon-side picker first, so an explicit directory always exists by the time `session/new` is sent.
 
-An explicit directory is passed as `cwd` and wins over the agent workspace. The session response's `workspace_dir` is displayed and stored in the existing `ChatState`.
+An explicit directory is passed as `cwd` and wins over the agent workspace. The session response's `workspace_dir` is displayed and stored in the existing `ChatState`. Whether an explicit path is absolute is judged for the machine that will run the session: a remote selection is accepted in any wire form a daemon can report (POSIX, drive-letter, or UNC), while a local selection must be absolute on this machine.
 
 ### Resumed Code sessions
 
@@ -42,7 +42,7 @@ A resumed Code session sends no replacement `cwd`. The daemon rehydrates the ses
 
 ### Changing directory
 
-`/change-directory` is available in the Code pane. It opens a local directory picker rooted at the current Code session's directory when available, or the process directory as a fallback for a fresh local picker. For remote Code it uses the existing daemon-backed picker.
+`/change-directory` is available in the Code pane. It opens a local directory picker rooted at the current Code session's directory when available, or the process directory as a fallback for a fresh local picker, falling back in turn to this machine's filesystem root when the process directory is not usable as a root. For remote Code it uses the existing daemon-backed picker, which starts at the daemon's protocol root because no remote root-discovery RPC exists.
 
 Confirming a directory starts a new session with the same agent and the selected `cwd`. The existing session remains tracked at its original root and can be resumed later. Cancelling the picker returns to the existing session. If the selected path cannot be represented or session creation fails, the existing session remains active and receives a localized error notice; no silent fallback to the agent workspace is allowed.
 
@@ -75,7 +75,7 @@ The daemon's session response (`workspace_dir`) is the canonical root after crea
 Use focused co-located tests at the JSON-RPC request and session-transition boundary:
 
 - Fresh local Code and Chat sessions omit `cwd` and allow the agent workspace to win.
-- Fresh remote Code without an explicit selection omits `cwd`; the explicit remote picker still sends the chosen path.
+- Fresh and restarted remote (WSS) Code always goes through the mandatory daemon-side picker and sends the chosen path as `cwd`; there is no remote fresh-session path that omits `cwd`.
 - Fresh local Code with an explicit path sends that path.
 - Resuming a Code session sends no replacement `cwd` and adopts the daemon's saved `workspace_dir`.
 - `/change-directory` parses, opens the correct picker, starts a distinct session with the selected path, and leaves the previous session tracked.

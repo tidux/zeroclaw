@@ -4,7 +4,7 @@
 
 **Goal:** Make fresh ZeroCode sessions default to the selected agent workspace while allowing explicit Code directory selection, preserving saved Code roots on resume, and exposing `/change-directory` as a safe new-session transition.
 
-**Architecture:** Keep session-root authority in the daemon's existing `session/new` response and `workspace_dir`. ZeroCode sends `cwd: null` for fresh default and resumed sessions, sends a path only for explicit selection, and stores the returned root in existing `ChatState`. Add a dedicated `PickChangeDirectory` phase so the current Code state can be stashed in the existing background-session machinery while a new root is selected; never mutate a running session's root.
+**Architecture:** Keep session-root authority in the daemon's existing `session/new` response and `workspace_dir`. ZeroCode sends `cwd: null` for fresh default local sessions and for resumed sessions, sends a path only for explicit selection (which remote Code always has, because its fresh and restart paths open the daemon-side picker first), and stores the returned root in existing `ChatState`. Add a dedicated `PickChangeDirectory` phase so the current Code state can be stashed in the existing background-session machinery while a new root is selected; never mutate a running session's root.
 
 **Tech Stack:** Rust, Tokio, JSON-RPC client, Ratatui/Crossterm TUI, Fluent localization, mdBook documentation, co-located `#[cfg(test)]` tests.
 
@@ -148,8 +148,11 @@ Add these identifiers to all five locale files, preserving the `{ $error }` plac
 ```ftl
 zc-chat-help-change-directory = Choose a directory and start a new Code session
 zc-chat-change-directory-error = Failed to start a session in the selected directory: { $error }
-zc-chat-change-directory-invalid-path = The selected directory cannot be represented as UTF-8, so the new Code session was not created.
 ```
+
+A rejected selection reuses the existing `zc-chat-code-cwd-not-utf8` and
+`zc-chat-code-cwd-not-absolute` keys through `LocalCodeCwdError::localized()`,
+which name the rejected path; no separate change-directory path key is added.
 
 Use natural translations for values in non-English catalogues; keep identifiers and placeholder names identical.
 
@@ -261,9 +264,9 @@ ChatPhase::PickChangeDirectory { agent_alias, explorer } => {
                 Err(error) => {
                     let _ = self.restore_last_focused().await;
                     if let ChatPhase::Active(state) = &mut self.phase {
-                        state.set_info_notice(crate::i18n::t(
-                            "zc-chat-change-directory-invalid-path",
-                        ));
+                        state.info_message =
+                            Some(crate::widgets::InfoMessage::error(error.localized()));
+                        state.mark_dirty_full();
                     } else {
                         self.phase = ChatPhase::Error(error.localized());
                     }
@@ -454,13 +457,15 @@ Expected: the success transition passes with both sessions tracked.
 Replace the current local Code launch-directory paragraph with:
 
 ```markdown
-Fresh sessions use the selected agent's configured workspace by default. In the
-**Code** pane, `/change-directory` opens a directory picker and starts a new
-session in the selected directory; the existing session remains available at its
-saved root. Remote Code uses the same explicit-root contract through its
-daemon-side picker. Resumed Code sessions keep their own working directory even
-if the launch directory or agent workspace later changes. Chat can use the
-selected agent's current workspace when it is reattached.
+Fresh Chat sessions, and fresh local Code sessions, use the selected agent's
+configured workspace by default. Fresh or restarted remote (WSS) Code always
+opens the daemon-side directory picker instead, so it has no default root. In
+the **Code** pane, `/change-directory` opens a directory picker (local or
+daemon-side, matching the connection) and starts a new session in the selected
+directory; the existing session remains available at its saved root. Resumed
+Code sessions keep their own working directory even if the launch directory or
+agent workspace later changes. Chat can use the selected agent's current
+workspace when it is reattached.
 ```
 
 Keep the session-switching section consistent: it may say that switching resumes a saved Code root, but it must not say that an active session is re-rooted.

@@ -60,6 +60,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 <!-- >>> generated:review-ci-evidence-playbook by `cargo generate review-docs` - do not edit <<< -->
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI beyond the [base-drift-only review case](../contributing/pr-review-protocol.md#ci-freshness-and-base-drift), or unavailable CI.
 <!-- >>> end generated:review-ci-evidence-playbook <<< -->
+- For a named Windows execution gap, use the [advisory Windows label guidance](./ci-and-actions.md#label-gated-advisory-windows-tests-windows-testsyml) to decide whether to request `ci:windows` and how to verify its result.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.
@@ -205,6 +206,8 @@ When a maintainer submits a request-changes review and the next step is on the P
 If the underlying bug or feature is still valid, preserve it in an issue, tracker row, replacement PR, or takeover plan instead of implying that the idea was rejected. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
 
 ## Automation override
+
+`zeroclaw-reviewer[bot]` and similar review automation are advisory; human reviewers own the verdict. Check stale, noisy, false, or overbroad findings against live evidence and explain the correction instead of turning them into author work. Automation should read existing human review threads when available and must not present an existing human finding as a new bot discovery. A real unresolved finding still needs reconciliation; advisory status is not a reason to ignore it.
 
 Use this when automation output creates review side effects:
 

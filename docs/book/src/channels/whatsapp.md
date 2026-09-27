@@ -74,6 +74,35 @@ notice a business-mode deployment gets.
 
 `passive_group_context = true` is opt-in and applies only to WhatsApp Web group chats. Allowed unaddressed group messages are stored in the room-scoped conversation history without starting an agent turn, sending reactions, downloading media, or calling the model. Later addressed messages in the same group can use that passive context.
 
+## PDF previews (`document_thumbnails`)
+
+When the agent sends a PDF through a `[DOCUMENT:...]` marker, WhatsApp phones
+show a generic file card unless the message itself carries a preview. With
+`document_thumbnails = true` (Web mode, default `false`), the channel renders
+the first page and reads the page count, and both go on the same document
+card. No separate image message is sent.
+
+```toml
+[channels.whatsapp.myaccount]
+document_thumbnails = true   # default: false
+```
+
+The preview is attached the way the official apps attach it: a small JPEG
+(96 px on the longest side) inside the message, and a larger one (480 px)
+uploaded next to the document and encrypted with the document's key. Phones
+draw the card from the uploaded one; the inline one is what they fall back to.
+If that upload fails, the card keeps the small inline preview.
+
+Rendering uses `pdftoppm` and `pdfinfo` from poppler-utils, found on the
+daemon's `PATH` (for example `sudo apt install poppler-utils`). It runs while
+the file uploads, and each step (a tool run, or the preview upload) is capped
+at 5 seconds. If the tools are missing or fail, or a rendered preview is too
+large, the document goes out without that part of the preview, exactly as it
+does with the key off, and a warning is logged. Only PDFs are previewed.
+
+The rasteriser parses whatever PDF the agent sends, including files it
+downloaded, so keep poppler-utils up to date on hosts where this is on.
+
 ## Restricting which groups (`allowed_groups`)
 
 `allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list is **not** permission: what it means is decided by `group_policy`. Under `allowlist` (the default) or `ignore` an empty list admits no group, and under `all` it admits every group. A list that admits everything cannot be told apart from a list nobody configured, so open group access has to be asked for by name. A non-empty list drops every group message whose chat JID matches no entry, and keeps doing so under every policy including `all`, so `all` widens the empty-list default rather than overriding an explicit list. **Direct messages always bypass this filter.**
@@ -87,6 +116,14 @@ session_path = "/var/lib/zeroclaw/wa.db"
 # Only operate in these two groups; all other groups are dropped.
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
+
+## Polls
+
+The `poll` tool posts a native WhatsApp poll in Web mode instead of the numbered text fallback used on channels without native polls. The tool accepts 2–10 options; the WhatsApp library accepts up to 12, but the tool schema does not expose 11–12. `multi_select` lets a voter select multiple options.
+
+Raw phone-number recipients are checked against the channel's number allowlist, and a disallowed number returns an error instead of silently doing nothing. As with ordinary sends, JID recipients bypass that number check. `duration_minutes` does not expire a native poll.
+
+Votes are not read back yet: the poll card shows the result to people in the chat, and the agent only learns that the poll was posted.
 
 ## Tool approval over chat (`approval_timeout_secs`)
 

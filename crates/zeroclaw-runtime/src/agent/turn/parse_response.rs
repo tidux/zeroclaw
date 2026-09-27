@@ -413,17 +413,27 @@ pub(crate) async fn record_accepted_chat_response(
     // invariant that `cached_input_tokens` is a subset of the total: a
     // cached-only response (total absent, cached 80_000) would otherwise
     // publish a total of ~5 alongside a cached subset of 80_000.
+    //
+    // When the provider proved a cached subset without a total, that subset is
+    // a known minimum for the prompt. Floor the display estimate at it so the
+    // meter cannot read near-zero against a prompt already known to be large
+    // (a 5-token history estimate beside 80_000 cached tokens would otherwise
+    // render 0% on a 200_000-token window despite a known 40% floor). The
+    // result stays labelled as an estimate and the measured total stays
+    // unknown.
     if let Some(tx) = ctx.event_tx {
+        let cached_input_tokens = usage.and_then(|u| u.cached_input_tokens);
         let estimated_input_tokens = if input_tokens.is_none() {
-            let n = crate::agent::history::estimate_history_tokens(history) as u64;
-            (n > 0).then_some(n)
+            let history_estimate = crate::agent::history::estimate_history_tokens(history) as u64;
+            let floored = history_estimate.max(cached_input_tokens.unwrap_or(0));
+            (floored > 0).then_some(floored)
         } else {
             None
         };
         let _ = tx
             .send(TurnEvent::Usage {
                 input_tokens,
-                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                cached_input_tokens,
                 output_tokens,
                 cost_usd,
                 context_token_budget: Some(ctx.context_limits.context_token_budget as u64),
@@ -1137,17 +1147,23 @@ mod cost_usd_regression_tests {
 
     /// `cached_input_tokens` is documented as a subset of `input_tokens`.
     /// When a provider reports the cached subset but omits the total, the
-    /// total must stay unknown: substituting a small history estimate would
-    /// publish a total smaller than its own proven subset.
+    /// measured total must stay unknown — and the *display* estimate must be
+    /// floored at the proven cached subset, so the meter cannot read
+    /// near-zero for a prompt already known to be large.
     #[tokio::test]
-    async fn cached_only_usage_keeps_measured_total_unknown() {
+    async fn cached_only_usage_floors_the_display_estimate_at_the_cached_minimum() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-cached-only");
 
-        // Deliberately tiny history: its estimate is far below the cached
+        // Deliberately tiny history: its raw estimate is far below the cached
         // subset the provider proved.
         let history = vec![ChatMessage::user("hi")];
+        let raw_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+        assert!(
+            raw_estimate < 80_000,
+            "fixture must exercise the impossible-total case"
+        );
         let usage = TokenUsage {
             input_tokens: None,
             output_tokens: Some(7),
@@ -1182,13 +1198,61 @@ mod cost_usd_regression_tests {
                     "cached-only usage must leave the measured total unknown"
                 );
                 assert_eq!(cached_input_tokens, Some(80_000));
-                if let Some(estimate) = estimated_input_tokens {
-                    assert!(
-                        estimate < 80_000,
-                        "fixture should exercise the impossible-total case"
-                    );
-                }
+                assert_eq!(
+                    estimated_input_tokens,
+                    Some(80_000),
+                    "display estimate must be floored at the proven cached minimum, \
+                     not the {raw_estimate}-token history estimate"
+                );
             }
+            other => panic!("expected TurnEvent::Usage, got {other:?}"),
+        }
+    }
+
+    /// A history larger than the cached subset must win: the floor raises a
+    /// too-small estimate, it never caps a legitimate one.
+    #[tokio::test]
+    async fn cached_floor_does_not_cap_a_larger_history_estimate() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(4);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let ctx = estimate_test_ctx(&tx, &pacing, "llamacpp", "local-model", "turn-cached-small");
+
+        let history = vec![ChatMessage::user(
+            "A considerably longer prompt so the history estimate clears the cached subset.",
+        )];
+        let raw_estimate = crate::agent::history::estimate_history_tokens(&history) as u64;
+        let usage = TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(7),
+            cached_input_tokens: Some(3),
+            cache_creation_input_tokens: None,
+        };
+        assert!(raw_estimate > 3, "fixture must exceed the cached subset");
+
+        record_accepted_chat_response(
+            &ctx,
+            "llamacpp",
+            "local-model",
+            "ok",
+            &[],
+            0,
+            Some(&usage),
+            &history,
+            std::time::Instant::now(),
+            0,
+            None,
+        )
+        .await;
+
+        match rx.try_recv().expect("accepted response must emit Usage") {
+            TurnEvent::Usage {
+                estimated_input_tokens,
+                ..
+            } => assert_eq!(
+                estimated_input_tokens,
+                Some(raw_estimate),
+                "a larger history estimate must not be capped by a small cached floor"
+            ),
             other => panic!("expected TurnEvent::Usage, got {other:?}"),
         }
     }

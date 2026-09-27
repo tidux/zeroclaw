@@ -206,11 +206,17 @@ pub enum TurnEvent {
         /// - A consumer rendering a context meter may use it as a display
         ///   numerator, and must label it as an estimate
         ///   (`TokenCountSource::Estimated`) rather than provider-reported.
-        /// - It is a lower bound: the history heuristic does not price
-        ///   separately supplied native tool schemas, so a tool-heavy request
-        ///   estimates low. That is acceptable for a labelled display value
+        /// - It is an approximation in both directions, not a bound. The
+        ///   history heuristic does not price separately supplied native tool
+        ///   schemas, so a tool-heavy request reads low; its byte-count and
+        ///   fixed-per-image costs can also read high against a provider's
+        ///   real tokenizer. That is acceptable for a labelled display value
         ///   and is not acceptable for accounting — another reason it is kept
         ///   off `input_tokens`.
+        /// - When the provider reported `cached_input_tokens` without a total,
+        ///   that subset is a known minimum for the prompt and the estimate is
+        ///   floored at it, so the meter cannot read near-zero for a prompt
+        ///   already known to be large.
         ///
         /// `None` means either the provider reported a real count (use
         /// `input_tokens`) or no estimate could be formed.

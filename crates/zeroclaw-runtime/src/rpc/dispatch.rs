@@ -20217,13 +20217,45 @@ mod tests {
     }
 
     /// Boundary: cached-only provider usage keeps the measured total unknown,
-    /// so the meter must not publish a total below the proven cached subset.
-    /// With no estimate available the numerator stays absent entirely.
+    /// and the display numerator it forwards must not fall below the proven
+    /// cached subset. This exercises the real cached-plus-estimate pairing the
+    /// producer emits, not an estimate-free event.
     #[test]
-    fn cached_only_usage_does_not_publish_a_total_below_its_cached_subset() {
+    fn cached_only_usage_forwards_a_numerator_at_or_above_its_cached_subset() {
         let event = TurnEvent::Usage {
             input_tokens: None,
             cached_input_tokens: Some(80_000),
+            output_tokens: Some(7),
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "anthropic.default".to_string(),
+            model: "model-c".to_string(),
+            accepted: true,
+            // What `record_accepted_chat_response` actually produces for this
+            // response: the history estimate floored at the cached subset.
+            estimated_input_tokens: Some(80_000),
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["input_tokens"], 80_000,
+            "display numerator must respect the known cached minimum"
+        );
+        assert_eq!(
+            v["params"]["input_tokens_source"], "estimate",
+            "a floored value is still an estimate, not a measured total"
+        );
+    }
+
+    /// Boundary: with no measured total and no estimate at all, the numerator
+    /// stays absent rather than being back-filled.
+    #[test]
+    fn unknown_total_without_an_estimate_stays_absent() {
+        let event = TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
             output_tokens: Some(7),
             cost_usd: None,
             context_token_budget: Some(180_000),
@@ -20235,7 +20267,6 @@ mod tests {
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
         assert!(
             v["params"].get("input_tokens").is_none(),
             "an unknown measured total must stay absent, not be back-filled"

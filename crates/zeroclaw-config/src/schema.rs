@@ -3926,8 +3926,8 @@ impl ResolvedRuntime {
         // An unconfigured capacity is only the compatibility stub, not model
         // truth. An explicit absolute budget above it is the operator telling
         // us the window is at least that large, so it becomes the window
-        // operand instead of being clamped down to the stub (#10068). The
-        // source is left untouched so wire/UI consumers still report the
+        // operand instead of being clamped down to the stub. The source is
+        // left untouched so wire/UI consumers still report the
         // capacity as unconfigured.
         let model_context_window = match (self.model_context_window_source, self.max_context_tokens)
         {
@@ -28366,7 +28366,7 @@ mod tests {
         // An unconfigured capacity is a compatibility stub, not model truth.
         // An explicit absolute budget above the stub is honored, and the
         // window operand is raised to it so capacity stays a hard invariant
-        // while its provenance still reports "not configured" (#10068).
+        // while its provenance still reports "not configured".
         let r = ResolvedRuntime {
             max_context_tokens: Some(1_000_000),
             ..ResolvedRuntime::default()
@@ -28468,7 +28468,7 @@ mod tests {
         assert_eq!(limits.model_context_window, 1_000_000);
     }
 
-    /// Mirrors the #10068 report: a provider profile that declares `model`
+    /// Mirrors the reported operator setup: a provider profile that declares `model`
     /// and `max_tokens` but no `context_window`, bound to a runtime profile
     /// with a large explicit `max_context_tokens`. The profile budget must
     /// win over the 32,000 compatibility stub.

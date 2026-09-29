@@ -23053,7 +23053,7 @@ mod tests {
 
         // (runtime_profile.max_context_tokens, provider.context_window, expected)
         let cases: &[(Option<usize>, Option<usize>, u64)] = &[
-            (Some(128_000), None, 128_000), // unknown capacity never caps an explicit budget (#10068)
+            (Some(128_000), None, 128_000), // unknown capacity never caps an explicit budget
             (Some(128_000), Some(200_000), 128_000),
             (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
             (None, None, 32_000),          // hard stub

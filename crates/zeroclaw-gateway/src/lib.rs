@@ -1771,6 +1771,40 @@ pub async fn run_gateway_with_plugin_webhooks(
             Ok(url) => {
                 println!("🌐 Tunnel active: {url}");
                 tunnel_url = Some(url);
+                // The WSS RPC plane and enrollment endpoint terminate their
+                // own TLS; publish them as raw TCP passthrough where the
+                // provider supports it. Resolved from this run's config, the
+                // same source the daemon starts those listeners from.
+                let services = zeroclaw_runtime::tunnel::daemon_tcp_services(&config);
+                match tun.publish_tcp_services(&services).await {
+                    Ok(published) => {
+                        for p in &published {
+                            println!(
+                                "{}",
+                                i18n::get_required_cli_string_with_args(
+                                    "cli-tunnel-tcp-service-published",
+                                    &[("service", p.service.name), ("endpoint", &p.endpoint)],
+                                )
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "tunnel_provider": tun.name(),
+                                "error": format!("{e}"),
+                            })),
+                            "Gateway: tunnel could not publish WSS/enrollment listeners; \
+                             they remain reachable only at their configured bind"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 println!("⚠️  Tunnel failed to start: {e}");

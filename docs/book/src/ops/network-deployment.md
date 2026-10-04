@@ -44,6 +44,24 @@ The tunnel forwards from a public URL to the gateway on `127.0.0.1`. No router c
 
 `tunnel_provider = "none"` (the default) keeps the gateway local with no tunnel. See the [Config reference](../reference/config.md#tunnel) for each provider's `[tunnel.<provider>]` fields.
 
+#### Tailscale: WSS and enrollment
+
+With `tunnel_provider = "tailscale"`, the gateway is published with `tailscale serve` (or `tailscale funnel` when `[tunnel.tailscale].funnel = true`). When `[wss]` is enabled, the daemon also publishes the WSS RPC listener on the tailnet, along with the enrollment endpoint when `[enroll]` is enabled. Each one keeps its own port:
+
+```bash
+tailscale serve --tcp <wss.port>    tcp://127.0.0.1:<wss.port>
+tailscale serve --tcp <enroll.port> tcp://127.0.0.1:<enroll.port>
+```
+
+These are **raw TCP passthrough** forwards. TLS still terminates inside the daemon, so the WSS plane stays mutually authenticated, and the enrollment short-auth-string still binds the daemon's own CA. Tailscale's HTTPS proxy is not used for them, because it would strip the client certificate. A wildcard bind (`0.0.0.0` / `::`) is forwarded to loopback; a specific bind address is forwarded to that address.
+
+Things to know:
+
+- **Tailnet-only, even with funnel.** Funnel only listens on ports 443, 8443, and 10000, and putting the mTLS plane on the public internet should be your explicit choice. It is not turned on as a side effect of funneling the gateway. To reach WSS from outside the tailnet, use `[relay]`.
+- **Certificate names.** Clients that dial the MagicDNS name (`wss://<node>.<tailnet>.ts.net:9781`) need that name in the auto-generated server certificate. Add it to `[wss].sans`.
+- **Enrollment lockout is shared.** Forwarded connections reach the enrollment endpoint from loopback. That means every tailnet enrollee shares one pairing-attempt lockout, and repeated bad codes from one tailnet peer temporarily block enrollment for the others. The lockout fails closed. It never weakens the pairing-code gate.
+- The forwards are foreground `tailscale serve` sessions owned by the gateway, so they are withdrawn when the gateway stops.
+
 ### Option 3: Reverse proxy
 
 Run nginx / Caddy / Traefik in front of the gateway. Terminate TLS there, proxy to `localhost:42617`. Suitable for:

@@ -4740,8 +4740,16 @@ fn resolve_wss_client_auth(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
-    if wss_cfg.sans.is_empty() {
+/// Server-certificate SANs shared by the WSS listener and the enrollment
+/// endpoint: `localhost`/`127.0.0.1`, the operator's `[wss].sans`, then
+/// `tailnet_sans` (resolved by `zeroclaw_runtime::tunnel::tailscale_server_sans`).
+/// Empty when there is nothing beyond the defaults, which keeps the
+/// default-SAN leaf reuse path in `ensure_server_materials_protected`.
+fn wss_server_sans(
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet_sans: &[String],
+) -> Vec<String> {
+    if wss_cfg.sans.is_empty() && tailnet_sans.is_empty() {
         return Vec::new();
     }
 
@@ -4750,6 +4758,7 @@ fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> 
         wss_cfg
             .sans
             .iter()
+            .chain(tailnet_sans)
             .filter(|value| !value.trim().is_empty())
             .cloned(),
     );
@@ -4795,14 +4804,52 @@ mod wss_client_auth_tests {
         };
 
         assert_eq!(
-            wss_server_sans(&cfg),
+            wss_server_sans(&cfg, &[]),
             vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn wss_server_sans_appends_tailnet_names_after_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["zero".into()],
+            ..Default::default()
+        };
+        let tailnet = vec![
+            "node.tail1234.ts.net".to_string(),
+            "100.101.102.103".to_string(),
+        ];
+
+        assert_eq!(
+            wss_server_sans(&cfg, &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "zero".to_string(),
+                "node.tail1234.ts.net".to_string(),
+                "100.101.102.103".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wss_server_sans_tailnet_names_alone_still_keep_loopback() {
+        // No [wss].sans: tailnet names must not drop localhost/127.0.0.1,
+        // which local clients and the relay bridge dial.
+        let tailnet = vec!["node.tail1234.ts.net".to_string()];
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "node.tail1234.ts.net".to_string(),
+            ]
+        );
     }
 }
 
@@ -7573,9 +7620,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
 
                 registry.register_wss(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
-                        let (wss_cfg, data_dir) = {
+                        let (wss_cfg, enroll_cfg, tunnel_cfg, data_dir) = {
                             let cfg = ctx.config.read();
-                            (cfg.wss.clone(), cfg.data_dir.clone())
+                            (
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.tunnel.clone(),
+                                cfg.data_dir.clone(),
+                            )
                         };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
@@ -7612,7 +7664,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 // uses to reach the daemon to the server cert. The
                                 // enrollment endpoint uses the same resolver so both
                                 // TLS surfaces present matching daemon identities.
-                                let server_sans = wss_server_sans(&wss_cfg);
+                                // When reached over the tailnet, the node's
+                                // MagicDNS name and tailnet IPs are added too.
+                                let tailnet_sans = zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                    &tunnel_cfg,
+                                    &wss_cfg,
+                                    &enroll_cfg,
+                                )
+                                .await;
+                                let server_sans = wss_server_sans(&wss_cfg, &tailnet_sans);
                                 let mats = zeroclaw_tls::ensure_server_materials_protected(
                                     &data_dir.join("tls"),
                                     &server_sans,
@@ -7816,6 +7876,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             enroll_cfg,
                             wss_cfg,
                             relay_cfg,
+                            tunnel_cfg,
                             data_dir,
                             startup_pairing_code_policy,
                         ) = {
@@ -7824,6 +7885,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
+                                cfg.tunnel.clone(),
                                 cfg.data_dir.clone(),
                                 cfg.gateway.pairing_code,
                             )
@@ -7876,7 +7938,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let ca_provided =
                             tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
                         let protection = ca_key_protection_from_env();
-                        let server_sans = wss_server_sans(&wss_cfg);
+                        let tailnet_sans = zeroclaw_runtime::tunnel::tailscale_server_sans(
+                            &tunnel_cfg,
+                            &wss_cfg,
+                            &enroll_cfg,
+                        )
+                        .await;
+                        let server_sans = wss_server_sans(&wss_cfg, &tailnet_sans);
                         let mats = zeroclaw_tls::ensure_server_materials_protected(
                             &tls_dir,
                             &server_sans,

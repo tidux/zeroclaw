@@ -13,7 +13,9 @@ pub use ngrok::NgrokTunnel;
 pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
 pub use pinggy::PinggyTunnel;
-pub use tailscale::TailscaleTunnel;
+pub use tailscale::{
+    TailscaleSelf, TailscaleTunnel, is_tailscale_ip, query_tailscale_self, tailscale_server_sans,
+};
 
 use anyhow::{Result, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

@@ -8166,6 +8166,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,

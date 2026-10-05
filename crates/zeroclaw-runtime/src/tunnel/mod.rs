@@ -683,8 +683,8 @@ mod tests {
 
     #[test]
     fn daemon_tcp_services_skips_enroll_under_external_client_ca() {
-        // Regression (#11530 review): with a bring-your-own client CA the
-        // daemon parks enrollment, so it must not be published or announced.
+        // With a bring-your-own client CA the daemon parks enrollment, so it
+        // must not be published or announced.
         let mut config = Config::default();
         config.wss.enabled = true;
         config.enroll.enabled = true;

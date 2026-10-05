@@ -4970,10 +4970,9 @@ mod wss_client_auth_tests {
 
     #[tokio::test]
     async fn listeners_share_one_tailnet_resolution_when_queries_would_differ() {
-        // Regression (#11530 review): WSS and enrollment used to query
-        // tailscaled separately. Here the second listener's query would fail
-        // where the first succeeded. Both must still load the same leaf, and
-        // it must carry the tailnet names.
+        // WSS and enrollment share one tailnet resolution. Here the second
+        // listener's query would fail where the first succeeded: both must
+        // still load the same leaf, and it must carry the tailnet names.
         let dir = tempfile::tempdir().unwrap();
         let tls_dir = dir.path().join("tls");
         let wss_cfg = wss_with_sans(&[]);
@@ -5051,9 +5050,8 @@ mod wss_client_auth_tests {
 
     #[tokio::test]
     async fn tailnet_outage_keeps_names_the_existing_leaf_carries() {
-        // Regression (#11530 review): with configured SANs, a failed query
-        // used to regenerate the leaf without the previously discovered
-        // tailnet names.
+        // With configured SANs, a failed query must not regenerate the leaf
+        // without the previously discovered tailnet names.
         let dir = tempfile::tempdir().unwrap();
         let tls_dir = dir.path().join("tls");
         let wss_cfg = wss_with_sans(&["zero"]);

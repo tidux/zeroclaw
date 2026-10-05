@@ -685,8 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwarder_exit_after_publication_is_detected() {
-        // Regression (#11530 review): a forwarder that died after the
-        // startup check went unnoticed.
+        // A forwarder that exits after the startup check must be observed.
         let forwarder =
             TcpForwarder::spawn(forwarder_service(), spawn_stand_in("echo gone >&2; exit 3"));
         wait_until(async || !forwarder.is_running()).await;

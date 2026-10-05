@@ -14,7 +14,8 @@ pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
 pub use pinggy::PinggyTunnel;
 pub use tailscale::{
-    TailscaleSelf, TailscaleTunnel, is_tailscale_ip, query_tailscale_self, tailscale_server_sans,
+    TailnetSans, TailscaleSelf, TailscaleTunnel, is_tailscale_ip, query_tailscale_self,
+    tailscale_server_sans,
 };
 
 use anyhow::{Result, bail};
@@ -50,8 +51,9 @@ pub struct PublishedTcpService {
 
 /// Resolve the daemon's enabled self-TLS listeners from live config.
 ///
-/// Enrollment is only listed alongside WSS because the daemon refuses to
-/// start it without `[wss]`. A bind address that does not parse as an IP is
+/// Enrollment is only listed when the daemon actually runs it: alongside WSS
+/// (it refuses to start without `[wss]`) and not under a bring-your-own
+/// client CA, where it holds no signing key and parks the endpoint. A bind address that does not parse as an IP is
 /// skipped: the listener itself refuses such a bind, so there is nothing to
 /// forward to.
 pub fn daemon_tcp_services(config: &Config) -> Vec<TcpService> {
@@ -67,6 +69,7 @@ pub fn daemon_tcp_services(config: &Config) -> Vec<TcpService> {
         });
     }
     if config.enroll.enabled
+        && config.wss.external_client_ca().is_none()
         && let Some(target) = local_forward_target(&config.enroll.bind, config.enroll.port)
     {
         services.push(TcpService {
@@ -676,6 +679,37 @@ mod tests {
         let mut config = Config::default();
         config.enroll.enabled = true;
         assert!(daemon_tcp_services(&config).is_empty());
+    }
+
+    #[test]
+    fn daemon_tcp_services_skips_enroll_under_external_client_ca() {
+        // Regression (#11530 review): with a bring-your-own client CA the
+        // daemon parks enrollment, so it must not be published or announced.
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.enroll.enabled = true;
+        // `EnrollConfig::default()` has an empty bind (serde supplies the real
+        // default); set it so enrollment is only excluded by the CA rule.
+        config.enroll.bind = "127.0.0.1".into();
+        config.enroll.port = 9782;
+        assert_eq!(
+            daemon_tcp_services(&config).len(),
+            2,
+            "precondition: enrollment is publishable without an external CA"
+        );
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            enabled: true,
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        });
+        let services = daemon_tcp_services(&config);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "wss");
+
+        // A CA path with client auth disabled is not an external CA (the WSS
+        // starter rejects that combination); enrollment stays listed.
+        config.wss.client_auth.as_mut().unwrap().enabled = false;
+        assert_eq!(daemon_tcp_services(&config).len(), 2);
     }
 
     #[test]

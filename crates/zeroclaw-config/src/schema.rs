@@ -8230,6 +8230,25 @@ impl Default for WssConfig {
     }
 }
 
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
+    }
+}
+
 /// Nominated-relay client (`[relay]`).
 ///
 /// When enabled, the daemon keeps a persistent outbound connection to a relay

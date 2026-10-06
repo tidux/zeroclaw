@@ -12,10 +12,153 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use zeroclaw_config::schema::{EnrollConfig, TunnelConfig, WssConfig};
 
-/// How long a freshly spawned `tailscale serve --tcp` gets to reject its
-/// configuration (port already served, not an operator, ...) before it is
-/// treated as running. Foreground serve exits promptly on such errors.
-const TCP_SERVE_SETTLE: Duration = Duration::from_millis(750);
+/// Bounds for bringing one `tailscale serve --tcp` forwarder up.
+#[derive(Debug, Clone, Copy)]
+struct ForwarderStartup {
+    /// How long a running forwarder has to appear in the serve config.
+    apply_timeout: Duration,
+    /// Poll interval while waiting for it to appear.
+    poll: Duration,
+    /// Spawn attempts when tailscaled rejects a concurrent serve-config write.
+    conflict_attempts: u32,
+    /// Backoff before conflict retry `n` is `n * conflict_backoff`.
+    conflict_backoff: Duration,
+}
+
+const FORWARDER_STARTUP: ForwarderStartup = ForwarderStartup {
+    apply_timeout: Duration::from_secs(5),
+    poll: Duration::from_millis(100),
+    conflict_attempts: 4,
+    conflict_backoff: Duration::from_millis(250),
+};
+
+/// Upper bound on one `tailscale serve status --json` probe.
+const SERVE_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why a forwarder was not published.
+#[derive(Debug)]
+enum ForwarderStartError {
+    /// The process exited before its forward appeared.
+    Exited {
+        status: String,
+        stderr: String,
+        attempts: u32,
+    },
+    /// It kept running but never appeared in the serve config (for example
+    /// blocked on an interactive prompt); it was killed.
+    NotApplied { waited: Duration },
+    /// It could not be spawned or polled.
+    Io(std::io::Error),
+}
+
+impl ForwarderStartError {
+    fn attrs(&self) -> serde_json::Value {
+        match self {
+            Self::Exited {
+                status,
+                stderr,
+                attempts,
+            } => serde_json::json!({"status": status, "stderr": stderr, "attempts": attempts}),
+            Self::NotApplied { waited } => {
+                serde_json::json!({"error": "not applied to the serve config", "waited_ms": waited.as_millis()})
+            }
+            Self::Io(e) => serde_json::json!({"error": e.to_string()}),
+        }
+    }
+}
+
+/// `tailscale serve` applies its config with an etag precondition, so
+/// concurrent writers (the gateway's own serve, other forwarders) can lose
+/// the race and exit with this error. Retrying is safe; other failures are not
+/// retried.
+fn is_serve_config_conflict(stderr: &str) -> bool {
+    stderr.contains("etag mismatch")
+        || stderr.contains("Another client is changing the serve config")
+}
+
+/// Whether `tailscale serve status --json` output forwards TCP `port`, in a
+/// foreground session (how the tunnel publishes) or the background config.
+fn serve_config_has_tcp_port(json: &[u8], port: u16) -> bool {
+    let config: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
+    let key = port.to_string();
+    let has_port = |c: &serde_json::Value| c["TCP"].get(&key).is_some();
+    has_port(&config)
+        || config["Foreground"]
+            .as_object()
+            .is_some_and(|sessions| sessions.values().any(has_port))
+}
+
+/// Ask tailscaled whether TCP `port` is currently served.
+async fn tcp_port_is_served(port: u16) -> bool {
+    let output = tokio::time::timeout(
+        SERVE_STATUS_TIMEOUT,
+        Command::new("tailscale")
+            .args(["serve", "status", "--json"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    matches!(output, Ok(Ok(ref out)) if out.status.success() && serve_config_has_tcp_port(&out.stdout, port))
+}
+
+/// Bring one forwarder up and return it only once its forward is actually in
+/// the serve config. A process that is merely still running is not proof:
+/// `tailscale serve` can block before applying anything. Concurrent-write
+/// conflicts are retried with backoff; anything else fails at once.
+async fn start_forwarder<S, A, AF>(
+    startup: ForwarderStartup,
+    mut spawn: S,
+    mut applied: A,
+) -> std::result::Result<Child, ForwarderStartError>
+where
+    S: FnMut() -> std::io::Result<Child>,
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = bool>,
+{
+    let mut attempt = 1;
+    loop {
+        let mut child = spawn().map_err(ForwarderStartError::Io)?;
+        let deadline = tokio::time::Instant::now() + startup.apply_timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => {
+                    child.kill().await.ok();
+                    return Err(ForwarderStartError::Io(e));
+                }
+            }
+            if applied().await {
+                return Ok(child);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                child.kill().await.ok();
+                child.wait().await.ok();
+                return Err(ForwarderStartError::NotApplied {
+                    waited: startup.apply_timeout,
+                });
+            }
+            tokio::time::sleep(startup.poll).await;
+        };
+        let mut stderr = String::new();
+        if let Some(pipe) = child.stderr.take() {
+            pipe.take(FORWARDER_STDERR_CAP)
+                .read_to_string(&mut stderr)
+                .await
+                .ok();
+        }
+        if is_serve_config_conflict(&stderr) && attempt < startup.conflict_attempts {
+            tokio::time::sleep(startup.conflict_backoff * attempt).await;
+            attempt += 1;
+            continue;
+        }
+        return Err(ForwarderStartError::Exited {
+            status: status.to_string(),
+            stderr: stderr.trim().to_string(),
+            attempts: attempt,
+        });
+    }
+}
 
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
 /// `tailscale funnel` (public internet).
@@ -387,60 +530,45 @@ impl Tunnel for TailscaleTunnel {
         }
         let hostname = self.resolve_hostname().await?;
 
-        let mut spawned = Vec::with_capacity(services.len());
+        // One at a time: `tailscale serve` writers race on the serve-config
+        // etag, so concurrent spawns make all but one fail.
+        let mut published = Vec::with_capacity(services.len());
         for service in services {
-            let child = Command::new("tailscale")
-                .args(tcp_serve_args(service))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()?;
-            spawned.push((service, child));
-        }
-
-        tokio::time::sleep(TCP_SERVE_SETTLE).await;
-
-        let mut published = Vec::with_capacity(spawned.len());
-        let mut forwarders = self.tcp_forwarders.lock().await;
-        for (service, mut child) in spawned {
-            match child.try_wait() {
-                Ok(None) => {
+            let started = start_forwarder(
+                FORWARDER_STARTUP,
+                || {
+                    Command::new("tailscale")
+                        .args(tcp_serve_args(service))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                },
+                || tcp_port_is_served(service.target.port()),
+            )
+            .await;
+            match started {
+                Ok(child) => {
                     published.push(PublishedTcpService {
                         service: *service,
                         endpoint: tcp_endpoint(&hostname, service),
                     });
-                    forwarders.push(TcpForwarder::spawn(*service, child));
-                }
-                Ok(Some(status)) => {
-                    let stderr = match child.wait_with_output().await {
-                        Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                        Err(e) => e.to_string(),
-                    };
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "service": service.name,
-                                "target": service.target.to_string(),
-                                "status": status.to_string(),
-                                "stderr": stderr,
-                            })),
-                        "tailscale serve --tcp exited; service not published on the tailnet"
-                    );
+                    self.tcp_forwarders
+                        .lock()
+                        .await
+                        .push(TcpForwarder::spawn(*service, child));
                 }
                 Err(e) => {
+                    let mut attrs = e.attrs();
+                    attrs["service"] = service.name.into();
+                    attrs["target"] = service.target.to_string().into();
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "service": service.name,
-                                "error": e.to_string(),
-                            })),
-                        "tailscale serve --tcp status unknown; withdrawing it"
+                            .with_attrs(attrs),
+                        "tailscale serve --tcp did not publish the service on the tailnet"
                     );
-                    child.kill().await.ok();
                 }
             }
         }
@@ -839,6 +967,135 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), forwarder.shutdown())
             .await
             .expect("shutdown should kill the forwarder, not wait out its sleep");
+    }
+
+    /// stderr of a forwarder that lost the serve-config race (Tailscale 1.102.4).
+    const CONFLICT_STDERR: &str = "Another client is changing the serve config; please try again.\nsending serve config: Preconditions failed: etag mismatch";
+
+    fn quick_startup() -> ForwarderStartup {
+        ForwarderStartup {
+            apply_timeout: Duration::from_millis(300),
+            poll: Duration::from_millis(10),
+            conflict_attempts: 3,
+            conflict_backoff: Duration::from_millis(1),
+        }
+    }
+
+    fn exit_with_stderr(stderr: &str) -> Child {
+        spawn_stand_in(&format!("printf '%s' '{stderr}' >&2; exit 1"))
+    }
+
+    #[test]
+    fn serve_config_conflict_is_recognised() {
+        assert!(is_serve_config_conflict(CONFLICT_STDERR));
+        assert!(!is_serve_config_conflict(
+            "Access denied: serve config denied"
+        ));
+        assert!(!is_serve_config_conflict(""));
+    }
+
+    #[test]
+    fn serve_config_has_tcp_port_reads_foreground_and_background() {
+        // Foreground sessions, shape from a live 1.102.4 node.
+        let fg = br#"{"Foreground":{"a7e5":{"TCP":{"19782":{"TCPForward":"127.0.0.1:19782"}}},"ecea":{"TCP":{"443":{"HTTPS":true}}}}}"#;
+        assert!(serve_config_has_tcp_port(fg, 19782));
+        assert!(serve_config_has_tcp_port(fg, 443));
+        assert!(!serve_config_has_tcp_port(fg, 19781));
+        let bg = br#"{"TCP":{"19781":{"TCPForward":"127.0.0.1:19781"}}}"#;
+        assert!(serve_config_has_tcp_port(bg, 19781));
+        assert!(!serve_config_has_tcp_port(b"{}", 19781));
+        assert!(!serve_config_has_tcp_port(b"not json", 19781));
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_retries_a_serve_config_conflict() {
+        // The first attempt loses the etag race; the retry is applied.
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let child = start_forwarder(
+            quick_startup(),
+            || {
+                Ok(
+                    match spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => exit_with_stderr(CONFLICT_STDERR),
+                        _ => spawn_stand_in("sleep 30"),
+                    },
+                )
+            },
+            || async { spawns.load(std::sync::atomic::Ordering::SeqCst) >= 2 },
+        )
+        .await
+        .expect("retry should publish");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        TcpForwarder::spawn(forwarder_service(), child)
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_does_not_retry_other_failures() {
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(exit_with_stderr("Access denied: serve config denied"))
+            },
+            || async { false },
+        )
+        .await
+        .expect_err("a non-conflict exit fails");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            matches!(err, ForwarderStartError::Exited { attempts: 1, ref stderr, .. } if stderr.contains("Access denied")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_gives_up_after_bounded_conflicts() {
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(exit_with_stderr(CONFLICT_STDERR))
+            },
+            || async { false },
+        )
+        .await
+        .expect_err("persistent conflicts fail");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            matches!(err, ForwarderStartError::Exited { attempts: 3, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_kills_a_process_that_never_applies() {
+        // Alive is not published: a forward that never shows up in the serve
+        // config is reported and its process is not left behind.
+        let pid = std::sync::atomic::AtomicU32::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || {
+                let child = spawn_stand_in("sleep 30");
+                pid.store(child.id().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+                Ok(child)
+            },
+            || async { false },
+        )
+        .await
+        .expect_err("never applied");
+        assert!(
+            matches!(err, ForwarderStartError::NotApplied { .. }),
+            "{err:?}"
+        );
+        let pid = pid.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} left running"
+        );
     }
 
     #[test]

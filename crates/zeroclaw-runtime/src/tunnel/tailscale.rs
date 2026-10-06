@@ -138,6 +138,19 @@ pub struct TailscaleSelf {
     pub dns_name: Option<String>,
     /// The node's tailnet addresses.
     pub ips: Vec<IpAddr>,
+    /// `Self.InNetworkMap`: whether tailscaled has received this node's
+    /// network map. `None` when the field is absent (older releases).
+    pub in_network_map: Option<bool>,
+}
+
+impl TailscaleSelf {
+    /// Whether this is a usable tailnet identity. `tailscale status --json`
+    /// succeeds before tailscaled has its network map, reporting
+    /// `InNetworkMap: false` with an empty `DNSName` and no `TailscaleIPs`;
+    /// that is "not known yet", not "this node has no tailnet names".
+    pub fn has_identity(&self) -> bool {
+        self.in_network_map != Some(false) && (self.dns_name.is_some() || !self.ips.is_empty())
+    }
 }
 
 /// Ask the local tailscaled who this node is.
@@ -162,8 +175,9 @@ pub async fn query_tailscale_self() -> Result<TailscaleSelf> {
 }
 
 /// Extract the node identity from `tailscale status --json`. Missing or
-/// malformed fields yield an empty identity rather than an error.
-fn parse_tailscale_self(json: &[u8]) -> TailscaleSelf {
+/// malformed fields yield an empty identity rather than an error; callers
+/// that need a real identity check [`TailscaleSelf::has_identity`].
+pub fn parse_tailscale_self(json: &[u8]) -> TailscaleSelf {
     let status: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
     let node = &status["Self"];
     let dns_name = node["DNSName"]
@@ -178,7 +192,12 @@ fn parse_tailscale_self(json: &[u8]) -> TailscaleSelf {
                 .collect()
         })
         .unwrap_or_default();
-    TailscaleSelf { dns_name, ips }
+    let in_network_map = node["InNetworkMap"].as_bool();
+    TailscaleSelf {
+        dns_name,
+        ips,
+        in_network_map,
+    }
 }
 
 /// Whether `ip` is in Tailscale's address space: the CGNAT range
@@ -264,20 +283,38 @@ pub async fn tailscale_server_sans(
         return TailnetSans::NotApplicable;
     }
     let hostname_override = tunnel.tailscale.as_ref().and_then(|ts| ts.hostname.clone());
-    match query_tailscale_self().await {
-        Ok(node) => TailnetSans::Resolved(tailnet_names(hostname_override.as_deref(), &node)),
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "could not read this node's tailnet identity; the WSS server certificate \
-                 keeps the names it already carries until the next successful start"
-            );
-            TailnetSans::Unavailable { hostname_override }
+    tailnet_sans_from_status(query_tailscale_self().await, hostname_override)
+}
+
+/// Classify a `tailscale status` outcome. Only a usable identity
+/// ([`TailscaleSelf::has_identity`]) is `Resolved`. A failed or timed-out
+/// query, malformed output, and a successful status reported before
+/// tailscaled has its network map are all `Unavailable`, so the existing
+/// certificate keeps its names instead of being regenerated without them.
+pub fn tailnet_sans_from_status(
+    status: Result<TailscaleSelf>,
+    hostname_override: Option<String>,
+) -> TailnetSans {
+    let reason = match status {
+        Ok(node) if node.has_identity() => {
+            return TailnetSans::Resolved(tailnet_names(hostname_override.as_deref(), &node));
         }
-    }
+        Ok(node) => format!(
+            "tailscaled reported no node identity yet (InNetworkMap: {})",
+            node.in_network_map
+                .map_or_else(|| "absent".to_string(), |v| v.to_string())
+        ),
+        Err(e) => e.to_string(),
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"error": reason})),
+        "could not read this node's tailnet identity; the WSS server certificate \
+         keeps the names it already carries until the next successful start"
+    );
+    TailnetSans::Unavailable { hostname_override }
 }
 
 /// Arguments for a raw TCP passthrough of `service` on the same tailnet port.
@@ -528,6 +565,83 @@ mod tests {
                 "fd7a:115c:a1e0::1234".parse::<IpAddr>().unwrap(),
             ]
         );
+    }
+
+    /// `tailscale status --json` before tailscaled has its network map
+    /// (shape from ipnlocal's status builder: OS hostname only, empty
+    /// DNSName, null TailscaleIPs, InNetworkMap false). Exit status is 0.
+    const NOT_READY_STATUS_JSON: &str = r#"{
+        "BackendState": "Starting",
+        "Self": {
+            "HostName": "zcnode",
+            "DNSName": "",
+            "TailscaleIPs": null,
+            "InNetworkMap": false,
+            "Online": false
+        }
+    }"#;
+
+    fn unavailable(hostname_override: Option<&str>) -> TailnetSans {
+        TailnetSans::Unavailable {
+            hostname_override: hostname_override.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn status_before_network_map_is_unavailable_not_empty() {
+        let node = parse_tailscale_self(NOT_READY_STATUS_JSON.as_bytes());
+        assert!(!node.has_identity());
+        assert_eq!(tailnet_sans_from_status(Ok(node), None), unavailable(None));
+        // The override is known without tailscaled and must survive.
+        let node = parse_tailscale_self(NOT_READY_STATUS_JSON.as_bytes());
+        assert_eq!(
+            tailnet_sans_from_status(Ok(node), Some("zero.tail1234.ts.net".into())),
+            unavailable(Some("zero.tail1234.ts.net"))
+        );
+    }
+
+    #[test]
+    fn malformed_status_is_unavailable() {
+        for raw in [&b"not json"[..], b"{}", br#"{"Self":null}"#] {
+            let node = parse_tailscale_self(raw);
+            assert_eq!(tailnet_sans_from_status(Ok(node), None), unavailable(None));
+        }
+    }
+
+    #[test]
+    fn failed_status_query_is_unavailable() {
+        let err = anyhow::Error::msg("tailscale status timed out");
+        assert_eq!(
+            tailnet_sans_from_status(Err(err), Some("zero".into())),
+            unavailable(Some("zero"))
+        );
+    }
+
+    #[test]
+    fn stale_identity_outside_the_network_map_is_unavailable() {
+        // Names without the map are not trusted as current.
+        let node = parse_tailscale_self(
+            br#"{"Self":{"DNSName":"old.tail1234.ts.net.","TailscaleIPs":["100.101.102.103"],"InNetworkMap":false}}"#,
+        );
+        assert_eq!(tailnet_sans_from_status(Ok(node), None), unavailable(None));
+    }
+
+    #[test]
+    fn ready_status_resolves_and_older_releases_without_the_flag_still_resolve() {
+        let node = parse_tailscale_self(STATUS_JSON.as_bytes());
+        assert!(matches!(
+            tailnet_sans_from_status(Ok(node), None),
+            TailnetSans::Resolved(names) if names.contains(&"zcnode.tail1234.ts.net".to_string())
+        ));
+        // STATUS_JSON has no InNetworkMap field: an identity alone suffices.
+        assert_eq!(
+            parse_tailscale_self(STATUS_JSON.as_bytes()).in_network_map,
+            None
+        );
+        let ready = parse_tailscale_self(
+            br#"{"Self":{"DNSName":"zcnode.tail1234.ts.net.","TailscaleIPs":[],"InNetworkMap":true}}"#,
+        );
+        assert!(ready.has_identity());
     }
 
     #[test]

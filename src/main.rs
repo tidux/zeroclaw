@@ -5091,6 +5091,107 @@ mod wss_client_auth_tests {
         }
     }
 
+    /// `tailscale status --json` as tailscaled reports it before receiving
+    /// its network map: exit status 0, OS hostname only, empty DNSName, null
+    /// TailscaleIPs, InNetworkMap false.
+    const NOT_READY_STATUS_JSON: &[u8] = br#"{
+        "BackendState": "Starting",
+        "Self": {
+            "HostName": "zcnode",
+            "DNSName": "",
+            "TailscaleIPs": null,
+            "InNetworkMap": false
+        }
+    }"#;
+
+    /// Discovery as production classifies a successful-but-not-ready status.
+    fn not_ready_status(hostname_override: Option<&str>) -> TailnetSans {
+        zeroclaw_runtime::tunnel::tailnet_sans_from_status(
+            Ok(zeroclaw_runtime::tunnel::parse_tailscale_self(
+                NOT_READY_STATUS_JSON,
+            )),
+            hostname_override.map(Into::into),
+        )
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_keeps_names_the_existing_leaf_carries() {
+        // A successful status with an empty identity is "not known yet"; with
+        // configured SANs it must not regenerate the leaf without its tailnet
+        // names, for either listener sharing this generation.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled ready.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled answers before its network map.
+        let shared = DaemonServerTls::default();
+        let wss =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+        let enroll =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "a not-ready status must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_with_override_keeps_discovered_names() {
+        // With a hostname override the not-ready path must keep the
+        // previously discovered names alongside it, not just the override.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            not_ready_status(Some("zero.tail1234.ts.net")),
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(
+            sans.contains(&"zero.tail1234.ts.net".to_string()),
+            "{sans:?}"
+        );
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
     #[tokio::test]
     async fn tailnet_outage_applies_configured_additions_without_stripping() {
         let dir = tempfile::tempdir().unwrap();

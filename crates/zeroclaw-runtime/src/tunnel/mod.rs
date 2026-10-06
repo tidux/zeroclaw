@@ -14,8 +14,8 @@ pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
 pub use pinggy::PinggyTunnel;
 pub use tailscale::{
-    TailnetSans, TailscaleSelf, TailscaleTunnel, is_tailscale_ip, query_tailscale_self,
-    tailscale_server_sans,
+    TailnetSans, TailscaleSelf, TailscaleTunnel, is_tailscale_ip, parse_tailscale_self,
+    query_tailscale_self, tailnet_sans_from_status, tailscale_server_sans,
 };
 
 use anyhow::{Result, bail};

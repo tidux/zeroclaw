@@ -24995,12 +24995,12 @@ mod tests {
             tool_call_id: "tc2".to_string(),
             raw_output: "tail output\n".to_string(),
         });
-        assert_eq!(s.dirty, LinesDirty::TailChanged(1));
+        assert_eq!(s.transcript_layout.view().dirty, LinesDirty::TailChanged(1));
         s.rebuild_lines(width);
-        let incremental = s.cached_lines.clone();
-        s.dirty = LinesDirty::Full;
+        let incremental = s.transcript_layout.view().cached_lines.clone();
+        s.transcript_layout.invalidate_full();
         s.rebuild_lines(width);
-        assert_eq!(incremental, s.cached_lines);
+        assert_eq!(incremental, s.transcript_layout.view().cached_lines);
 
         // Non-tail result (parallel tool calls) still renders correctly.
         s.apply_update(SessionUpdate::ToolResult {
@@ -25009,10 +25009,10 @@ mod tests {
             raw_output: "earlier output\n".to_string(),
         });
         s.rebuild_lines(width);
-        let fallback = s.cached_lines.clone();
-        s.dirty = LinesDirty::Full;
+        let fallback = s.transcript_layout.view().cached_lines.clone();
+        s.transcript_layout.invalidate_full();
         s.rebuild_lines(width);
-        assert_eq!(fallback, s.cached_lines);
+        assert_eq!(fallback, s.transcript_layout.view().cached_lines);
     }
 
     #[test]

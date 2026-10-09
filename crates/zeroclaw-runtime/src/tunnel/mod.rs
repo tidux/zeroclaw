@@ -105,7 +105,8 @@ pub trait Tunnel: Send + Sync {
     /// Returns the public URL on success.
     async fn start(&self, local_host: &str, local_port: u16) -> Result<String>;
 
-    /// Stop the tunnel process gracefully.
+    /// Stop the tunnel, ending the processes it started and withdrawing what it
+    /// published. The gateway calls this when it shuts down.
     async fn stop(&self) -> Result<()>;
 
     /// Check if the tunnel is still alive.

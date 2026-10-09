@@ -616,20 +616,16 @@ impl Tunnel for TailscaleTunnel {
         Ok(published)
     }
 
+    /// Withdraw what this tunnel published by ending the processes it started:
+    /// the gateway's `serve`/`funnel` and each TCP forwarder. All of them run
+    /// in the foreground, so tailscaled drops their config when they exit.
+    /// The node's serve config is never reset: the operator's own `--bg`
+    /// entries and other processes' sessions live in it too.
     async fn stop(&self) -> Result<()> {
         let forwarders: Vec<TcpForwarder> = self.tcp_forwarders.lock().await.drain(..).collect();
         for forwarder in forwarders {
             forwarder.shutdown().await;
         }
-
-        // Also reset the tailscale serve/funnel
-        let subcommand = if self.funnel { "funnel" } else { "serve" };
-        Command::new("tailscale")
-            .args([subcommand, "reset"])
-            .output()
-            .await
-            .ok();
-
         kill_shared(&self.proc).await
     }
 
@@ -693,6 +689,43 @@ mod tests {
         let tunnel = TailscaleTunnel::new(false, None);
         let result = tunnel.stop().await;
         assert!(result.is_ok());
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[tokio::test]
+    async fn stop_ends_and_reaps_only_the_processes_this_tunnel_started() {
+        // Foreground serve config lives as long as its process, so ending the
+        // gateway serve and each forwarder withdraws exactly what this tunnel
+        // published. Reaped, not just signalled: stop returns only once the
+        // processes are gone.
+        let tunnel = TailscaleTunnel::new(false, Some("node.tailnet.ts.net".into()));
+        let gateway = spawn_stand_in("sleep 30");
+        let forwarder = spawn_stand_in("sleep 30");
+        let pids = [gateway.id().unwrap(), forwarder.id().unwrap()];
+        *tunnel.proc.lock().await = Some(TunnelProcess {
+            child: gateway,
+            public_url: "https://node.tailnet.ts.net".into(),
+        });
+        tunnel
+            .tcp_forwarders
+            .lock()
+            .await
+            .push(TcpForwarder::spawn(forwarder_service(), forwarder));
+
+        tokio::time::timeout(Duration::from_secs(5), tunnel.stop())
+            .await
+            .expect("stop should kill its processes, not wait out their sleep")
+            .unwrap();
+
+        for pid in pids {
+            assert!(!process_exists(pid), "pid {pid} left behind by stop");
+        }
+        assert!(tunnel.proc.lock().await.is_none());
+        assert!(tunnel.tcp_forwarders.lock().await.is_empty());
+        assert!(!tunnel.health_check().await);
     }
 
     const STATUS_JSON: &str = r#"{

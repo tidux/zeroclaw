@@ -2630,6 +2630,31 @@ pub async fn run_gateway_with_plugin_webhooks(
         .await?;
     }
 
+    // Withdraw the tunnel before slower teardown below: the daemon allows a
+    // short grace window before aborting the gateway. An early error return
+    // above still drops the tunnel, which kills its processes without waiting.
+    if let Some(tun) = tunnel {
+        if let Err(e) = tun.stop().await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "tunnel_provider": tun.name(),
+                        "error": format!("{e}"),
+                    })),
+                "Gateway: tunnel did not stop cleanly"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"tunnel_provider": tun.name()})),
+                "Gateway: tunnel stopped"
+            );
+        }
+    }
+
     if let Some(task) = mdns_task {
         let mut task = task;
         tokio::select! {

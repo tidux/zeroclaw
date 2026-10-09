@@ -122,7 +122,7 @@ impl TuiRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn new_unsigned() -> Self {
         Self {
             signing_key: None,

@@ -3,7 +3,8 @@ use super::{
     new_shared_process,
 };
 use anyhow::{Context, Result, bail};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -76,20 +77,39 @@ fn is_serve_config_conflict(stderr: &str) -> bool {
         || stderr.contains("Another client is changing the serve config")
 }
 
-/// Whether `tailscale serve status --json` output forwards TCP `port`, in a
-/// foreground session (how the tunnel publishes) or the background config.
-fn serve_config_has_tcp_port(json: &[u8], port: u16) -> bool {
-    let config: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
-    let key = port.to_string();
-    let has_port = |c: &serde_json::Value| c["TCP"].get(&key).is_some();
-    has_port(&config)
-        || config["Foreground"]
+/// Foreground serve sessions in `tailscale serve status --json` output that
+/// raw-forward `target`'s port to `target`, or `None` if the output is
+/// unreadable.
+///
+/// Only an exact match counts: another handler on the port (HTTPS, a forward
+/// elsewhere, TLS terminated by tailscaled) is not the requested forward. The
+/// background config is ignored because the tunnel publishes in the
+/// foreground, so a background entry is never one of its forwarders.
+fn serve_sessions_forwarding(json: &[u8], target: SocketAddr) -> Option<BTreeSet<String>> {
+    let config: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let port = target.port().to_string();
+    // Tailscale stores a `tcp://` target as its URL host: `SocketAddr`'s
+    // display form, with brackets for IPv6.
+    let target = target.to_string();
+    let forwards = |session: &serde_json::Value| {
+        let handler = &session["TCP"][&port];
+        handler["TCPForward"].as_str() == Some(target.as_str())
+            && handler["TerminateTLS"].as_str().is_none_or(str::is_empty)
+    };
+    Some(
+        config["Foreground"]
             .as_object()
-            .is_some_and(|sessions| sessions.values().any(has_port))
+            .into_iter()
+            .flatten()
+            .filter(|(_, session)| forwards(session))
+            .map(|(id, _)| id.clone())
+            .collect(),
+    )
 }
 
-/// Ask tailscaled whether TCP `port` is currently served.
-async fn tcp_port_is_served(port: u16) -> bool {
+/// Ask tailscaled which foreground sessions raw-forward to `target`; `None`
+/// if it could not be asked.
+async fn serve_sessions_for(target: SocketAddr) -> Option<BTreeSet<String>> {
     let output = tokio::time::timeout(
         SERVE_STATUS_TIMEOUT,
         Command::new("tailscale")
@@ -98,25 +118,35 @@ async fn tcp_port_is_served(port: u16) -> bool {
             .output(),
     )
     .await;
-    matches!(output, Ok(Ok(ref out)) if out.status.success() && serve_config_has_tcp_port(&out.stdout, port))
+    match output {
+        Ok(Ok(out)) if out.status.success() => serve_sessions_forwarding(&out.stdout, target),
+        _ => None,
+    }
 }
 
-/// Bring one forwarder up and return it only once its forward is actually in
-/// the serve config. A process that is merely still running is not proof:
-/// `tailscale serve` can block before applying anything. Concurrent-write
-/// conflicts are retried with backoff; anything else fails at once.
-async fn start_forwarder<S, A, AF>(
+/// Bring one forwarder up and return it only once its own forward is in the
+/// serve config. A process that is merely still running is not proof:
+/// `tailscale serve` can block before applying anything. Nor is a matching
+/// forward that was already there: a forward from another session makes this
+/// one fail, so only a session that appears after the spawn counts, and the
+/// process must still be running once it has been seen.
+/// Concurrent-write conflicts are retried with backoff; anything else fails at
+/// once.
+async fn start_forwarder<S, P, PF>(
     startup: ForwarderStartup,
     mut spawn: S,
-    mut applied: A,
+    mut probe: P,
 ) -> std::result::Result<Child, ForwarderStartError>
 where
     S: FnMut() -> std::io::Result<Child>,
-    A: FnMut() -> AF,
-    AF: std::future::Future<Output = bool>,
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Option<BTreeSet<String>>>,
 {
     let mut attempt = 1;
     loop {
+        // If this probe fails, every matching session will look new; the
+        // post-probe process check still applies.
+        let existing = probe().await.unwrap_or_default();
         let mut child = spawn().map_err(ForwarderStartError::Io)?;
         let deadline = tokio::time::Instant::now() + startup.apply_timeout;
         let status = loop {
@@ -128,8 +158,19 @@ where
                     return Err(ForwarderStartError::Io(e));
                 }
             }
-            if applied().await {
-                return Ok(child);
+            let applied = probe()
+                .await
+                .is_some_and(|sessions| !sessions.is_subset(&existing));
+            if applied {
+                // The forward can vanish with its process while the probe ran.
+                match child.try_wait() {
+                    Ok(None) => return Ok(child),
+                    Ok(Some(status)) => break status,
+                    Err(e) => {
+                        child.kill().await.ok();
+                        return Err(ForwarderStartError::Io(e));
+                    }
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 child.kill().await.ok();
@@ -544,7 +585,7 @@ impl Tunnel for TailscaleTunnel {
                         .kill_on_drop(true)
                         .spawn()
                 },
-                || tcp_port_is_served(service.target.port()),
+                || serve_sessions_for(service.target),
             )
             .await;
             match started {
@@ -985,6 +1026,12 @@ mod tests {
         spawn_stand_in(&format!("printf '%s' '{stderr}' >&2; exit 1"))
     }
 
+    fn exit_with_stderr_after(delay_secs: &str, stderr: &str) -> Child {
+        spawn_stand_in(&format!(
+            "sleep {delay_secs}; printf '%s' '{stderr}' >&2; exit 1"
+        ))
+    }
+
     #[test]
     fn serve_config_conflict_is_recognised() {
         assert!(is_serve_config_conflict(CONFLICT_STDERR));
@@ -994,17 +1041,143 @@ mod tests {
         assert!(!is_serve_config_conflict(""));
     }
 
+    fn sessions(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
     #[test]
-    fn serve_config_has_tcp_port_reads_foreground_and_background() {
+    fn serve_sessions_match_only_a_raw_forward_to_the_requested_target() {
         // Foreground sessions, shape from a live 1.102.4 node.
         let fg = br#"{"Foreground":{"a7e5":{"TCP":{"19782":{"TCPForward":"127.0.0.1:19782"}}},"ecea":{"TCP":{"443":{"HTTPS":true}}}}}"#;
-        assert!(serve_config_has_tcp_port(fg, 19782));
-        assert!(serve_config_has_tcp_port(fg, 443));
-        assert!(!serve_config_has_tcp_port(fg, 19781));
+        assert_eq!(
+            serve_sessions_forwarding(fg, addr("127.0.0.1:19782")),
+            Some(sessions(&["a7e5"]))
+        );
+        // Something else on the port is not the requested forward: an HTTPS
+        // handler, a forward to another target, or TLS terminated by tailscaled.
+        assert_eq!(
+            serve_sessions_forwarding(fg, addr("127.0.0.1:443")),
+            Some(sessions(&[]))
+        );
+        let elsewhere =
+            br#"{"Foreground":{"b1":{"TCP":{"19781":{"TCPForward":"127.0.0.1:8080"}}}}}"#;
+        assert_eq!(
+            serve_sessions_forwarding(elsewhere, addr("127.0.0.1:19781")),
+            Some(sessions(&[]))
+        );
+        let terminated = br#"{"Foreground":{"c1":{"TCP":{"19781":{"TCPForward":"127.0.0.1:19781","TerminateTLS":"node.tailnet.ts.net"}}}}}"#;
+        assert_eq!(
+            serve_sessions_forwarding(terminated, addr("127.0.0.1:19781")),
+            Some(sessions(&[]))
+        );
+        // The background config is never this process's foreground session.
         let bg = br#"{"TCP":{"19781":{"TCPForward":"127.0.0.1:19781"}}}"#;
-        assert!(serve_config_has_tcp_port(bg, 19781));
-        assert!(!serve_config_has_tcp_port(b"{}", 19781));
-        assert!(!serve_config_has_tcp_port(b"not json", 19781));
+        assert_eq!(
+            serve_sessions_forwarding(bg, addr("127.0.0.1:19781")),
+            Some(sessions(&[]))
+        );
+        // `tcp://[::1]:p` is stored as the URL host, brackets included.
+        let v6 = br#"{"Foreground":{"d1":{"TCP":{"9782":{"TCPForward":"[::1]:9782"}}}}}"#;
+        assert_eq!(
+            serve_sessions_forwarding(v6, addr("[::1]:9782")),
+            Some(sessions(&["d1"]))
+        );
+        assert_eq!(
+            serve_sessions_forwarding(b"{}", addr("127.0.0.1:19781")),
+            Some(sessions(&[]))
+        );
+        assert_eq!(
+            serve_sessions_forwarding(b"not json", addr("127.0.0.1:19781")),
+            None
+        );
+    }
+
+    /// A probe that reports `before` until `spawns` reaches `applied_at`, then
+    /// `after`.
+    fn probe_after<'a>(
+        spawns: &'a std::sync::atomic::AtomicUsize,
+        applied_at: usize,
+        before: &'a [&'a str],
+        after: &'a [&'a str],
+    ) -> impl FnMut() -> std::future::Ready<Option<BTreeSet<String>>> + 'a {
+        move || {
+            let n = spawns.load(std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Some(sessions(if n >= applied_at { after } else { before })))
+        }
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_does_not_take_an_existing_forward_as_its_own() {
+        // Another session already forwards the port to the same target, so the
+        // new forwarder is rejected. Its exit must be reported, not hidden
+        // behind the forward that was there before it started.
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(spawn_stand_in(
+                    "sleep 0.1; echo 'port 9781 already in use' >&2; exit 1",
+                ))
+            },
+            probe_after(&spawns, 0, &["other"], &["other"]),
+        )
+        .await
+        .expect_err("a pre-existing forward is not this forwarder's publication");
+        assert!(
+            matches!(err, ForwarderStartError::Exited { ref stderr, .. } if stderr.contains("already in use")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_accepts_its_new_session_beside_an_existing_one() {
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let child = start_forwarder(
+            quick_startup(),
+            || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(spawn_stand_in("sleep 30"))
+            },
+            probe_after(&spawns, 1, &["other"], &["other", "mine"]),
+        )
+        .await
+        .expect("the new session is this forwarder's");
+        TcpForwarder::spawn(forwarder_service(), child)
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_rechecks_the_process_after_the_probe() {
+        // The process is alive when polled, then exits while the status probe
+        // is in flight. A forward seen by that probe is not proof the process
+        // still holds it.
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || Ok(exit_with_stderr_after("0.05", "rejected")),
+            || {
+                let first = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        return Some(sessions(&[]));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some(sessions(&["mine"]))
+                }
+            },
+        )
+        .await
+        .expect_err("a process that exited during the probe is not published");
+        assert!(
+            matches!(err, ForwarderStartError::Exited { ref stderr, .. } if stderr.contains("rejected")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1021,7 +1194,7 @@ mod tests {
                     },
                 )
             },
-            || async { spawns.load(std::sync::atomic::Ordering::SeqCst) >= 2 },
+            probe_after(&spawns, 2, &[], &["retry"]),
         )
         .await
         .expect("retry should publish");
@@ -1040,7 +1213,7 @@ mod tests {
                 spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(exit_with_stderr("Access denied: serve config denied"))
             },
-            || async { false },
+            || async { Some(sessions(&[])) },
         )
         .await
         .expect_err("a non-conflict exit fails");
@@ -1060,7 +1233,7 @@ mod tests {
                 spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(exit_with_stderr(CONFLICT_STDERR))
             },
-            || async { false },
+            || async { Some(sessions(&[])) },
         )
         .await
         .expect_err("persistent conflicts fail");
@@ -1083,7 +1256,7 @@ mod tests {
                 pid.store(child.id().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
                 Ok(child)
             },
-            || async { false },
+            || async { Some(sessions(&[])) },
         )
         .await
         .expect_err("never applied");

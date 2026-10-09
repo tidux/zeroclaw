@@ -1,14 +1,87 @@
-use super::{SharedProcess, Tunnel, TunnelProcess, kill_shared, new_shared_process};
+use super::Tunnel;
 use anyhow::{Result, bail};
-use tokio::process::Command;
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
+
+/// How long `start` waits to see whether the CLI exited instead of staying
+/// in the foreground. Instant failures (permission, etag, overwrite) show
+/// up in this window; a process that is still running afterward is assumed
+/// to be serving.
+const IMMEDIATE_EXIT_WINDOW: Duration = Duration::from_millis(150);
+
+/// Cap on serve stderr kept for an unexpected-exit or start-failure report.
+const SERVE_STDERR_CAP: u64 = 8 * 1024;
 
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
 /// `tailscale funnel` (public internet).
 /// Requires Tailscale installed and authenticated (`tailscale up`).
+///
+/// Foreground `tailscale serve` *is* the serve: when the CLI exits,
+/// tailscaled withdraws the config. `--bg` would leave the publish up
+/// after this process dies, so the tunnel is supervised as a child
+/// instead of fire-and-forget.
 pub struct TailscaleTunnel {
     funnel: bool,
     hostname: Option<String>,
-    proc: SharedProcess,
+    /// Binary invoked for `serve`/`funnel`/`status`/`reset`. Overridable in
+    /// tests so process-lifecycle coverage does not need a real tailscaled.
+    program: PathBuf,
+    serve: Mutex<Option<ServeProcess>>,
+}
+
+/// A published foreground serve, owned by its watcher task.
+struct ServeProcess {
+    public_url: String,
+    /// Sending, or dropping it, ends the serve (see `watch_serve`).
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ServeProcess {
+    fn spawn(public_url: String, child: Child) -> Self {
+        let (stop, stop_rx) = oneshot::channel();
+        let task = zeroclaw_spawn::spawn!(watch_serve(child, stop_rx));
+        Self {
+            public_url,
+            stop: Some(stop),
+            task: Some(task),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    async fn shutdown(mut self) {
+        self.request_stop();
+        if let Some(task) = self.task.take() {
+            task.await.ok();
+        }
+    }
+
+    fn request_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.send(()).ok();
+        }
+    }
+}
+
+impl Drop for ServeProcess {
+    fn drop(&mut self) {
+        self.request_stop();
+        if let Some(task) = self.task.take() {
+            if task.is_finished() {
+                return;
+            }
+            // JoinHandle::drop aborts. Detach so the watcher can kill+wait
+            // even when the gateway drops the tunnel without an explicit stop().
+            std::mem::forget(task);
+        }
+    }
 }
 
 impl TailscaleTunnel {
@@ -16,7 +89,97 @@ impl TailscaleTunnel {
         Self {
             funnel,
             hostname,
-            proc: new_shared_process(),
+            program: PathBuf::from("tailscale"),
+            serve: Mutex::new(None),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_program(mut self, program: PathBuf) -> Self {
+        self.program = program;
+        self
+    }
+}
+
+/// Own one foreground serve until it exits or is told to stop. An unexpected
+/// exit silently takes the gateway off the tailnet, so that is reported; a
+/// stop request (or dropping the tunnel, which drops the sender) kills it
+/// and waits so the child cannot stay `<defunct>`.
+async fn watch_serve(mut child: Child, stop: oneshot::Receiver<()>) {
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    if let Some(stdout) = stdout {
+        zeroclaw_spawn::spawn!(drain_pipe(stdout));
+    }
+    tokio::select! {
+        status = child.wait() => {
+            let mut captured = String::new();
+            if let Some(stderr) = stderr {
+                stderr
+                    .take(SERVE_STDERR_CAP)
+                    .read_to_string(&mut captured)
+                    .await
+                    .ok();
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "status": match status {
+                            Ok(status) => status.to_string(),
+                            Err(e) => e.to_string(),
+                        },
+                        "stderr": captured.trim(),
+                    })),
+                "tailscale serve exited after publication; the gateway is no longer \
+                 reachable on the tailnet until the tunnel restarts"
+            );
+        }
+        _ = stop => {
+            child.kill().await.ok();
+            child.wait().await.ok();
+        }
+    }
+}
+
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Fail if the CLI has already left the foreground. A pid that is merely
+/// still assigned is not proof it is serving: an exited child stays
+/// `<defunct>` until waited.
+async fn confirm_foreground_serve(child: &mut Child, window: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(pipe) = child.stderr.take() {
+                    pipe.take(SERVE_STDERR_CAP)
+                        .read_to_string(&mut stderr)
+                        .await
+                        .ok();
+                }
+                bail!(
+                    "tailscale serve exited before publishing ({status}): {}",
+                    stderr.trim()
+                );
+            }
+            Ok(None) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => bail!("tailscale serve status check failed: {e}"),
         }
     }
 }
@@ -35,7 +198,7 @@ impl Tunnel for TailscaleTunnel {
             h.clone()
         } else {
             // Query tailscale for the current hostname
-            let output = Command::new("tailscale")
+            let output = Command::new(&self.program)
                 .args(["status", "--json"])
                 .output()
                 .await?;
@@ -57,52 +220,73 @@ impl Tunnel for TailscaleTunnel {
         };
 
         // tailscale serve|funnel <port>
-        let child = Command::new("tailscale")
+        let mut child = Command::new(&self.program)
             .args([subcommand, &local_port.to_string()])
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
+        if let Err(e) = confirm_foreground_serve(&mut child, IMMEDIATE_EXIT_WINDOW).await {
+            child.kill().await.ok();
+            child.wait().await.ok();
+            return Err(e);
+        }
+
         let public_url = format!("https://{hostname}:{local_port}");
 
-        let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess {
-            child,
-            public_url: public_url.clone(),
-        });
+        let mut guard = self.serve.lock().await;
+        *guard = Some(ServeProcess::spawn(public_url.clone(), child));
 
         Ok(public_url)
     }
 
     async fn stop(&self) -> Result<()> {
-        // Also reset the tailscale serve/funnel
-        let subcommand = if self.funnel { "funnel" } else { "serve" };
-        Command::new("tailscale")
-            .args([subcommand, "reset"])
-            .output()
-            .await
-            .ok();
-
-        kill_shared(&self.proc).await
+        let serve = self.serve.lock().await.take();
+        if let Some(serve) = serve {
+            // Stop the child first so the watcher treats this as a requested
+            // shutdown rather than an unexpected exit. Reset then clears any
+            // leftover serve config; a failed start never reaches here, so
+            // we cannot wipe an unrelated host config.
+            serve.shutdown().await;
+            let subcommand = if self.funnel { "funnel" } else { "serve" };
+            Command::new(&self.program)
+                .args([subcommand, "reset"])
+                .output()
+                .await
+                .ok();
+        }
+        Ok(())
     }
 
+    /// Healthy while the watcher still owns a live foreground serve.
+    /// `Child::id` stays `Some` on a zombie, so health is the watcher task,
+    /// which ends only after `wait`.
     async fn health_check(&self) -> bool {
-        let guard = self.proc.lock().await;
-        guard.as_ref().is_some_and(|tp| tp.child.id().is_some())
+        self.serve
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(ServeProcess::is_running)
     }
 
     fn public_url(&self) -> Option<String> {
-        self.proc
-            .try_lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
+        self.serve.try_lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|s| s.is_running())
+                .map(|s| s.public_url.clone())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn constructor_stores_hostname_and_mode() {
@@ -128,5 +312,178 @@ mod tests {
         let tunnel = TailscaleTunnel::new(false, None);
         let result = tunnel.stop().await;
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_fails_when_the_cli_exits_immediately() {
+        let fake = FakeBin::script(
+            r#"
+if [ "$2" = reset ]; then exit 0; fi
+echo "Access denied: serve config denied" >&2
+exit 1
+"#,
+        );
+        let tunnel = TailscaleTunnel::new(false, Some("node.example.ts.net".into()))
+            .with_program(fake.path.clone());
+
+        let err = tunnel
+            .start("127.0.0.1", 42617)
+            .await
+            .expect_err("an immediately-exiting serve must fail start");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Access denied: serve config denied"),
+            "start error should surface serve stderr, got: {msg}"
+        );
+        assert!(!tunnel.health_check().await);
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn health_check_fails_after_the_serve_process_exits() {
+        let fake = FakeBin::script(
+            r#"
+if [ "$2" = reset ]; then exit 0; fi
+sleep 0.4
+echo "lost etag" >&2
+exit 1
+"#,
+        );
+        let tunnel = TailscaleTunnel::new(false, Some("node.example.ts.net".into()))
+            .with_program(fake.path.clone());
+
+        let url = tunnel.start("127.0.0.1", 42617).await.unwrap();
+        assert_eq!(url, "https://node.example.ts.net:42617");
+        assert!(
+            tunnel.health_check().await,
+            "serve must look healthy while it is still in the foreground"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !tunnel.health_check().await,
+            "an exited tailscale serve must not count as healthy"
+        );
+        assert!(
+            tunnel.public_url().is_none(),
+            "an exited serve is no longer running, so it has no public URL"
+        );
+        tunnel.stop().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_reaps_a_live_serve() {
+        let fake = FakeBin::script(
+            r#"
+if [ "$2" = reset ]; then exit 0; fi
+sleep 30
+"#,
+        );
+        let tunnel = TailscaleTunnel::new(false, Some("node.example.ts.net".into()))
+            .with_program(fake.path.clone());
+
+        tunnel.start("127.0.0.1", 42617).await.unwrap();
+        assert!(tunnel.health_check().await);
+        assert_eq!(
+            tunnel.public_url().as_deref(),
+            Some("https://node.example.ts.net:42617")
+        );
+
+        tunnel.stop().await.unwrap();
+        assert!(!tunnel.health_check().await);
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn confirm_foreground_serve_rejects_an_exited_child() {
+        let mut child = spawn_exiting("serve failed", 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = confirm_foreground_serve(&mut child, Duration::from_millis(100))
+            .await
+            .expect_err("exited child must fail the confirm window");
+        assert!(
+            err.to_string().contains("serve failed"),
+            "confirm should include stderr, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_foreground_serve_accepts_a_live_child() {
+        let mut child = spawn_sleeping().await;
+        confirm_foreground_serve(&mut child, Duration::from_millis(80))
+            .await
+            .expect("a live child must pass the confirm window");
+        child.kill().await.ok();
+        child.wait().await.ok();
+    }
+
+    #[cfg(unix)]
+    struct FakeBin {
+        path: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeBin {
+        fn script(body: &str) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir for fake tailscale");
+            let tmp = dir.path().join("tailscale.tmp");
+            let path = dir.path().join("tailscale");
+            fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).expect("write fake tailscale");
+            let mut perms = fs::metadata(&tmp)
+                .expect("stat fake tailscale")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&tmp, perms).expect("chmod fake tailscale");
+            fs::rename(&tmp, &path).expect("publish fake tailscale");
+            Self { path, _dir: dir }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn spawn_exiting(stderr: &str, code: i32) -> Child {
+        Command::new("cmd")
+            .args(["/C", &format!("echo {stderr} 1>&2 & exit {code}")])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("cmd should spawn an exiting fixture")
+    }
+
+    #[cfg(not(windows))]
+    async fn spawn_exiting(stderr: &str, code: i32) -> Child {
+        Command::new("sh")
+            .args(["-c", &format!("echo {stderr} >&2; exit {code}")])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sh should spawn an exiting fixture")
+    }
+
+    #[cfg(windows)]
+    async fn spawn_sleeping() -> Child {
+        Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("cmd should spawn a sleeping fixture")
+    }
+
+    #[cfg(not(windows))]
+    async fn spawn_sleeping() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("sleep should spawn")
     }
 }

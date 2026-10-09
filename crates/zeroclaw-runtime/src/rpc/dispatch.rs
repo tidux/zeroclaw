@@ -27275,6 +27275,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -27365,6 +27366,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         if let TurnEvent::Usage {
             context_token_budget,
@@ -27521,6 +27523,7 @@ mod tests {
             provider_ref: String::new(),
             model: String::new(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         if let TurnEvent::Usage {
@@ -27611,6 +27614,7 @@ mod tests {
             provider_ref: "openai.default".to_string(),
             model: "model-b".to_string(),
             accepted: true,
+            estimated_input_tokens: None,
         };
         let model_ctx_window = if let TurnEvent::Usage {
             provider_ref,

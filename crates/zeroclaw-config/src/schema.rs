@@ -7197,14 +7197,17 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. When a
-    /// new image takes the count past the limit, the oldest surviving
-    /// image is removed from its message, which can invalidate a
-    /// provider's cached prefix from that message onward; a larger limit
-    /// delays cap eviction and reduces how many happen over a session,
-    /// but once the limit is full each further image still evicts one.
-    /// Acts as the upper bound on per-turn upload cost when tool outputs
-    /// surface local image paths.
+    /// dropped first. When a new image takes the count past the limit, the
+    /// oldest images are removed in one batch, down to half the limit
+    /// rounded up (4 -> 2, 8 -> 4, 16 -> 8); the count then grows back to the
+    /// limit before the next batch. Removing an image changes the message
+    /// that held it, which can invalidate a provider's cached prefix from
+    /// that message onward; batching means a session past the limit pays
+    /// that once every `max_images / 2 + 1` new images rather than on every
+    /// one. Right after a batch the model sees fewer older images than the
+    /// limit allows. A larger limit delays the first batch and makes each
+    /// one less frequent. Acts as the upper bound on per-turn upload cost
+    /// when tool outputs surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8184,6 +8187,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,
@@ -8241,6 +8248,25 @@ impl Default for WssConfig {
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
+    }
+}
+
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
     }
 }
 
@@ -17133,6 +17159,18 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub use_markdown_blocks: bool,
+    /// Accept messages posted by other Slack apps and bots
+    /// (`subtype = "bot_message"`), such as Workflow Builder steps.
+    ///
+    /// Off by default: these senders are not humans, so accepting them widens
+    /// who can drive the agent. Enabling this does **not** bypass
+    /// authorization: the posting app's bot ID still has to match the
+    /// channel's peer allowlist, so allow specific bot IDs rather than `"*"`
+    /// unless every app in the workspace is trusted. This agent's own posts
+    /// are always ignored regardless of this setting.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allow_bot_messages: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]

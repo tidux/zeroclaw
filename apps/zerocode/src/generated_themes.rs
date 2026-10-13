@@ -316,7 +316,7 @@ pub(crate) const GENERATED_THEMES: &[(&str, Theme)] = &[
             title: Color::Rgb(61, 219, 217),
             heading: Color::Rgb(190, 149, 255),
             body: Color::Rgb(208, 208, 208),
-            dim: Color::Rgb(82, 82, 82),
+            dim: Color::Rgb(152, 152, 152),
             accent: Color::Rgb(238, 83, 150),
             warn: Color::Rgb(66, 190, 101),
             selection_bg: Color::Rgb(57, 57, 57),

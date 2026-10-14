@@ -334,7 +334,7 @@ fn gateway_public_url(hostname: &str) -> String {
 ///
 /// Every process it starts runs in the foreground, where tailscaled keeps a
 /// session's serve config exactly as long as the process lives, and is owned
-/// by a [`ServeProcess`] watcher: an exit is reaped and reported at once
+/// by a `ServeProcess` watcher: an exit is reaped and reported at once
 /// rather than left as a zombie that still looks alive, and ending the
 /// watcher withdraws what the process published.
 pub struct TailscaleTunnel {

@@ -1043,6 +1043,122 @@ enum QuoteState {
     Double,
 }
 
+/// What closes an open [`SegmentFrame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentFrameKind {
+    /// `$(`, `<(`, `>(`, or a grouping `(`; closed by an unquoted `)`.
+    Paren,
+    /// Old-style command substitution; closed by the next unescaped backtick.
+    Backtick,
+}
+
+/// A POSIX substitution or subshell that is open while splitting segments.
+struct SegmentFrame {
+    kind: SegmentFrameKind,
+    /// The enclosing segment to resume when this frame closes, with a
+    /// placeholder (`$()`, `<()`, `>()`, or ``` `` ```) standing in for the
+    /// inner command. `None` for a grouping subshell, which is itself a segment
+    /// boundary.
+    resume: Option<String>,
+    /// Quote state of the enclosing word: command substitution also opens
+    /// inside double quotes.
+    resume_quote: QuoteState,
+    /// Inside `$((...))`, where `<<` is a shift rather than a heredoc.
+    arithmetic: bool,
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    current.clear();
+}
+
+fn open_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    kind: SegmentFrameKind,
+    placeholder: Option<&str>,
+    arithmetic: bool,
+) {
+    let resume = match placeholder {
+        Some(placeholder) => {
+            let mut resume = std::mem::take(current);
+            resume.push_str(placeholder);
+            Some(resume)
+        }
+        None => {
+            push_segment(segments, current);
+            None
+        }
+    };
+    let arithmetic = arithmetic || frames.last().is_some_and(|frame| frame.arithmetic);
+    frames.push(SegmentFrame {
+        kind,
+        resume,
+        resume_quote: *quote,
+        arithmetic,
+    });
+    *quote = QuoteState::None;
+}
+
+fn close_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+) {
+    push_segment(segments, current);
+    if let Some(frame) = frames.pop() {
+        *current = frame.resume.unwrap_or_default();
+        *quote = frame.resume_quote;
+    }
+}
+
+/// Open a backtick substitution, or close the innermost one if it is open.
+fn toggle_backtick_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+) {
+    if frames
+        .last()
+        .is_some_and(|frame| frame.kind == SegmentFrameKind::Backtick)
+    {
+        close_segment_frame(frames, segments, current, quote);
+    } else {
+        open_segment_frame(
+            frames,
+            segments,
+            current,
+            quote,
+            SegmentFrameKind::Backtick,
+            Some("``"),
+            false,
+        );
+    }
+}
+
+/// Split a command into the simple commands a shell would run, so each one
+/// can be checked on its own.
+///
+/// Segments end at unquoted `;`, newlines, `|`, `||`, and `&&`. Under the
+/// POSIX dialect, command substitution (`$(...)`, `` `...` ``), process
+/// substitution (`<(...)`, `>(...)`), and subshells (`(...)`) are boundaries
+/// too: the inner command becomes its own segment, and the enclosing word keeps
+/// a `$()`-style placeholder. Otherwise the closing `)` or backtick sticks to
+/// the last inner word (`$(ls 2>/dev/null)` yields a `/dev/null)` redirect
+/// target), and the inner command hides behind the outer one.
+///
+/// Every character other than those delimiters lands in exactly one segment
+/// (heredoc bodies aside), including when parentheses or backticks are
+/// unbalanced or a `case` pattern ends in `)`. A misparse can over-split a
+/// command but cannot drop text from the scan. Segments are returned in the
+/// order they end, so an inner command comes before the command containing it.
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -1050,6 +1166,13 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut escaped = false;
     let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
     let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    // `cmd.exe` has no command substitution, and its parenthesized blocks are
+    // not modeled here, so only the POSIX dialect splits at these boundaries.
+    let posix_substitution = matches!(dialect, ShellDialect::Posix);
+    let mut frames: Vec<SegmentFrame> = Vec::new();
+    // The previous character if it was unescaped syntax outside single quotes,
+    // so `(` can tell `$(`, `<(`, and `>(` from a grouping subshell.
+    let mut last_syntax_char: Option<char> = None;
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -1059,15 +1182,8 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut heredoc_word_buf = String::new();
     let mut chars = command.chars().peekable();
 
-    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
-        let trimmed = current.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed.to_string());
-        }
-        current.clear();
-    };
-
     while let Some(ch) = chars.next() {
+        let opener = last_syntax_char.take();
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -1086,8 +1202,27 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     current.push(ch);
                     continue;
                 }
+                if posix_substitution && ch == '(' && opener == Some('$') {
+                    let arithmetic = chars.peek() == Some(&'(');
+                    open_segment_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        SegmentFrameKind::Paren,
+                        Some("()"),
+                        arithmetic,
+                    );
+                    continue;
+                }
+                if posix_substitution && ch == '`' {
+                    toggle_backtick_frame(&mut frames, &mut segments, &mut current, &mut quote);
+                    continue;
+                }
                 if ch == '"' {
                     quote = QuoteState::None;
+                } else if ch == '$' {
+                    last_syntax_char = Some(ch);
                 }
                 current.push(ch);
             }
@@ -1176,25 +1311,90 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     '<' => {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
+                        // Inside `$((...))`, `<<` is a left shift.
                         if chars.peek() == Some(&'<') {
                             if let Some(second) = chars.next() {
                                 current.push(second);
                             }
-                            if chars.peek() != Some(&'<') {
+                            let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
+                            if chars.peek() != Some(&'<') && !in_arithmetic {
                                 reading_heredoc_word = true;
                             }
                             // `<<<` falls through with no heredoc tracking.
+                        } else {
+                            last_syntax_char = Some(ch);
                         }
                     }
-                    _ => current.push(ch),
+                    '(' if posix_substitution => match opener {
+                        Some('$') => {
+                            let arithmetic = chars.peek() == Some(&'(');
+                            open_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                SegmentFrameKind::Paren,
+                                Some("()"),
+                                arithmetic,
+                            );
+                        }
+                        Some('<' | '>') => open_segment_frame(
+                            &mut frames,
+                            &mut segments,
+                            &mut current,
+                            &mut quote,
+                            SegmentFrameKind::Paren,
+                            Some("()"),
+                            false,
+                        ),
+                        // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
+                        // that is still a word boundary.
+                        _ => open_segment_frame(
+                            &mut frames,
+                            &mut segments,
+                            &mut current,
+                            &mut quote,
+                            SegmentFrameKind::Paren,
+                            None,
+                            false,
+                        ),
+                    },
+                    ')' if posix_substitution => {
+                        if frames
+                            .last()
+                            .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
+                        {
+                            close_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                            );
+                        } else {
+                            // An unmatched `)`, such as a `case` pattern
+                            // terminator, still ends the word before it.
+                            push_segment(&mut segments, &mut current);
+                        }
+                    }
+                    '`' if posix_substitution => {
+                        toggle_backtick_frame(&mut frames, &mut segments, &mut current, &mut quote);
+                    }
+                    _ => {
+                        last_syntax_char = Some(ch);
+                        current.push(ch);
+                    }
                 }
             }
         }
     }
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        segments.push(trimmed.to_string());
+    push_segment(&mut segments, &mut current);
+    // Flush the enclosing text of any substitution left open, so an
+    // unterminated `$(` cannot hide the command around it.
+    while let Some(frame) = frames.pop() {
+        if let Some(mut resume) = frame.resume {
+            push_segment(&mut segments, &mut resume);
+        }
     }
 
     segments
@@ -3542,6 +3742,17 @@ impl SecurityPolicy {
             || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
+        {
+            return false;
+        }
+
+        // POSIX subshells split into their own segments below, so `(git status)`
+        // would be checked as plain `git status`. Keep rejecting unquoted
+        // grouping syntax here so the segment split does not widen the strict
+        // allowlist; `$(`, `<(`, `>(`, and backticks are rejected above.
+        if matches!(dialect, ShellDialect::Posix)
+            && (contains_unquoted_char(command, '(', dialect)
+                || contains_unquoted_char(command, ')', dialect))
         {
             return false;
         }
@@ -8185,6 +8396,171 @@ mod tests {
             posix("grep --file=/etc/passwd>/dev/null root"),
             Some("/etc/passwd".into())
         );
+    }
+
+    /// POSIX command substitution, process substitution, subshells, and
+    /// backticks close with a character that is not whitespace. The scanner
+    /// must end the inner command there instead of gluing `)` or `` ` `` onto
+    /// the last word, which turned `$(cmd 2>/dev/null)` into a blocked
+    /// `/dev/null)` redirect target.
+    #[test]
+    fn forbidden_path_argument_allows_safe_devices_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "x=$(echo a 2>/dev/null)",
+            "x=$(echo a 2>/dev/null); echo \"$x\"",
+            "x=\"$(echo a 2>/dev/null)\"",
+            "echo \"$(ls 2>/dev/null)\" \"$(ls 2> /dev/null)\"",
+            "x=$(echo $(echo a 2>/dev/null) 2>/dev/null)",
+            "x=$(cat </dev/null)",
+            "x=$(cat</dev/null)",
+            "(echo a 2>/dev/null)",
+            "(cd sub && ls 2>/dev/null) | wc -l",
+            "(echo a) 2>/dev/null",
+            "x=`echo a 2>/dev/null`",
+            "echo \"`echo a 2>/dev/null`\"",
+            "diff <(sort a 2>/dev/null) <(sort b 2>/dev/null)",
+            "for b in $(which -a zeroclaw 2>/dev/null); do echo $b; done",
+            "find . \\( -name a -o -name b \\) 2>/dev/null",
+            "echo $((1 + 2)) 2>/dev/null",
+            "grep -E '(a|b)' file 2>/dev/null",
+            "echo ')' 2>/dev/null",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+        }
+    }
+
+    /// Splitting at substitution boundaries must expose the inner command to
+    /// the scan, never hide it: lookalike devices and forbidden paths inside a
+    /// substitution stay blocked and are reported without the closing `)`.
+    #[test]
+    fn forbidden_path_argument_scans_inside_posix_substitutions() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for (command, blocked) in [
+            ("x=$(echo a 2>/dev/nullx)", "/dev/nullx"),
+            (
+                "x=$(echo a 2>/dev/null/../../etc/passwd)",
+                "/dev/null/../../etc/passwd",
+            ),
+            ("x=$(cat /etc/passwd)", "/etc/passwd"),
+            ("x=$(cat /etc/passwd 2>/dev/null)", "/etc/passwd"),
+            // Double quotes do not stop command substitution, so the inner
+            // command is scanned too.
+            ("x=\"$(cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"`cat /etc/shadow`\"", "/etc/shadow"),
+            ("x=`cat /etc/passwd`", "/etc/passwd"),
+            ("(cat /etc/passwd)", "/etc/passwd"),
+            ("(echo a) >/etc/passwd", "/etc/passwd"),
+            ("diff <(cat /etc/passwd) b", "/etc/passwd"),
+            ("x=$(echo $(cat /etc/passwd))", "/etc/passwd"),
+            // Unbalanced or `case`-style closers are boundaries, not hiding
+            // places.
+            ("case x in a) cat /etc/passwd;; esac", "/etc/passwd"),
+            ("echo a) cat /etc/passwd", "/etc/passwd"),
+            // Arithmetic `<<` is a shift, not a heredoc that swallows the rest.
+            ("echo $((8 << 1)); cat /etc/passwd", "/etc/passwd"),
+            ("echo $((8<<1))\ncat /etc/passwd\n1", "/etc/passwd"),
+        ] {
+            assert_eq!(posix(command), Some(blocked.into()), "{command}");
+        }
+    }
+
+    /// `cmd.exe` has no `$(...)` or backtick substitution, so those characters
+    /// stay ordinary word characters under the Windows command dialect.
+    #[test]
+    fn windows_cmd_does_not_split_posix_substitution_syntax() {
+        assert_eq!(
+            split_unquoted_segments("echo `a` $(b)", ShellDialect::WindowsCmd),
+            vec!["echo `a` $(b)".to_string()]
+        );
+    }
+
+    #[test]
+    fn posix_segments_split_at_substitution_boundaries() {
+        let split = |command: &str| split_unquoted_segments(command, ShellDialect::Posix);
+        // Segments are returned in the order they end: inner commands first.
+        assert_eq!(split("x=$(echo a)"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=\"$(echo a)\""), vec!["echo a", "x=\"$()\""]);
+        assert_eq!(split("x=`echo a`"), vec!["echo a", "x=``"]);
+        assert_eq!(split("(echo a) && b"), vec!["echo a", "b"]);
+        assert_eq!(split("diff <(a) >(b)"), vec!["a", "b", "diff <() >()"]);
+        assert_eq!(split("x=$(a $(b) c) d"), vec!["b", "a $() c", "x=$() d"]);
+        assert_eq!(split("x=$(a; b)"), vec!["a", "b", "x=$()"]);
+        // Arithmetic is scanned like a nested command, with no heredoc.
+        assert_eq!(split("echo $((1 << 2))"), vec!["1 << 2", "echo $()"]);
+        // Unbalanced input keeps every word: an unterminated substitution
+        // still flushes the command around it, and a stray `)` is a boundary.
+        assert_eq!(split("cat a $(echo b"), vec!["echo b", "cat a $()"]);
+        assert_eq!(split("cat a `echo b"), vec!["echo b", "cat a ``"]);
+        assert_eq!(split("echo a) b"), vec!["echo a", "b"]);
+        // Quoted and escaped parentheses and backticks are literal.
+        assert_eq!(split("echo '$(a)' '`b`'"), vec!["echo '$(a)' '`b`'"]);
+        assert_eq!(
+            split("echo \\$\\(a\\) \\`b\\`"),
+            vec!["echo \\$\\(a\\) \\`b\\`"]
+        );
+        assert_eq!(split("echo \"(a)\""), vec!["echo \"(a)\""]);
+        // A quote inside a substitution does not leak into the outer word.
+        assert_eq!(
+            split("x=\"$(echo \")\")\""),
+            vec!["echo \")\"", "x=\"$()\""]
+        );
+    }
+
+    /// Commands inside substitutions and subshells carry their own risk.
+    #[test]
+    fn command_risk_level_sees_commands_inside_posix_substitutions() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            "x=$(rm -rf ./build)",
+            "x=\"$(rm -rf ./build)\"",
+            "x=`rm -rf ./build`",
+            "echo \"`rm -rf ./build`\"",
+            "(rm -rf ./build)",
+            "echo ok && (cd sub; rm -rf ./build)",
+            "diff <(rm -rf ./build) b",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::High,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            p.command_risk_level("x=$(git rev-parse HEAD 2>/dev/null)"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    /// The strict allowlist decision for grouping and substitution syntax is
+    /// unchanged: segment splitting must not turn a previously rejected
+    /// `(git status)` into an accepted one.
+    #[test]
+    fn strict_allowlist_still_rejects_posix_grouping_and_substitution() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("git status 2>/dev/null"));
+        // Escaped and quoted parentheses are literal, not grouping syntax.
+        assert!(p.is_command_allowed("find . \\( -name a -o -name b \\)"));
+        assert!(p.is_command_allowed("grep -E '(a|b)' file"));
+        for command in [
+            "(git status)",
+            "(git status 2>/dev/null)",
+            "(git status) 2>/dev/null",
+            "git status && (git log)",
+            "x=$(git status)",
+            "git status `git log`",
+            "git status )",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+        }
     }
 
     /// The dialect divergence that broke the host-defaulting tests on Windows,

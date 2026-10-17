@@ -1065,6 +1065,57 @@ struct SegmentFrame {
     resume_quote: QuoteState,
     /// Inside `$((...))`, where `<<` is a shift rather than a heredoc.
     arithmetic: bool,
+    /// Syntax state of the commands inside this frame.
+    nest: SegmentNest,
+}
+
+/// Per-frame syntax that changes what a `)` means. Bash parses a whole
+/// substitution before running it, so a `case` pattern's `)` or a `)` inside
+/// `${...}` does not close `$(...)`. Treating either as the closer would
+/// restore the enclosing quote state and hide the rest of the inner command
+/// inside one quoted argument.
+#[derive(Debug, Default, Clone, Copy)]
+struct SegmentNest {
+    /// Open `case` statements, whose pattern terminators are `)`.
+    case_depth: usize,
+    /// Open `${...}` parameter expansions, where `(` and `)` are literal.
+    param_depth: usize,
+}
+
+fn segment_nest_mut<'a>(
+    frames: &'a mut [SegmentFrame],
+    top: &'a mut SegmentNest,
+) -> &'a mut SegmentNest {
+    match frames.last_mut() {
+        Some(frame) => &mut frame.nest,
+        None => top,
+    }
+}
+
+/// Track `case`/`esac` keywords as the word in `current` ends. A keyword only
+/// counts in command position: first in the segment, or after reserved words
+/// that can precede a command (`then case`, `do case`).
+fn note_case_keyword(current: &str, nest: &mut SegmentNest) {
+    if !current.ends_with(|c: char| !c.is_whitespace()) {
+        return;
+    }
+    let mut words = current.split_whitespace();
+    let Some(last) = words.next_back() else {
+        return;
+    };
+    if !words.all(|word| {
+        matches!(
+            word,
+            "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
+        )
+    }) {
+        return;
+    }
+    match last {
+        "case" => nest.case_depth += 1,
+        "esac" => nest.case_depth = nest.case_depth.saturating_sub(1),
+        _ => {}
+    }
 }
 
 fn push_segment(segments: &mut Vec<String>, current: &mut String) {
@@ -1095,12 +1146,17 @@ fn open_segment_frame(
             None
         }
     };
-    let arithmetic = arithmetic || frames.last().is_some_and(|frame| frame.arithmetic);
+    // Arithmetic carries into the parentheses of an arithmetic expression,
+    // but a command substitution or backtick inside it is ordinary shell
+    // syntax again (heredocs included).
+    let arithmetic = arithmetic
+        || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
     frames.push(SegmentFrame {
         kind,
         resume,
         resume_quote: *quote,
         arithmetic,
+        nest: SegmentNest::default(),
     });
     *quote = QuoteState::None;
 }
@@ -1173,6 +1229,10 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     // The previous character if it was unescaped syntax outside single quotes,
     // so `(` can tell `$(`, `<(`, and `>(` from a grouping subshell.
     let mut last_syntax_char: Option<char> = None;
+    // `case` and `${...}` state outside every frame.
+    let mut top_nest = SegmentNest::default();
+    // Inside a `#` comment, until the next newline.
+    let mut in_comment = false;
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -1284,7 +1344,50 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     continue;
                 }
 
+                // A comment runs to the newline. Its text stays in the segment,
+                // and separators still split (conservative), but `)`, quotes,
+                // backticks, and `$(` inside it are not syntax, so a comment's
+                // `)` cannot close a substitution early.
+                if in_comment {
+                    if ch == '\n' {
+                        in_comment = false;
+                    } else if !matches!(ch, ';' | '|' | '&') {
+                        current.push(ch);
+                        continue;
+                    }
+                }
+
+                let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
+                if posix_substitution
+                    && !in_comment
+                    && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | ')'))
+                {
+                    note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
+                }
+                let SegmentNest {
+                    case_depth,
+                    param_depth,
+                } = *segment_nest_mut(&mut frames, &mut top_nest);
+
                 match ch {
+                    '#' if posix_substitution
+                        && !in_comment
+                        && !in_arithmetic
+                        && param_depth == 0
+                        && (current.trim().is_empty()
+                            || opener.is_some_and(char::is_whitespace)) =>
+                    {
+                        in_comment = true;
+                        current.push(ch);
+                    }
+                    '{' if posix_substitution && opener == Some('$') => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth += 1;
+                        current.push(ch);
+                    }
+                    '}' if posix_substitution && param_depth > 0 => {
+                        segment_nest_mut(&mut frames, &mut top_nest).param_depth -= 1;
+                        current.push(ch);
+                    }
                     '\'' if single_quotes_are_syntax => {
                         quote = QuoteState::Single;
                         current.push(ch);
@@ -1316,7 +1419,6 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                             if let Some(second) = chars.next() {
                                 current.push(second);
                             }
-                            let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
                             if chars.peek() != Some(&'<') && !in_arithmetic {
                                 reading_heredoc_word = true;
                             }
@@ -1325,44 +1427,49 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                             last_syntax_char = Some(ch);
                         }
                     }
-                    '(' if posix_substitution => match opener {
-                        Some('$') => {
-                            let arithmetic = chars.peek() == Some(&'(');
-                            open_segment_frame(
+                    // Inside `${...}` only `$(` opens a frame; other parentheses
+                    // are literal pattern text (`${x/)/y}`).
+                    '(' if posix_substitution && (param_depth == 0 || opener == Some('$')) => {
+                        match opener {
+                            Some('$') => {
+                                let arithmetic = chars.peek() == Some(&'(');
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    SegmentFrameKind::Paren,
+                                    Some("()"),
+                                    arithmetic,
+                                );
+                            }
+                            Some('<' | '>') => open_segment_frame(
                                 &mut frames,
                                 &mut segments,
                                 &mut current,
                                 &mut quote,
                                 SegmentFrameKind::Paren,
                                 Some("()"),
-                                arithmetic,
-                            );
+                                false,
+                            ),
+                            // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
+                            // that is still a word boundary.
+                            _ => open_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                SegmentFrameKind::Paren,
+                                None,
+                                false,
+                            ),
                         }
-                        Some('<' | '>') => open_segment_frame(
-                            &mut frames,
-                            &mut segments,
-                            &mut current,
-                            &mut quote,
-                            SegmentFrameKind::Paren,
-                            Some("()"),
-                            false,
-                        ),
-                        // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
-                        // that is still a word boundary.
-                        _ => open_segment_frame(
-                            &mut frames,
-                            &mut segments,
-                            &mut current,
-                            &mut quote,
-                            SegmentFrameKind::Paren,
-                            None,
-                            false,
-                        ),
-                    },
-                    ')' if posix_substitution => {
-                        if frames
-                            .last()
-                            .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
+                    }
+                    ')' if posix_substitution && param_depth == 0 => {
+                        if case_depth == 0
+                            && frames
+                                .last()
+                                .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
                         {
                             close_segment_frame(
                                 &mut frames,
@@ -1371,8 +1478,8 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 &mut quote,
                             );
                         } else {
-                            // An unmatched `)`, such as a `case` pattern
-                            // terminator, still ends the word before it.
+                            // A `case` pattern terminator, or an unmatched `)`,
+                            // ends the word before it without closing a frame.
                             push_segment(&mut segments, &mut current);
                         }
                     }
@@ -8427,6 +8534,10 @@ mod tests {
             "echo $((1 + 2)) 2>/dev/null",
             "grep -E '(a|b)' file 2>/dev/null",
             "echo ')' 2>/dev/null",
+            // A command substitution inside arithmetic uses ordinary shell
+            // syntax, so its quoted heredoc body is data, not a command.
+            "echo \"$(( $(cat <<'EOF' | wc -l\n/etc/passwd\nEOF\n) + 1 ))\"",
+            "x=\"$(case a in a) echo a 2>/dev/null;; esac)\"",
         ] {
             assert_eq!(posix(command), None, "{command}");
         }
@@ -8464,6 +8575,36 @@ mod tests {
             // Arithmetic `<<` is a shift, not a heredoc that swallows the rest.
             ("echo $((8 << 1)); cat /etc/passwd", "/etc/passwd"),
             ("echo $((8<<1))\ncat /etc/passwd\n1", "/etc/passwd"),
+            // A `)` that bash does not treat as the substitution's closer must
+            // not end it early. Closing early would restore the outer double
+            // quote and hide the rest of the command inside one argument.
+            (
+                "echo \"$(case x in x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            ("echo $(case x in x) cat /etc/passwd;; esac)", "/etc/passwd"),
+            (
+                "echo \"$(case x in (x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(case x in a) (cd a) ;; x) cat /etc/passwd;; esac)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(if true; then case x in x) cat /etc/passwd;; esac; fi)\"",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"`case x in x) cat /etc/passwd;; esac`\"",
+                "/etc/passwd",
+            ),
+            ("echo \"$(echo ${x/)/y}; cat /etc/passwd)\"", "/etc/passwd"),
+            ("echo \"${x:-$(cat /etc/passwd)}\"", "/etc/passwd"),
+            (
+                "echo \"$(echo a # comment )\ncat /etc/passwd\n)\"",
+                "/etc/passwd",
+            ),
         ] {
             assert_eq!(posix(command), Some(blocked.into()), "{command}");
         }
@@ -8509,6 +8650,27 @@ mod tests {
             split("x=\"$(echo \")\")\""),
             vec!["echo \")\"", "x=\"$()\""]
         );
+        // `case` pattern terminators end a segment inside the substitution
+        // without closing it; `esac` lets the next `)` close it again.
+        assert_eq!(
+            split("x=\"$(case a in a) b;; esac)\""),
+            vec!["case a in a", "b", "esac", "x=\"$()\""]
+        );
+        // Inside `${...}`, `(` and `)` are literal, but `$(` still nests.
+        assert_eq!(split("x=$(echo ${y/)/z})"), vec!["echo ${y/)/z}", "x=$()"]);
+        assert_eq!(
+            split("echo \"${y:-$(b)}\""),
+            vec!["b", "echo \"${y:-$()}\""]
+        );
+        // A comment's `)` does not close the substitution, and the comment
+        // ends at the newline. Mid-word `#` and `${#x}` are not comments.
+        assert_eq!(split("x=$(a # c )\nb\n)"), vec!["a # c )", "b", "x=$()"]);
+        assert_eq!(split("x=$(a#b) ${#y}"), vec!["a#b", "x=$() ${#y}"]);
+        // A command substitution inside arithmetic recognizes heredocs again.
+        assert_eq!(
+            split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
+            vec!["cat <<'E'", "$() + 1", "echo $()"]
+        );
     }
 
     /// Commands inside substitutions and subshells carry their own risk.
@@ -8527,6 +8689,14 @@ mod tests {
             "(rm -rf ./build)",
             "echo ok && (cd sub; rm -rf ./build)",
             "diff <(rm -rf ./build) b",
+            "echo \"$(case x in x) rm -rf ./build;; esac)\"",
+            "echo $(case x in x) rm -rf ./build;; esac)",
+            "echo \"$(echo ${x/)/y}; rm -rf ./build)\"",
+            "echo \"$(echo a # )\nrm -rf ./build\n)\"",
+            // An apostrophe in a comment is not a quote, so it cannot swallow
+            // the next line's command.
+            "ls # don't\nrm -rf ./build",
+            "ls # don't; rm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

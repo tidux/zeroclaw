@@ -1199,6 +1199,57 @@ fn toggle_backtick_frame(
     }
 }
 
+/// Read the delimiter word after `<<` (or `<<-`), copying its raw text into
+/// `current` and returning it with quotes and escapes removed.
+///
+/// The delimiter is one shell word: it ends at unquoted whitespace or a
+/// metacharacter, and the rest of the line (`| wc -l`, more redirects, a
+/// second `<<B`) is scanned as ordinary command text. Reading to the end of the
+/// line instead made a delimiter like `EOF | wc -l` that never matches, so every
+/// later command was skipped as heredoc body.
+fn read_heredoc_delimiter(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    current: &mut String,
+    backslash_is_literal: bool,
+) -> Option<String> {
+    if let Some(dash) = chars.next_if_eq(&'-') {
+        current.push(dash);
+    }
+    while let Some(blank) = chars.next_if(|ch| matches!(ch, ' ' | '\t')) {
+        current.push(blank);
+    }
+    let mut delimiter = String::new();
+    let mut quote = QuoteState::None;
+    while let Some(&ch) = chars.peek() {
+        if quote == QuoteState::None
+            && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
+        {
+            break;
+        }
+        chars.next();
+        current.push(ch);
+        match (quote, ch) {
+            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            (QuoteState::None | QuoteState::Double, '\\') if !backslash_is_literal => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                    delimiter.push(escaped);
+                }
+            }
+            _ => delimiter.push(ch),
+        }
+    }
+    // A `(` right after the word (`<<$(cmd)`) means this is not a plain
+    // delimiter. Open no heredoc rather than guess one, so the following text
+    // is scanned instead of skipped.
+    if delimiter.is_empty() || chars.peek() == Some(&'(') {
+        return None;
+    }
+    Some(delimiter)
+}
+
 /// Split a command into the simple commands a shell would run, so each one
 /// can be checked on its own.
 ///
@@ -1237,9 +1288,10 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
-    // True while reading the delimiter word that follows `<<`.
-    let mut reading_heredoc_word = false;
-    let mut heredoc_word_buf = String::new();
+    // Delimiters of heredocs opened on the current command line, in order.
+    // Their bodies start at the next unquoted newline.
+    let mut pending_heredocs: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -1287,52 +1339,17 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 current.push(ch);
             }
             QuoteState::None => {
-                if escaped {
-                    escaped = false;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
-                    continue;
-                }
-                if ch == '\\' && !backslash_is_literal {
-                    escaped = true;
-                    if heredoc_delimiter.is_some() {
-                        heredoc_line_buf.push(ch);
-                    } else {
-                        current.push(ch);
-                    }
-                    continue;
-                }
-
-                // Reading the delimiter word that follows `<<`.
-                if reading_heredoc_word {
-                    if ch == '\n' {
-                        // Finalise the delimiter and enter the heredoc body.
-                        let raw = heredoc_word_buf.trim().trim_start_matches('-');
-                        let delim = raw
-                            .trim_matches(|c| c == '\'' || c == '"' || c == '\\')
-                            .to_string();
-                        if !delim.is_empty() {
-                            heredoc_delimiter = Some(delim);
-                        }
-                        heredoc_word_buf.clear();
-                        reading_heredoc_word = false;
-                        // The newline after `<<WORD` belongs to the same segment.
-                        current.push(ch);
-                    } else {
-                        heredoc_word_buf.push(ch);
-                        current.push(ch);
-                    }
-                    continue;
-                }
-
+                // Heredoc bodies and comments are line-based and come first:
+                // a backslash cannot extend either past its newline. Inside a
+                // body this can end the heredoc earlier than an unquoted-
+                // delimiter shell would (`\<newline>` joins lines there), which
+                // only scans more text, never less.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
                         if heredoc_line_buf.trim() == delim {
-                            // Terminator line reached — end of heredoc body.
-                            heredoc_delimiter = None;
+                            // Terminator line reached. Start the next queued
+                            // heredoc body from the same command line, if any.
+                            heredoc_delimiter = pending_heredocs.pop_front();
                             heredoc_line_buf.clear();
                             push_segment(&mut segments, &mut current);
                         } else {
@@ -1346,8 +1363,9 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
 
                 // A comment runs to the newline. Its text stays in the segment,
                 // and separators still split (conservative), but `)`, quotes,
-                // backticks, and `$(` inside it are not syntax, so a comment's
-                // `)` cannot close a substitution early.
+                // backticks, backslashes, and `$(` inside it are not syntax, so
+                // a comment cannot close a substitution early or continue past
+                // its newline.
                 if in_comment {
                     if ch == '\n' {
                         in_comment = false;
@@ -1355,6 +1373,17 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         current.push(ch);
                         continue;
                     }
+                }
+
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' && !backslash_is_literal {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
                 }
 
                 let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
@@ -1396,7 +1425,11 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
-                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    ';' => push_segment(&mut segments, &mut current),
+                    '\n' => {
+                        push_segment(&mut segments, &mut current);
+                        heredoc_delimiter = pending_heredocs.pop_front();
+                    }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
                             // Consume full `||`; both characters are separators.
@@ -1419,8 +1452,15 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                             if let Some(second) = chars.next() {
                                 current.push(second);
                             }
-                            if chars.peek() != Some(&'<') && !in_arithmetic {
-                                reading_heredoc_word = true;
+                            if chars.peek() != Some(&'<')
+                                && !in_arithmetic
+                                && let Some(delimiter) = read_heredoc_delimiter(
+                                    &mut chars,
+                                    &mut current,
+                                    backslash_is_literal,
+                                )
+                            {
+                                pending_heredocs.push_back(delimiter);
                             }
                             // `<<<` falls through with no heredoc tracking.
                         } else {
@@ -8538,6 +8578,12 @@ mod tests {
             // syntax, so its quoted heredoc body is data, not a command.
             "echo \"$(( $(cat <<'EOF' | wc -l\n/etc/passwd\nEOF\n) + 1 ))\"",
             "x=\"$(case a in a) echo a 2>/dev/null;; esac)\"",
+            // Heredoc bodies stay data, including with more text after the
+            // delimiter and several heredocs on one line.
+            "cat <<'EOF' | wc -l\n/etc/passwd\nEOF",
+            "cat <<A - <<B\n/etc/passwd\nA\n/etc/shadow\nB",
+            "cat <<-EOF\n\t/etc/passwd\n\tEOF",
+            "cat <<\"E F\"\n/etc/passwd\nE F",
         ] {
             assert_eq!(posix(command), None, "{command}");
         }
@@ -8605,6 +8651,28 @@ mod tests {
                 "echo \"$(echo a # comment )\ncat /etc/passwd\n)\"",
                 "/etc/passwd",
             ),
+            // The heredoc delimiter is one word; the rest of its line and every
+            // command after the terminator are still scanned.
+            (
+                "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<'EOF' | wc -l\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<EOF >out\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<'EOF' /etc/passwd\nhello\nEOF", "/etc/passwd"),
+            (
+                "cat <<A - <<B\none\nA\ntwo\nB\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<-EOF\n\thello\n\tEOF\ncat /etc/passwd", "/etc/passwd"),
+            // A delimiter that is not a plain word opens no heredoc.
+            ("cat <<$(echo E)\nE\ncat /etc/passwd", "/etc/passwd"),
+            // A backslash does not continue a comment past its newline.
+            ("cat \"$(echo ok # \\\n)\" /etc/passwd", "/etc/passwd"),
+            ("echo ok # \\\ncat /etc/passwd", "/etc/passwd"),
         ] {
             assert_eq!(posix(command), Some(blocked.into()), "{command}");
         }
@@ -8671,6 +8739,17 @@ mod tests {
             split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
             vec!["cat <<'E'", "$() + 1", "echo $()"]
         );
+        // The heredoc delimiter is one word, and the body starts at the next
+        // newline, so the rest of the line is its own segment.
+        assert_eq!(
+            split("cat <<'E' | wc -l\nbody\nE\nnext"),
+            vec!["cat <<'E'", "wc -l", "next"]
+        );
+        // A comment ends at its newline even after a trailing backslash.
+        assert_eq!(
+            split("x=\"$(a # c \\\n)\" b"),
+            vec!["a # c \\", "x=\"$()\" b"]
+        );
     }
 
     /// Commands inside substitutions and subshells carry their own risk.
@@ -8697,6 +8776,9 @@ mod tests {
             // the next line's command.
             "ls # don't\nrm -rf ./build",
             "ls # don't; rm -rf ./build",
+            "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; rm -rf ./build",
+            "cat <<'EOF' | wc -l\nhello\nEOF\nrm -rf ./build",
+            "echo ok # \\\nrm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

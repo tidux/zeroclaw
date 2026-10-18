@@ -1,3 +1,4 @@
+#![allow(clippy::assert_is_empty)]
 //! Pure half of the Quickstart plugin step.
 //!
 //! Everything here is a function of values the caller already holds: the

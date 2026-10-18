@@ -908,16 +908,26 @@ mod tests {
 
     /// Whether `pid`'s process still exists.
     ///
-    /// Non-Linux fallback: `/proc` is unavailable, so this uses `kill(pid, 0)`
-    /// to check process liveness portably. Callers pair this with
-    /// `health_check()` (which waits for the watcher task to finish) to verify
-    /// reaping cross-platform.
-    #[cfg(not(target_os = "linux"))]
+    /// Non-Linux Unix fallback: `/proc` is unavailable, so this uses
+    /// `kill(pid, 0)` to check process liveness portably. Callers pair this
+    /// with `health_check()` (which waits for the watcher task to finish) to
+    /// verify reaping cross-platform.
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn process_exists(pid: u32) -> bool {
         // `kill(pid, 0)` returns 0 if the process exists (or we can signal it),
         // and -1 with ESRCH if it doesn't.
         let pid = libc::pid_t::try_from(pid).unwrap_or(0);
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Whether `pid`'s process still exists.
+    ///
+    /// Windows fallback: `kill` is unavailable, so this always returns
+    /// `false`. Callers pair this with `health_check()` (which waits for the
+    /// watcher task to finish) to verify reaping portably.
+    #[cfg(windows)]
+    fn process_exists(_pid: u32) -> bool {
+        false
     }
 
     #[tokio::test]
@@ -1316,7 +1326,10 @@ mod tests {
         *tunnel.gateway.lock().await = Some(gateway_serve(child));
         // The child must be alive before we drop the tunnel; otherwise the
         // test would pass vacuously on a spawn failure.
-        assert!(tunnel.health_check().await, "gateway serve should be running before drop");
+        assert!(
+            tunnel.health_check().await,
+            "gateway serve should be running before drop"
+        );
         drop(tunnel);
         // On Linux, /proc confirms the process is gone. On macOS, kill(pid, 0)
         // checks liveness portably. Both wait for the watcher to kill and reap.
@@ -1732,16 +1745,20 @@ mod tests {
 
     /// Integration test against a live `tailscaled`: exercises the full
     /// `TailscaleTunnel::start()` path — spawn, readiness probe, and fallback
-    /// when port 443 is already held. Skipped when `tailscale` is not on PATH
-    /// or the node is not logged in.
+    /// when port 443 is already held.
+    ///
+    /// **Ignored by default**: this test publishes a real HTTPS proxy on the
+    /// host's Tailscale port 443. Run only on a disposable test node with
+    /// `cargo test -- --ignored start_gateway_serve_against_live_tailscaled`.
     #[tokio::test]
+    #[ignore = "publishes a real HTTPS proxy on port 443; run only on a disposable test node"]
     async fn start_gateway_serve_against_live_tailscaled() {
         // Skip unless tailscale is available and the node is logged in.
         let which = std::process::Command::new("which")
             .arg("tailscale")
             .output()
             .ok();
-        if which.map_or(true, |o| !o.status.success()) {
+        if which.is_none_or(|o| !o.status.success()) {
             eprintln!("skipped: tailscale not on PATH");
             return;
         }
@@ -1765,47 +1782,76 @@ mod tests {
         let hostname = self_info.dns_name.as_deref().unwrap_or("localhost");
         let tunnel = TailscaleTunnel::new(false, Some(hostname.to_string()));
 
-        // Step 1: start the gateway serve. With port 443 free, this should
-        // publish and return a URL.
-        let result = tunnel.start("127.0.0.1", 42617).await;
-        match &result {
-            Ok(url) => {
-                eprintln!("start() succeeded: {url}");
-                assert!(url.starts_with("https://"));
-                assert!(tunnel.health_check().await);
-            }
-            Err(e) => {
-                eprintln!("start() failed: {e}");
-            }
-        }
+        // Step 1: start the gateway serve with port 443 free. This must
+        // succeed and return a URL — a failure here is a real regression,
+        // not a skip.
+        let url = tunnel
+            .start("127.0.0.1", 42617)
+            .await
+            .expect("start() should succeed when port 443 is free");
+        assert!(url.starts_with("https://"), "url should be https: {url}");
+        assert!(
+            tunnel.health_check().await,
+            "gateway should be healthy after start"
+        );
 
-        // Step 2: stop and verify cleanup.
+        // Step 2: stop and verify cleanup — no defunct child, no URL.
         tunnel.stop().await.unwrap();
-        assert!(!tunnel.health_check().await);
-        assert!(tunnel.public_url().is_none());
+        assert!(
+            !tunnel.health_check().await,
+            "gateway should be unhealthy after stop"
+        );
+        assert!(
+            tunnel.public_url().is_none(),
+            "URL should be cleared after stop"
+        );
 
-        // Step 3: hold port 443 with a stand-in serve session, then start
-        // again. This should fail with a port-held error and fall back.
-        let holder = spawn_stand_in("sleep 30");
-        *tunnel.gateway.lock().await = Some(gateway_serve(holder));
-        // The holder occupies the gateway slot; start() will take it, shut it
-        // down, then try to spawn a new serve on 443 — which is held by the
-        // live tailscale session from step 1's cleanup. Actually, step 1's
-        // stop() already withdrew the serve config, so 443 should be free
-        // again. To test the "port stays held" case, we need an external
-        // holder. We simulate by checking that start() either succeeds (port
-        // free) or fails with a port-held error (port held).
+        // Step 3: hold port 443 with a real `tailscale serve` process, then
+        // start again. This must fail with a port-held error and leave no
+        // defunct child.
+        // Start a local HTTP server to proxy to.
+        let mut holder_server = std::process::Command::new("python3")
+            .args(["-c", "import http.server,socketserver;h=http.server.SimpleHTTPRequestHandler;s=socketserver.TCPServer(('127.0.0.1',19999),h);s.serve_forever()"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn holder HTTP server");
+        // Hold port 443 via tailscale serve.
+        let serve_holder = std::process::Command::new("tailscale")
+            .args(["serve", "--bg", "--https=443", "http://127.0.0.1:19999"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("tailscale serve --bg should succeed");
+        assert!(
+            serve_holder.success(),
+            "tailscale serve --bg should succeed"
+        );
+        // Give tailscaled a moment to publish the session.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         let result2 = tunnel.start("127.0.0.1", 42617).await;
-        match &result2 {
-            Ok(url) => {
-                eprintln!("second start() succeeded: {url}");
-                tunnel.stop().await.unwrap();
-            }
-            Err(e) => {
-                eprintln!("second start() failed (expected if port held): {e}");
-                // Verify no defunct child remains.
-                assert!(!tunnel.health_check().await);
-            }
-        }
+        assert!(
+            result2.is_err(),
+            "start() should fail when port 443 is held by another session"
+        );
+        let err = result2.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("listener already exists for port 443"),
+            "error should mention port 443 conflict, got: {err_msg}"
+        );
+        // No defunct child should remain after the failed start.
+        assert!(
+            !tunnel.health_check().await,
+            "no defunct child after failed start"
+        );
+
+        // Cleanup: release port 443 and stop the holder server.
+        let _ = std::process::Command::new("tailscale")
+            .args(["serve", "reset"])
+            .status();
+        holder_server.kill().ok();
+        holder_server.wait().ok();
     }
 }

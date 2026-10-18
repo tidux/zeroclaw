@@ -1,3 +1,4 @@
+#![allow(clippy::assert_is_empty)]
 //! The plugin egress grant ceremony: the pure half.
 //!
 //! The manifest **declares**; the operator's config **grants**. Installation is

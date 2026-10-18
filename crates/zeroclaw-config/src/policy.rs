@@ -1344,11 +1344,11 @@ fn read_heredoc_delimiter(
     // delimiter. Open no heredoc rather than guess one, so the following text
     // is scanned instead of skipped.
     //
-    // A delimiter containing a newline or carriage return cannot be matched by
-    // the line-oriented body scanner. Bash does not treat it as a one-line
-    // terminator either (`<<$'E\nF'` runs to EOF), so skipping against it would
-    // hide later commands that bash still runs when the input ends.
-    if delimiter.is_empty() || delimiter.contains(['\n', '\r']) || chars.peek() == Some(&'(') {
+    // A newline inside the delimiter is not a one-line terminator. Bash runs
+    // `<<$'E\nF'` to EOF, so skipping against it would hide later commands.
+    // A carriage return can still end a physical line (`<<$'E\rF'` ends at
+    // `E<CR>F`), and that match happens before the line is trimmed.
+    if delimiter.is_empty() || delimiter.contains('\n') || chars.peek() == Some(&'(') {
         return None;
     }
     Some(delimiter)
@@ -1434,21 +1434,23 @@ fn expand_ansi_c_escape(
             char::from_u32(u32::from(control) & 0x1f).map(|ch| ch.to_string())
         }
         digit if digit.is_ascii_digit() && digit <= '7' => {
-            // Bash accepts one to three octal digits, but `\0` followed by
-            // another digit is a two-digit escape (`\012` is newline plus
-            // `2`, not one character). Every other leading digit takes three.
+            // Bash reads up to three octal digits, including a leading zero:
+            // `\077` is `?`, not a control character followed by `7`. Only a
+            // leading `\0` stops after two digits when a third is present
+            // (`\0123` is newline plus `3`). `\400` is an incomplete value,
+            // not a character this scanner can match.
             let mut value = u32::from(digit) - u32::from('0');
-            let width = if digit == '0' { 1 } else { 2 };
-            let mut rest = String::new();
-            for _ in 0..width {
+            let mut consumed = 1;
+            while consumed < 3 {
                 let Some(next) = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7') else {
                     break;
                 };
                 value = value * 8 + (u32::from(next) - u32::from('0'));
-                rest.push(next);
+                consumed += 1;
             }
-            // `\0dd` keeps the third digit as literal text after the escape.
-            if digit == '0' && rest.chars().count() == 1 {
+            // `\0123` is newline plus a literal `3`: a leading zero takes at
+            // most three digits, and the fourth stays text. `\077` is `?`.
+            if digit == '0' && consumed == 3 {
                 let extra = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7');
                 let mut expanded = char::from_u32(value)?.to_string();
                 if let Some(extra) = extra {
@@ -1589,7 +1591,17 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 // only scans more text, never less.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
                     if ch == '\n' {
-                        if heredoc_line_buf.trim() == delim {
+                        // A carriage return is part of the terminator
+                        // (`<<$'E\rF'` ends at the line `E<CR>F`) and is not
+                        // trimmed away. Any other line is compared after
+                        // trimming, which is what `<<-` needs and is also how
+                        // an ordinary delimiter ignores surrounding blanks.
+                        let line = if delim.contains('\r') {
+                            heredoc_line_buf.as_str()
+                        } else {
+                            heredoc_line_buf.trim()
+                        };
+                        if line == delim {
                             // Terminator line reached. Start the next queued
                             // heredoc body from the same command line, if any.
                             heredoc_delimiter = pending_heredocs.pop_front();
@@ -8849,6 +8861,7 @@ mod tests {
             "cat <<E\\\n/etc/passwd\nEpasswd",
             // An escaped space or metacharacter is part of the delimiter word.
             "cat <<E\\ OF\n/etc/passwd\nE OF",
+            "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF",
             "cat <<E\\;OF\n/etc/passwd\nE;OF",
             // Bash ANSI-C quotes expand before the terminator is matched.
             "cat <<$'EOF'\n/etc/passwd\nEOF",
@@ -9056,9 +9069,20 @@ mod tests {
                 "/etc/passwd",
             ),
             // `\101` is three octal digits (`A`). Reading only two would wait
-            // for `E10F` and skip the command after `EAF`.
+            // for `E10F` and skip the command after `EAF`. `\077` is likewise
+            // three digits (`?`), including the leading zero.
             (
                 "cat <<$'E\\101F'\nhello\nEAF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\ncat /etc/passwd"),
+                "/etc/passwd",
+            ),
+            // A carriage return can end a physical line. The body stays data,
+            // so a quote in it cannot swallow the command after the terminator.
+            (
+                "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\ncat /etc/passwd",
                 "/etc/passwd",
             ),
             // A leading backslash is quote removal, so the terminator is
@@ -9217,6 +9241,8 @@ mod tests {
             "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; rm -rf ./build",
             "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\101F'\nhello\nEAF\nrm -rf ./build",
+            concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\nrm -rf ./build"),
+            "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",
             "cat <<$\"EOF\"\nhello\nEOF\nrm -rf ./build",

@@ -1307,10 +1307,22 @@ fn read_heredoc_delimiter(
                     QuoteState::Double
                 };
             }
-            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => {
+            (QuoteState::Single, '\'') if !ansi_c => quote = QuoteState::None,
+            (QuoteState::Single, '\'') => {
                 quote = QuoteState::None;
                 ansi_c = false;
             }
+            // An escaped `"`, `$`, `` ` ``, or `\` inside double quotes is part
+            // of the word, not its closer. Stopping at `\"` turned `<<"E\" F"`
+            // into the delimiter `E"`, which never matches `E" F`.
+            (QuoteState::Double, '\\') if !backslash_is_literal => {
+                if let Some(escaped) = chars.next_if(|next| matches!(next, '$' | '`' | '"' | '\\'))
+                {
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+            }
+            (QuoteState::Double, '"') => quote = QuoteState::None,
             (QuoteState::None, '\'') => quote = QuoteState::Single,
             (QuoteState::None, '"') => quote = QuoteState::Double,
             // Inside `$'...'`, `\'` is an escaped apostrophe, not the closer.
@@ -1336,20 +1348,29 @@ fn read_heredoc_delimiter(
         }
     }
     if quote != QuoteState::None {
-        // An unclosed quote has no delimiter this scanner can trust.
-        return None;
+        // An unclosed quote has no delimiter this scanner can match. The body
+        // is still literal text, so skip it rather than parse its quotes.
+        return Some(String::new());
     }
-    let delimiter = remove_heredoc_delimiter_quotes(&raw)?;
-    // A `(` right after the word (`<<$(cmd)`) means this is not a plain
-    // delimiter. Open no heredoc rather than guess one, so the following text
-    // is scanned instead of skipped.
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+        // `$"..."` and other expansions this scanner does not model. In the
+        // default locale `$"EOF"` is `EOF`, but guessing wrong hides later
+        // commands. Skipping the body as data cannot: a quote inside it stays
+        // data instead of swallowing the command after the terminator.
+        return Some(String::new());
+    };
+    // A `(` right after the word (`<<$(cmd)`) is a command substitution, not a
+    // heredoc. Open none, so the substitution and the lines after it are scanned.
     //
     // A newline inside the delimiter is not a one-line terminator. Bash runs
-    // `<<$'E\nF'` to EOF, so skipping against it would hide later commands.
-    // A carriage return can still end a physical line (`<<$'E\rF'` ends at
-    // `E<CR>F`), and that match happens before the line is trimmed.
-    if delimiter.is_empty() || delimiter.contains('\n') || chars.peek() == Some(&'(') {
+    // `<<$'E\nF'` to EOF. Skipping that body scans no command bash runs, while
+    // parsing it would let a quote in the body hide a later command. A carriage
+    // return can still end a physical line (`<<$'E\rF'` ends at `E<CR>F`).
+    if chars.peek() == Some(&'(') {
         return None;
+    }
+    if delimiter.contains('\n') {
+        return Some(String::new());
     }
     Some(delimiter)
 }
@@ -1386,7 +1407,17 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
             // heredoc, so a quote in the body swallowed the following command.
             (QuoteState::Single, '\\') if ansi_c => {
                 let escaped = chars.next()?;
-                delimiter.push_str(&expand_ansi_c_escape(escaped, &mut chars)?);
+                // Bash truncates an ANSI-C string at the first NUL. Keeping
+                // the NUL made `<<$'E\0F'` wait for `E<NUL>F` while bash ends
+                // the body at `E`.
+                let expanded = expand_ansi_c_escape(escaped, &mut chars)?;
+                match expanded.split_once('\0') {
+                    Some((before, _)) => {
+                        delimiter.push_str(before);
+                        return Some(delimiter);
+                    }
+                    None => delimiter.push_str(&expanded),
+                }
             }
             (QuoteState::None | QuoteState::Double, '\\') => match chars.next() {
                 Some('\n') => {}
@@ -1596,6 +1627,19 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 // delimiter shell would (`\<newline>` joins lines there), which
                 // only scans more text, never less.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
+                    // An empty delimiter means the opener could not be read
+                    // reliably. Skip the rest of its opening line as data, so a
+                    // quote there cannot hide the following command, then scan
+                    // every later line. Skipping the whole remainder hid the
+                    // command after a `$"..."` terminator.
+                    if delim.is_empty() {
+                        if ch == '\n' {
+                            heredoc_delimiter = pending_heredocs.pop_front();
+                            heredoc_line_buf.clear();
+                            push_segment(&mut segments, &mut current);
+                        }
+                        continue;
+                    }
                     if ch == '\n' {
                         // A carriage return is part of the terminator
                         // (`<<$'E\rF'` ends at the line `E<CR>F`) and is not
@@ -8869,6 +8913,8 @@ mod tests {
             "cat <<E\\ OF\n/etc/passwd\nE OF",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF",
             "cat <<$EOF\necho 'https://example.invalid\n$EOF",
+            "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF",
+            "cat <<\"E\\\" F\"\necho 'https://example.invalid\nE\" F",
             "cat <<E\\;OF\n/etc/passwd\nE;OF",
             // Bash ANSI-C quotes expand before the terminator is matched.
             "cat <<$'EOF'\n/etc/passwd\nEOF",
@@ -9102,6 +9148,27 @@ mod tests {
                 "cat <<E$HOME\necho 'https://example.invalid\nE$HOME\ncat /etc/passwd",
                 "/etc/passwd",
             ),
+            // Bash truncates `$'...'` at the first NUL, so `<<$'E\0F'` ends at
+            // `E`. Waiting for `E<NUL>F` skipped the trailing command.
+            (
+                concat!(
+                    "echo \"$(cat <<$'E",
+                    r"\0",
+                    "F'\nhello\nE\n)\"; cat /etc/passwd"
+                ),
+                "/etc/passwd",
+            ),
+            // `$"..."` depends on the locale catalog. The body is still literal,
+            // so a quote in it cannot swallow the command after the terminator.
+            (
+                "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `\"` inside a double-quoted delimiter is part of the word.
+            (
+                "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
             (
@@ -9219,10 +9286,11 @@ mod tests {
             split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
             vec!["cat <<E\\ OF", "wc -l", "next"]
         );
-        // `$"..."` is locale-dependent, so no body is skipped against it.
+        // `$"..."` is locale-dependent. The opening line is data, and every
+        // later line is scanned rather than skipped against a guessed delimiter.
         assert_eq!(
             split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            vec!["cat <<$\"EOF\"", "body", "EOF", "next"]
+            vec!["cat <<$\"EOF\"", "EOF", "next"]
         );
     }
 
@@ -9267,6 +9335,13 @@ mod tests {
             concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\nrm -rf ./build"),
             concat!("cat <<$'E", r"\501", "F'\nhello\nEAF\nrm -rf ./build"),
             "cat <<$EOF\necho 'https://example.invalid\n$EOF\nrm -rf ./build",
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'\nhello\nE\n)\"; rm -rf ./build"
+            ),
+            "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
+            "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",

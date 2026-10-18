@@ -1231,6 +1231,10 @@ fn toggle_backtick_frame(
 /// second `<<B`) is scanned as ordinary command text. Reading to the end of the
 /// line instead made a delimiter like `EOF | wc -l` that never matches, so every
 /// later command was skipped as heredoc body.
+///
+/// `None` means "do not skip a body". That is the safe result when the word is
+/// not a plain delimiter (`<<$(cmd)`) or when its quote syntax cannot be read
+/// reliably: skipping against the wrong terminator hides every later command.
 fn read_heredoc_delimiter(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     current: &mut String,
@@ -1242,8 +1246,9 @@ fn read_heredoc_delimiter(
     while let Some(blank) = chars.next_if(|ch| matches!(ch, ' ' | '\t')) {
         current.push(blank);
     }
-    let mut delimiter = String::new();
+    let mut raw = String::new();
     let mut quote = QuoteState::None;
+    let mut ansi_c = false;
     while let Some(&ch) = chars.peek() {
         if quote == QuoteState::None
             && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
@@ -1252,33 +1257,56 @@ fn read_heredoc_delimiter(
         }
         chars.next();
         current.push(ch);
+        raw.push(ch);
         match (quote, ch) {
-            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
+            // Recognize `$'...'` / `$"..."` before the backslash-newline join.
+            // Otherwise `<<$'E\'OF'` is read as an ordinary single-quoted word
+            // whose `\'` closes it, and the rest of the command is swallowed
+            // into the delimiter.
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => {
+                let opener = chars.next().expect("peeked quote");
+                current.push(opener);
+                raw.push(opener);
+                quote = if opener == '\'' {
+                    ansi_c = true;
+                    QuoteState::Single
+                } else {
+                    QuoteState::Double
+                };
+            }
+            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => {
+                quote = QuoteState::None;
+                ansi_c = false;
+            }
             (QuoteState::None, '\'') => quote = QuoteState::Single,
             (QuoteState::None, '"') => quote = QuoteState::Double,
-            // Shell quote removal: a backslash-newline joins the word in both
-            // contexts. Unquoted, a backslash escapes any character. Inside
-            // double quotes it escapes only `$`, `` ` ``, `"`, and `\`, and
-            // stays part of the word before anything else (`"E\OF"` is
-            // `E\OF`). Dropping it there made a delimiter that never matched
-            // the terminator line, hiding every later command as body.
-            (QuoteState::None | QuoteState::Double, '\\') if !backslash_is_literal => {
-                match chars.next_if(|&next| {
-                    next == '\n'
-                        || quote == QuoteState::None
-                        || matches!(next, '$' | '`' | '"' | '\\')
-                }) {
-                    Some('\n') => current.push('\n'),
-                    Some(escaped) => {
-                        current.push(escaped);
-                        delimiter.push(escaped);
-                    }
-                    None => delimiter.push('\\'),
+            // Inside `$'...'`, `\'` is an escaped apostrophe, not the closer.
+            // Leave the backslash in the raw word for the expansion pass.
+            (QuoteState::Single, '\\') if ansi_c => {
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                    raw.push(escaped);
                 }
             }
-            _ => delimiter.push(ch),
+            // A backslash-newline joins the delimiter word before quote removal,
+            // quoted or not. Other escapes stay in the raw word: unquoted and
+            // double-quoted removal, and `$'...'` expansion, happen together
+            // afterwards. Stripping an ANSI-C backslash here would turn `\'`
+            // into a quote closer.
+            (QuoteState::None | QuoteState::Double, '\\')
+                if !backslash_is_literal && chars.next_if_eq(&'\n').is_some() =>
+            {
+                current.push('\n');
+                raw.push('\n');
+            }
+            _ => {}
         }
     }
+    if quote != QuoteState::None {
+        // An unclosed quote has no delimiter this scanner can trust.
+        return None;
+    }
+    let delimiter = remove_heredoc_delimiter_quotes(&raw)?;
     // A `(` right after the word (`<<$(cmd)`) means this is not a plain
     // delimiter. Open no heredoc rather than guess one, so the following text
     // is scanned instead of skipped.
@@ -1286,6 +1314,120 @@ fn read_heredoc_delimiter(
         return None;
     }
     Some(delimiter)
+}
+
+/// Apply shell quote removal to a heredoc delimiter word, including bash
+/// `$'...'` expansion. `None` means the word contains an expansion this scanner
+/// does not model (`$"..."`, `${...}`, `` `...` ``, `$(...)`), so no body may
+/// be skipped against it.
+fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
+    let mut delimiter = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote = QuoteState::None;
+    let mut ansi_c = false;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (QuoteState::Single, '\'') | (QuoteState::Double, '"') => {
+                quote = QuoteState::None;
+                ansi_c = false;
+            }
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => {
+                let opener = chars.next().expect("peeked quote");
+                if opener == '"' {
+                    return None;
+                }
+                quote = QuoteState::Single;
+                ansi_c = true;
+            }
+            (QuoteState::None, '$' | '`') | (QuoteState::Double, '$' | '`') => return None,
+            (QuoteState::Single, '\\') if ansi_c => {
+                let escaped = chars.next()?;
+                delimiter.push(expand_ansi_c_escape(escaped, &mut chars)?);
+            }
+            (QuoteState::None | QuoteState::Double, '\\') => match chars.next() {
+                Some('\n') => {}
+                Some(escaped)
+                    if quote == QuoteState::None || matches!(escaped, '$' | '`' | '"' | '\\') =>
+                {
+                    delimiter.push(escaped);
+                }
+                Some(escaped) => {
+                    delimiter.push('\\');
+                    delimiter.push(escaped);
+                }
+                None => delimiter.push('\\'),
+            },
+            _ => delimiter.push(ch),
+        }
+    }
+    Some(delimiter)
+}
+
+/// Expand one bash ANSI-C escape. `None` means the escape is incomplete or not
+/// modeled, so the caller must not skip a heredoc body against this delimiter.
+fn expand_ansi_c_escape(
+    escaped: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<char> {
+    match escaped {
+        'a' => Some('\u{0007}'),
+        'b' => Some('\u{0008}'),
+        'e' | 'E' => Some('\u{001b}'),
+        'f' => Some('\u{000c}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{000b}'),
+        '\\' => Some('\\'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        '?' => Some('?'),
+        'x' => decode_hex_escape(chars, 2),
+        'u' => decode_hex_escape(chars, 4),
+        'U' => decode_hex_escape(chars, 8),
+        'c' => {
+            let control = chars.next()?;
+            let folded = control.to_ascii_uppercase();
+            if !folded.is_ascii_uppercase() {
+                return None;
+            }
+            char::from_u32(u32::from(folded) - u32::from('@'))
+        }
+        digit if digit.is_ascii_digit() && digit <= '7' => {
+            let mut value = u32::from(digit) - u32::from('0');
+            for _ in 0..2 {
+                let Some(next) = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7') else {
+                    break;
+                };
+                value = value * 8 + (u32::from(next) - u32::from('0'));
+            }
+            char::from_u32(value)
+        }
+        other => Some(other),
+    }
+}
+
+/// Decode a `\x`, `\u`, or `\U` escape. Bash consumes up to `max_digits` hex
+/// digits and requires at least one.
+fn decode_hex_escape(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    max_digits: usize,
+) -> Option<char> {
+    let mut value = 0_u32;
+    let mut digits = 0;
+    while digits < max_digits {
+        let Some(digit) = chars.next_if(|ch| ch.is_ascii_hexdigit()) else {
+            break;
+        };
+        value = value * 16 + digit.to_digit(16).expect("hex digit");
+        digits += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    char::from_u32(value)
 }
 
 /// Split a command into the simple commands a shell would run, so each one
@@ -8646,6 +8788,10 @@ mod tests {
             "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
             "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
             "cat <<E\\\nOF\n/etc/passwd\nEOF",
+            // Bash ANSI-C quotes expand before the terminator is matched.
+            "cat <<$'EOF'\n/etc/passwd\nEOF",
+            "cat <<$'E\\x4fF'\n/etc/passwd\nEOF",
+            "cat <<E$'O'F\n/etc/passwd\nEOF",
             // A heredoc opened inside a substitution reads its body there; the
             // outer heredoc's body starts after the line the substitution
             // closes on. A subshell shares the enclosing heredoc queue.
@@ -8791,6 +8937,32 @@ mod tests {
             // An inner heredoc whose substitution closes before a newline has
             // no body inside it and is dropped, so the lines after are scanned.
             ("echo \"$(cat <<B)\"\ncat /etc/passwd\nB", "/etc/passwd"),
+            // `$'...'` is expanded before the terminator is matched. Reading the
+            // raw word as `$EOF` never matches `EOF` and hides the trailing
+            // command. An expansion the scanner cannot model (`$"..."`,
+            // `$(...)`) opens no heredoc, so the following lines stay scanned.
+            (
+                "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<$'E\\x4fF'\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E$'O'F\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<$'E\\'OF'\nhello\nE'OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<$'E\\\\OF'\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<$\"EOF\"\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<$(echo EOF)\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
         ] {
             assert_eq!(posix(command), Some(blocked.into()), "{command}");
         }
@@ -8874,6 +9046,16 @@ mod tests {
             split("x=\"$(a # c \\\n)\" b"),
             vec!["a # c \\", "x=\"$()\" b"]
         );
+        // An ANSI-C quoted delimiter expands before the body is skipped.
+        assert_eq!(
+            split("cat <<$'EOF'\nbody\nEOF\nnext"),
+            vec!["cat <<$'EOF'", "next"]
+        );
+        // `$"..."` is locale-dependent, so no body is skipped against it.
+        assert_eq!(
+            split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
+            vec!["cat <<$\"EOF\"", "body", "EOF", "next"]
+        );
     }
 
     /// Commands inside substitutions and subshells carry their own risk.
@@ -8907,6 +9089,9 @@ mod tests {
             "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
             "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; rm -rf ./build",
             "cat <<A && (echo s\na\nA\necho t)\nrm -rf ./build",
+            "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; rm -rf ./build",
+            "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
+            "cat <<$\"EOF\"\nhello\nEOF\nrm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

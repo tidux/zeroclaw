@@ -1,4 +1,3 @@
-#![allow(clippy::assert_is_empty)]
 //! `zeroclaw plugin update`: the pure half.
 //!
 //! The runtime grants a plugin every permission its manifest requests, so a

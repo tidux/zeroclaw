@@ -1,4 +1,3 @@
-#![allow(clippy::assert_is_empty)]
 //! The Plugins step of `zeroclaw quickstart`: tool plugins picked from the
 //! registry, installed and configured when the agent is created, then
 //! activated with the operator's consent.

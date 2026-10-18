@@ -1,4 +1,3 @@
-#![allow(clippy::assert_is_empty)]
 //! Plugin instance rows, channel bindings included: the pure half.
 //!
 //! A plugin package's host-owned state, its private `config` map and its

@@ -1250,6 +1250,39 @@ fn read_heredoc_delimiter(
     let mut quote = QuoteState::None;
     let mut ansi_c = false;
     while let Some(&ch) = chars.peek() {
+        // An escape is part of the word, including when the escaped character
+        // is itself a word boundary. Checking the boundary first turned
+        // `<<E\ OF` into the delimiter `E\` (the space ended the word), which
+        // never matches the terminator `E OF` and hides every later command.
+        // Inside `$'...'` the backslash is an ANSI-C escape, not a shell
+        // escape, so it does not protect the following character from ending
+        // the quote.
+        if quote == QuoteState::None && ch == '\\' && !backslash_is_literal && !ansi_c {
+            chars.next();
+            current.push(ch);
+            raw.push(ch);
+            match chars.peek() {
+                // A backslash-newline joins the delimiter (`<<E\<newline>OF`
+                // is `EOF`). Record the newline and keep reading the word.
+                Some('\n') => {
+                    let newline = chars.next().expect("peeked newline");
+                    current.push(newline);
+                    raw.push(newline);
+                }
+                // Any other escaped character is part of the word, even when
+                // it would otherwise end it (`<<E\ OF` is `E OF`).
+                Some(_) => {
+                    let escaped = chars.next().expect("peeked escape");
+                    current.push(escaped);
+                    raw.push(escaped);
+                }
+                // A backslash at the end of the input is not a join. Leave it
+                // in the word so the body scanner does not treat the following
+                // line as part of the delimiter.
+                None => {}
+            }
+            continue;
+        }
         if quote == QuoteState::None
             && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')'))
         {
@@ -1310,7 +1343,12 @@ fn read_heredoc_delimiter(
     // A `(` right after the word (`<<$(cmd)`) means this is not a plain
     // delimiter. Open no heredoc rather than guess one, so the following text
     // is scanned instead of skipped.
-    if delimiter.is_empty() || chars.peek() == Some(&'(') {
+    //
+    // A delimiter containing a newline or carriage return cannot be matched by
+    // the line-oriented body scanner. Bash does not treat it as a one-line
+    // terminator either (`<<$'E\nF'` runs to EOF), so skipping against it would
+    // hide later commands that bash still runs when the input ends.
+    if delimiter.is_empty() || delimiter.contains(['\n', '\r']) || chars.peek() == Some(&'(') {
         return None;
     }
     Some(delimiter)
@@ -1344,7 +1382,7 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
             (QuoteState::None, '$' | '`') | (QuoteState::Double, '$' | '`') => return None,
             (QuoteState::Single, '\\') if ansi_c => {
                 let escaped = chars.next()?;
-                delimiter.push(expand_ansi_c_escape(escaped, &mut chars)?);
+                delimiter.push_str(&expand_ansi_c_escape(escaped, &mut chars)?);
             }
             (QuoteState::None | QuoteState::Double, '\\') => match chars.next() {
                 Some('\n') => {}
@@ -1370,42 +1408,59 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
 fn expand_ansi_c_escape(
     escaped: char,
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Option<char> {
+) -> Option<String> {
+    let one = |ch: char| Some(ch.to_string());
     match escaped {
-        'a' => Some('\u{0007}'),
-        'b' => Some('\u{0008}'),
-        'e' | 'E' => Some('\u{001b}'),
-        'f' => Some('\u{000c}'),
-        'n' => Some('\n'),
-        'r' => Some('\r'),
-        't' => Some('\t'),
-        'v' => Some('\u{000b}'),
-        '\\' => Some('\\'),
-        '\'' => Some('\''),
-        '"' => Some('"'),
-        '?' => Some('?'),
-        'x' => decode_hex_escape(chars, 2),
-        'u' => decode_hex_escape(chars, 4),
-        'U' => decode_hex_escape(chars, 8),
+        'a' => one('\u{0007}'),
+        'b' => one('\u{0008}'),
+        'e' | 'E' => one('\u{001b}'),
+        'f' => one('\u{000c}'),
+        'n' => one('\n'),
+        'r' => one('\r'),
+        't' => one('\t'),
+        'v' => one('\u{000b}'),
+        '\\' => one('\\'),
+        '\'' => one('\''),
+        '"' => one('"'),
+        '?' => one('?'),
+        'x' => decode_hex_escape(chars, 2).map(|ch| ch.to_string()),
+        'u' => decode_hex_escape(chars, 4).map(|ch| ch.to_string()),
+        'U' => decode_hex_escape(chars, 8).map(|ch| ch.to_string()),
         'c' => {
+            // Bash consumes the next byte and masks it with 0x1f. A letter,
+            // digit, or punctuation can all be a control introducer, so an
+            // unrecognized character must not abort the expansion.
             let control = chars.next()?;
-            let folded = control.to_ascii_uppercase();
-            if !folded.is_ascii_uppercase() {
-                return None;
-            }
-            char::from_u32(u32::from(folded) - u32::from('@'))
+            char::from_u32(u32::from(control) & 0x1f).map(|ch| ch.to_string())
         }
         digit if digit.is_ascii_digit() && digit <= '7' => {
+            // Bash accepts one to three octal digits, but `\0` followed by
+            // another digit is a two-digit escape (`\012` is newline plus
+            // `2`, not one character). Every other leading digit takes three.
             let mut value = u32::from(digit) - u32::from('0');
-            for _ in 0..2 {
+            let width = if digit == '0' { 1 } else { 2 };
+            let mut rest = String::new();
+            for _ in 0..width {
                 let Some(next) = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7') else {
                     break;
                 };
                 value = value * 8 + (u32::from(next) - u32::from('0'));
+                rest.push(next);
             }
-            char::from_u32(value)
+            // `\0dd` keeps the third digit as literal text after the escape.
+            if digit == '0' && rest.chars().count() == 1 {
+                let extra = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7');
+                let mut expanded = char::from_u32(value)?.to_string();
+                if let Some(extra) = extra {
+                    expanded.push(extra);
+                }
+                return Some(expanded);
+            }
+            char::from_u32(value).map(|ch| ch.to_string())
         }
-        other => Some(other),
+        // An unrecognized escape keeps the backslash. Dropping it made
+        // `\q` look like `q`, so the terminator never matched.
+        other => Some(format!("\\{other}")),
     }
 }
 
@@ -8788,6 +8843,13 @@ mod tests {
             "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
             "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
             "cat <<E\\\nOF\n/etc/passwd\nEOF",
+            // A trailing backslash joins the next line into the delimiter, so
+            // the line after it is body, not a command. Bash warns that it
+            // wanted `Ehello` and never runs a command placed after that line.
+            "cat <<E\\\n/etc/passwd\nEpasswd",
+            // An escaped space or metacharacter is part of the delimiter word.
+            "cat <<E\\ OF\n/etc/passwd\nE OF",
+            "cat <<E\\;OF\n/etc/passwd\nE;OF",
             // Bash ANSI-C quotes expand before the terminator is matched.
             "cat <<$'EOF'\n/etc/passwd\nEOF",
             "cat <<$'E\\x4fF'\n/etc/passwd\nEOF",
@@ -8899,6 +8961,41 @@ mod tests {
             ),
             // A backslash-newline inside the delimiter joins it into one word.
             ("cat <<E\\\nOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            // An escaped space or metacharacter stays inside the delimiter.
+            // Stopping at it made a terminator that never matches, so the
+            // trailing command was skipped as body.
+            ("cat <<E\\ OF\nhello\nE OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\ \\ OF\nhello\nE  OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\tOF\nhello\nE\tOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\;OF\nhello\nE;OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\|OF\nhello\nE|OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\&OF\nhello\nE&OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\<OF\nhello\nE<OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\>OF\nhello\nE>OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\(OF\nhello\nE(OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\)OF\nhello\nE)OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\#OF\nhello\nE#OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\"OF\nhello\nE\"OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<E\\'OF\nhello\nE'OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\$OF\nhello\nE$OF\ncat /etc/passwd", "/etc/passwd"),
+            ("cat <<E\\`OF\nhello\nE`OF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<E\\\\OF\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E\\\\\\ OF\nhello\nE\\ OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
             (
                 "cat <<\"E\\\nOF\"\nhello\nEOF\ncat /etc/passwd",
                 "/etc/passwd",
@@ -8956,6 +9053,25 @@ mod tests {
             ),
             (
                 "cat <<$'E\\\\OF'\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // `\101` is three octal digits (`A`). Reading only two would wait
+            // for `E10F` and skip the command after `EAF`.
+            (
+                "cat <<$'E\\101F'\nhello\nEAF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // A leading backslash is quote removal, so the terminator is
+            // `EOF`, not `\EOF`.
+            ("cat <<\\EOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            // Inside `$'...'` a backslash before a space or semicolon is
+            // literal. Expanding it made a terminator bash never writes.
+            (
+                "cat <<$'E\\ OF'\nhello\nE\\ OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<$'E\\;OF'\nhello\nE\\;OF\ncat /etc/passwd",
                 "/etc/passwd",
             ),
             ("cat <<$\"EOF\"\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
@@ -9051,6 +9167,11 @@ mod tests {
             split("cat <<$'EOF'\nbody\nEOF\nnext"),
             vec!["cat <<$'EOF'", "next"]
         );
+        // An escaped space is part of the delimiter, not the end of the word.
+        assert_eq!(
+            split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
+            vec!["cat <<E\\ OF", "wc -l", "next"]
+        );
         // `$"..."` is locale-dependent, so no body is skipped against it.
         assert_eq!(
             split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
@@ -9087,10 +9208,17 @@ mod tests {
             "echo ok # \\\nrm -rf ./build",
             "cat <<\"E\\OF\"\nhello\nE\\OF\nrm -rf ./build",
             "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<E\\ OF\nhello\nE OF\nrm -rf ./build",
+            "cat <<E\\;OF\nhello\nE;OF\nrm -rf ./build",
+            "cat <<E\\|OF\nhello\nE|OF\nrm -rf ./build",
+            "cat <<E\\(OF\nhello\nE(OF\nrm -rf ./build",
             "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; rm -rf ./build",
             "cat <<A && (echo s\na\nA\necho t)\nrm -rf ./build",
             "echo \"$(cat <<$'EOF'\nhello\nEOF\n)\"; rm -rf ./build",
             "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\101F'\nhello\nEAF\nrm -rf ./build",
+            "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
+            "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",
             "cat <<$\"EOF\"\nhello\nEOF\nrm -rf ./build",
         ] {
             assert_eq!(

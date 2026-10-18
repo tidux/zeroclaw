@@ -1232,14 +1232,16 @@ fn toggle_backtick_frame(
 /// line instead made a delimiter like `EOF | wc -l` that never matches, so every
 /// later command was skipped as heredoc body.
 ///
-/// `None` means "do not skip a body". That is the safe result when the word is
-/// not a plain delimiter (`<<$(cmd)`) or when its quote syntax cannot be read
-/// reliably: skipping against the wrong terminator hides every later command.
+/// `None` means this is not a heredoc (`<<$(cmd)`). `Some(Err(()))` means it is
+/// a heredoc whose delimiter this scanner cannot prove. Callers must not skip
+/// lines in that case: a wrong terminator hides every command after the body.
+/// `Some(Ok(delimiter))` is a one-line terminator the body matcher can compare
+/// exactly.
 fn read_heredoc_delimiter(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     current: &mut String,
     backslash_is_literal: bool,
-) -> Option<String> {
+) -> Option<Result<String, ()>> {
     if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
     }
@@ -1347,32 +1349,28 @@ fn read_heredoc_delimiter(
             _ => {}
         }
     }
-    if quote != QuoteState::None {
-        // An unclosed quote has no delimiter this scanner can match. The body
-        // is still literal text, so skip it rather than parse its quotes.
-        return Some(String::new());
-    }
-    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
-        // `$"..."` and other expansions this scanner does not model. In the
-        // default locale `$"EOF"` is `EOF`, but guessing wrong hides later
-        // commands. Skipping the body as data cannot: a quote inside it stays
-        // data instead of swallowing the command after the terminator.
-        return Some(String::new());
-    };
-    // A `(` right after the word (`<<$(cmd)`) is a command substitution, not a
-    // heredoc. Open none, so the substitution and the lines after it are scanned.
-    //
-    // A newline inside the delimiter is not a one-line terminator. Bash runs
-    // `<<$'E\nF'` to EOF. Skipping that body scans no command bash runs, while
-    // parsing it would let a quote in the body hide a later command. A carriage
-    // return can still end a physical line (`<<$'E\rF'` ends at `E<CR>F`).
     if chars.peek() == Some(&'(') {
+        // `<<$(cmd)` is a command substitution, not a heredoc.
         return None;
     }
-    if delimiter.contains('\n') {
-        return Some(String::new());
+    if quote != QuoteState::None {
+        // The opener is a heredoc, but its quote never closed. Do not skip a
+        // body against a delimiter this scanner did not finish reading.
+        return Some(Err(()));
     }
-    Some(delimiter)
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+        // `$"..."` and any other expansion this scanner does not model. The
+        // opener is still a heredoc. Skipping its lines against a guessed
+        // terminator is the bypass, so the caller scans them instead.
+        return Some(Err(()));
+    };
+    // A newline in the delimiter is not a one-line terminator (`<<$'E\nF'`
+    // runs to EOF). A carriage return can end a physical line, and the body
+    // matcher compares it before trimming.
+    if delimiter.is_empty() || delimiter.contains('\n') {
+        return Some(Err(()));
+    }
+    Some(Ok(delimiter))
 }
 
 /// Apply shell quote removal to a heredoc delimiter word, including bash
@@ -1407,14 +1405,17 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
             // heredoc, so a quote in the body swallowed the following command.
             (QuoteState::Single, '\\') if ansi_c => {
                 let escaped = chars.next()?;
-                // Bash truncates an ANSI-C string at the first NUL. Keeping
-                // the NUL made `<<$'E\0F'` wait for `E<NUL>F` while bash ends
-                // the body at `E`.
+                // Bash truncates an ANSI-C string at the first NUL, but text
+                // after that quoted part stays in the word: `<<$'E\0F'X` ends
+                // at `EX`, not `E`. Returning here dropped that suffix.
                 let expanded = expand_ansi_c_escape(escaped, &mut chars)?;
                 match expanded.split_once('\0') {
                     Some((before, _)) => {
                         delimiter.push_str(before);
-                        return Some(delimiter);
+                        ansi_c = false;
+                        // Discard the rest of this quoted part, then keep
+                        // reading later fragments of the same delimiter word.
+                        while chars.next_if(|next| *next != '\'').is_some() {}
                     }
                     None => delimiter.push_str(&expanded),
                 }
@@ -1627,19 +1628,6 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 // delimiter shell would (`\<newline>` joins lines there), which
                 // only scans more text, never less.
                 if let Some(delim) = heredoc_delimiter.as_deref() {
-                    // An empty delimiter means the opener could not be read
-                    // reliably. Skip the rest of its opening line as data, so a
-                    // quote there cannot hide the following command, then scan
-                    // every later line. Skipping the whole remainder hid the
-                    // command after a `$"..."` terminator.
-                    if delim.is_empty() {
-                        if ch == '\n' {
-                            heredoc_delimiter = pending_heredocs.pop_front();
-                            heredoc_line_buf.clear();
-                            push_segment(&mut segments, &mut current);
-                        }
-                        continue;
-                    }
                     if ch == '\n' {
                         // A carriage return is part of the terminator
                         // (`<<$'E\rF'` ends at the line `E<CR>F`) and is not
@@ -1757,15 +1745,25 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                             if let Some(second) = chars.next() {
                                 current.push(second);
                             }
-                            if chars.peek() != Some(&'<')
-                                && !in_arithmetic
-                                && let Some(delimiter) = read_heredoc_delimiter(
+                            if chars.peek() != Some(&'<') && !in_arithmetic {
+                                match read_heredoc_delimiter(
                                     &mut chars,
                                     &mut current,
                                     backslash_is_literal,
-                                )
-                            {
-                                pending_heredocs.push_back(delimiter);
+                                ) {
+                                    // A proven one-line delimiter. Its body is
+                                    // data, so it is safe to skip.
+                                    Some(Ok(delimiter)) => pending_heredocs.push_back(delimiter),
+                                    // The opener is a heredoc, but its delimiter
+                                    // uses syntax this scanner cannot prove.
+                                    // Skipping those lines is the bypass: a
+                                    // wrong terminator hides every later command.
+                                    // Leave the text in the scan instead.
+                                    Some(Err(())) => {}
+                                    // Not a heredoc (`<<$(cmd)`). The following
+                                    // text is ordinary command text.
+                                    None => {}
+                                }
                             }
                             // `<<<` falls through with no heredoc tracking.
                         } else {
@@ -8913,7 +8911,6 @@ mod tests {
             "cat <<E\\ OF\n/etc/passwd\nE OF",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF",
             "cat <<$EOF\necho 'https://example.invalid\n$EOF",
-            "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF",
             "cat <<\"E\\\" F\"\necho 'https://example.invalid\nE\" F",
             "cat <<E\\;OF\n/etc/passwd\nE;OF",
             // Bash ANSI-C quotes expand before the terminator is matched.
@@ -9158,12 +9155,18 @@ mod tests {
                 ),
                 "/etc/passwd",
             ),
-            // `$"..."` depends on the locale catalog. The body is still literal,
-            // so a quote in it cannot swallow the command after the terminator.
+            // Text after the truncated ANSI-C part stays in the delimiter.
+            // `<<$'E\0F'X` ends at `EX`, not `E`.
             (
-                "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
+                concat!(
+                    "echo \"$(cat <<$'E",
+                    r"\0",
+                    "F'X\nhello\nEX\n)\"; cat /etc/passwd"
+                ),
                 "/etc/passwd",
             ),
+            // `$"..."` depends on the locale catalog, so its body is not skipped.
+            // The lines after the opener stay in the scan.
             // `\"` inside a double-quoted delimiter is part of the word.
             (
                 "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
@@ -9286,11 +9289,10 @@ mod tests {
             split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
             vec!["cat <<E\\ OF", "wc -l", "next"]
         );
-        // `$"..."` is locale-dependent. The opening line is data, and every
-        // later line is scanned rather than skipped against a guessed delimiter.
+        // `$"..."` is locale-dependent, so no body is skipped against it.
         assert_eq!(
             split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            vec!["cat <<$\"EOF\"", "EOF", "next"]
+            vec!["cat <<$\"EOF\"", "body", "EOF", "next"]
         );
     }
 
@@ -9340,7 +9342,12 @@ mod tests {
                 r"\0",
                 "F'\nhello\nE\n)\"; rm -rf ./build"
             ),
-            "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
+            concat!(
+                "echo \"$(cat <<$'E",
+                r"\0",
+                "F'X\nhello\nEX\n)\"; rm -rf ./build"
+            ),
+            // `$"..."` is not a proven delimiter, so its body is scanned too.
             "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",

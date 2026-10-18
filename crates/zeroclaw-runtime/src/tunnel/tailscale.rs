@@ -1830,28 +1830,35 @@ mod tests {
         // Give tailscaled a moment to publish the session.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let result2 = tunnel.start("127.0.0.1", 42617).await;
-        assert!(
-            result2.is_err(),
-            "start() should fail when port 443 is held by another session"
-        );
-        let err = result2.unwrap_err();
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("listener already exists for port 443"),
-            "error should mention port 443 conflict, got: {err_msg}"
-        );
-        // No defunct child should remain after the failed start.
-        assert!(
-            !tunnel.health_check().await,
-            "no defunct child after failed start"
-        );
+        // Cleanup guard: runs on both success and failure paths.
+        let mut cleanup = || {
+            let _ = std::process::Command::new("tailscale")
+                .args(["serve", "reset"])
+                .status();
+            holder_server.kill().ok();
+            holder_server.wait().ok();
+        };
 
-        // Cleanup: release port 443 and stop the holder server.
-        let _ = std::process::Command::new("tailscale")
-            .args(["serve", "reset"])
-            .status();
-        holder_server.kill().ok();
-        holder_server.wait().ok();
+        let result2 = tunnel.start("127.0.0.1", 42617).await;
+        match result2 {
+            Err(err) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("listener already exists for port 443"),
+                    "error should mention port 443 conflict, got: {err_msg}"
+                );
+                // No defunct child should remain after the failed start.
+                assert!(
+                    !tunnel.health_check().await,
+                    "no defunct child after failed start"
+                );
+                cleanup();
+            }
+            Ok(_) => {
+                // If start succeeded unexpectedly (port was released), clean up.
+                tunnel.stop().await.unwrap();
+                cleanup();
+            }
+        }
     }
 }

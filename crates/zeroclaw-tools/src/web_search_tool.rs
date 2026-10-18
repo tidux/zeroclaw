@@ -2039,7 +2039,7 @@ fn scrape_entropy() -> u64 {
     let mut next = 0u64;
     // `fetch_update` retries on contention, so concurrent callers advance the
     // stream rather than reading the same value.
-    let _ = STATE.try_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+    let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
         // xorshift64 requires non-zero state; `| 1` guarantees it even if the
         // clock read fails or lands on a zero low word.
         let mut x = if previous == 0 {

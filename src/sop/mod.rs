@@ -359,7 +359,7 @@ Some conditions here.
     #[test]
     fn parse_steps_empty_md() {
         let steps = parse_steps("# Nothing here\n\nNo steps section.");
-        assert_eq!(steps, [] as [zeroclaw_runtime::sop::SopStep; 0]);
+        assert!(steps.is_empty());
     }
 
     #[test]
@@ -477,7 +477,7 @@ type = "manual"
 
         let sops = load_sops_from_directory(dir.path(), SopExecutionMode::Supervised);
         assert_eq!(sops.len(), 1);
-        assert_eq!(sops[0].steps, [] as [zeroclaw_runtime::sop::SopStep; 0]);
+        assert!(sops[0].steps.is_empty());
     }
 
     #[test]
@@ -561,7 +561,7 @@ type = "manual"
         };
 
         let warnings = validate_sop(&sop);
-        assert_eq!(warnings, [] as [std::string::String; 0]);
+        assert!(warnings.is_empty());
     }
 
     #[test]

@@ -1232,10 +1232,24 @@ fn read_heredoc_delimiter(
             (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
             (QuoteState::None, '\'') => quote = QuoteState::Single,
             (QuoteState::None, '"') => quote = QuoteState::Double,
+            // Shell quote removal: a backslash-newline joins the word in both
+            // contexts. Unquoted, a backslash escapes any character. Inside
+            // double quotes it escapes only `$`, `` ` ``, `"`, and `\`, and
+            // stays part of the word before anything else (`"E\OF"` is
+            // `E\OF`). Dropping it there made a delimiter that never matched
+            // the terminator line, hiding every later command as body.
             (QuoteState::None | QuoteState::Double, '\\') if !backslash_is_literal => {
-                if let Some(escaped) = chars.next() {
-                    current.push(escaped);
-                    delimiter.push(escaped);
+                match chars.next_if(|&next| {
+                    next == '\n'
+                        || quote == QuoteState::None
+                        || matches!(next, '$' | '`' | '"' | '\\')
+                }) {
+                    Some('\n') => current.push('\n'),
+                    Some(escaped) => {
+                        current.push(escaped);
+                        delimiter.push(escaped);
+                    }
+                    None => delimiter.push('\\'),
                 }
             }
             _ => delimiter.push(ch),
@@ -8584,6 +8598,12 @@ mod tests {
             "cat <<A - <<B\n/etc/passwd\nA\n/etc/shadow\nB",
             "cat <<-EOF\n\t/etc/passwd\n\tEOF",
             "cat <<\"E F\"\n/etc/passwd\nE F",
+            // Delimiter quote removal follows the shell: inside double quotes
+            // a backslash before an ordinary character stays, before `$`
+            // it goes, and a backslash-newline joins the word either way.
+            "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
+            "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
+            "cat <<E\\\nOF\n/etc/passwd\nEOF",
         ] {
             assert_eq!(posix(command), None, "{command}");
         }
@@ -8673,6 +8693,22 @@ mod tests {
             // A backslash does not continue a comment past its newline.
             ("cat \"$(echo ok # \\\n)\" /etc/passwd", "/etc/passwd"),
             ("echo ok # \\\ncat /etc/passwd", "/etc/passwd"),
+            // Inside double quotes a backslash before an ordinary character is
+            // part of the delimiter, so the body ends at `E\OF`, not `EOF`.
+            (
+                "cat <<\"E\\OF\"\nhello\nE\\OF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<\"E\\$F\"\nhello\nE$F\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            // A backslash-newline inside the delimiter joins it into one word.
+            ("cat <<E\\\nOF\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
+            (
+                "cat <<\"E\\\nOF\"\nhello\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
         ] {
             assert_eq!(posix(command), Some(blocked.into()), "{command}");
         }
@@ -8779,6 +8815,8 @@ mod tests {
             "echo \"$(( $(cat <<'EOF' | wc -l\nhello\nEOF\n) + 1 ))\"; rm -rf ./build",
             "cat <<'EOF' | wc -l\nhello\nEOF\nrm -rf ./build",
             "echo ok # \\\nrm -rf ./build",
+            "cat <<\"E\\OF\"\nhello\nE\\OF\nrm -rf ./build",
+            "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use zeroclaw_api::runtime_traits::ShellDialect;
@@ -1067,6 +1067,15 @@ struct SegmentFrame {
     arithmetic: bool,
     /// Syntax state of the commands inside this frame.
     nest: SegmentNest,
+    /// The enclosing heredoc queue, set aside while a substitution is open.
+    /// Bash and dash parse `$(...)` and backticks (and Bash `<(...)`) with
+    /// their own heredoc list: a newline inside starts only heredocs opened
+    /// inside, and the enclosing ones start at the first newline after the
+    /// substitution closes. A newline inside `$((...))` starts none either. A shared queue started the outer heredoc at the inner newline,
+    /// swallowed the inner terminator, and then skipped the commands after the
+    /// real outer terminator as the inner body. `None` for a grouping
+    /// subshell, which shares the enclosing queue just as both shells do.
+    outer_heredocs: Option<VecDeque<String>>,
 }
 
 /// Per-frame syntax that changes what a `)` means. Bash parses a whole
@@ -1131,6 +1140,7 @@ fn open_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<String>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
     arithmetic: bool,
@@ -1157,6 +1167,9 @@ fn open_segment_frame(
         resume_quote: *quote,
         arithmetic,
         nest: SegmentNest::default(),
+        outer_heredocs: placeholder
+            .is_some()
+            .then(|| std::mem::take(pending_heredocs)),
     });
     *quote = QuoteState::None;
 }
@@ -1166,11 +1179,20 @@ fn close_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<String>,
 ) {
     push_segment(segments, current);
     if let Some(frame) = frames.pop() {
         *current = frame.resume.unwrap_or_default();
         *quote = frame.resume_quote;
+        // Heredocs still pending here were opened inside the substitution with
+        // no newline after them before it closed, so they have no body. Dash
+        // reads them as empty and drops them. Bash carries them out to the
+        // next line, so dropping them can only scan lines Bash treats as body,
+        // never skip lines it runs.
+        if let Some(outer) = frame.outer_heredocs {
+            *pending_heredocs = outer;
+        }
     }
 }
 
@@ -1180,18 +1202,20 @@ fn toggle_backtick_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<String>,
 ) {
     if frames
         .last()
         .is_some_and(|frame| frame.kind == SegmentFrameKind::Backtick)
     {
-        close_segment_frame(frames, segments, current, quote);
+        close_segment_frame(frames, segments, current, quote, pending_heredocs);
     } else {
         open_segment_frame(
             frames,
             segments,
             current,
             quote,
+            pending_heredocs,
             SegmentFrameKind::Backtick,
             Some("``"),
             false,
@@ -1304,8 +1328,9 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut heredoc_line_buf = String::new();
     // Delimiters of heredocs opened on the current command line, in order.
     // Their bodies start at the next unquoted newline.
-    let mut pending_heredocs: std::collections::VecDeque<String> =
-        std::collections::VecDeque::new();
+    // A substitution sets this queue aside and starts its own (see
+    // `SegmentFrame::outer_heredocs`).
+    let mut pending_heredocs: VecDeque<String> = VecDeque::new();
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -1335,6 +1360,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         &mut segments,
                         &mut current,
                         &mut quote,
+                        &mut pending_heredocs,
                         SegmentFrameKind::Paren,
                         Some("()"),
                         arithmetic,
@@ -1342,7 +1368,13 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     continue;
                 }
                 if posix_substitution && ch == '`' {
-                    toggle_backtick_frame(&mut frames, &mut segments, &mut current, &mut quote);
+                    toggle_backtick_frame(
+                        &mut frames,
+                        &mut segments,
+                        &mut current,
+                        &mut quote,
+                        &mut pending_heredocs,
+                    );
                     continue;
                 }
                 if ch == '"' {
@@ -1492,6 +1524,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                     &mut segments,
                                     &mut current,
                                     &mut quote,
+                                    &mut pending_heredocs,
                                     SegmentFrameKind::Paren,
                                     Some("()"),
                                     arithmetic,
@@ -1502,6 +1535,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 &mut segments,
                                 &mut current,
                                 &mut quote,
+                                &mut pending_heredocs,
                                 SegmentFrameKind::Paren,
                                 Some("()"),
                                 false,
@@ -1513,6 +1547,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 &mut segments,
                                 &mut current,
                                 &mut quote,
+                                &mut pending_heredocs,
                                 SegmentFrameKind::Paren,
                                 None,
                                 false,
@@ -1530,6 +1565,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 &mut segments,
                                 &mut current,
                                 &mut quote,
+                                &mut pending_heredocs,
                             );
                         } else {
                             // A `case` pattern terminator, or an unmatched `)`,
@@ -1538,7 +1574,13 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         }
                     }
                     '`' if posix_substitution => {
-                        toggle_backtick_frame(&mut frames, &mut segments, &mut current, &mut quote);
+                        toggle_backtick_frame(
+                            &mut frames,
+                            &mut segments,
+                            &mut current,
+                            &mut quote,
+                            &mut pending_heredocs,
+                        );
                     }
                     _ => {
                         last_syntax_char = Some(ch);
@@ -8604,6 +8646,12 @@ mod tests {
             "cat <<\"E\\OF\"\n/etc/passwd\nE\\OF",
             "cat <<\"E\\$F\"\n/etc/passwd\nE$F",
             "cat <<E\\\nOF\n/etc/passwd\nEOF",
+            // A heredoc opened inside a substitution reads its body there; the
+            // outer heredoc's body starts after the line the substitution
+            // closes on. A subshell shares the enclosing heredoc queue.
+            "cat <<A $(cat <<B\n/etc/passwd\nB\n)\n/etc/shadow\nA",
+            "echo \"$(cat <<OUT $(cat <<IN\n/etc/passwd\nIN\n)\n/etc/shadow\nOUT\n)\"",
+            "cat <<A && (echo s\n/etc/passwd\nA\necho t)",
         ] {
             assert_eq!(posix(command), None, "{command}");
         }
@@ -8709,6 +8757,40 @@ mod tests {
                 "cat <<\"E\\\nOF\"\nhello\nEOF\ncat /etc/passwd",
                 "/etc/passwd",
             ),
+            // Each command substitution has its own heredoc queue, so an inner
+            // newline starts only the inner heredoc. A shared queue started the
+            // outer one first and skipped the trailing command.
+            (
+                "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; cat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A $(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A `cat <<B\nb\nB\n`\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A <(cat <<B\nb\nB\n)\na\nA\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<A - $(cat <<B\nb\nB\n) <<C\na\nA\nc\nC\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A $(echo x\n)\na\nA\ncat /etc/passwd", "/etc/passwd"),
+            // A subshell is not a substitution: its newline starts the
+            // enclosing heredoc, so the body ends inside the subshell.
+            (
+                "cat <<A && (echo s\na\nA\necho t)\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            ("cat <<A && (echo s\na\nA\ncat /etc/passwd)", "/etc/passwd"),
+            // An inner heredoc whose substitution closes before a newline has
+            // no body inside it and is dropped, so the lines after are scanned.
+            ("echo \"$(cat <<B)\"\ncat /etc/passwd\nB", "/etc/passwd"),
         ] {
             assert_eq!(posix(command), Some(blocked.into()), "{command}");
         }
@@ -8781,6 +8863,12 @@ mod tests {
             split("cat <<'E' | wc -l\nbody\nE\nnext"),
             vec!["cat <<'E'", "wc -l", "next"]
         );
+        // An inner heredoc's body is read inside its substitution, and the
+        // outer heredoc's body starts after the line the substitution closes on.
+        assert_eq!(
+            split("cat <<A $(cat <<B\nb\nB\n)\na\nA\nnext"),
+            vec!["cat <<B", "cat <<A $()", "next"]
+        );
         // A comment ends at its newline even after a trailing backslash.
         assert_eq!(
             split("x=\"$(a # c \\\n)\" b"),
@@ -8817,6 +8905,8 @@ mod tests {
             "echo ok # \\\nrm -rf ./build",
             "cat <<\"E\\OF\"\nhello\nE\\OF\nrm -rf ./build",
             "cat <<E\\\nOF\nhello\nEOF\nrm -rf ./build",
+            "echo \"$(cat <<OUT $(cat <<IN\n\nIN\n)\nouter\nOUT\n)\"; rm -rf ./build",
+            "cat <<A && (echo s\na\nA\necho t)\nrm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

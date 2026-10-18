@@ -1379,7 +1379,11 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
                 quote = QuoteState::Single;
                 ansi_c = true;
             }
-            (QuoteState::None, '$' | '`') | (QuoteState::Double, '$' | '`') => return None,
+            // A bare `$` or backtick in a heredoc delimiter is literal. Bash
+            // does not expand `<<$EOF`, `<<"$EOF"`, or `<<`echo EOF``. Only
+            // `$'...'` and `$"..."` are quoting forms, and those are handled
+            // above. Treating every `$` as an unsupported expansion opened no
+            // heredoc, so a quote in the body swallowed the following command.
             (QuoteState::Single, '\\') if ansi_c => {
                 let escaped = chars.next()?;
                 delimiter.push_str(&expand_ansi_c_escape(escaped, &mut chars)?);
@@ -1450,15 +1454,17 @@ fn expand_ansi_c_escape(
             }
             // `\0123` is newline plus a literal `3`: a leading zero takes at
             // most three digits, and the fourth stays text. `\077` is `?`.
+            // Bash keeps only the low eight bits, so `\501` is `A`, not `Ł`.
+            let byte = char::from_u32(value & 0xff)?;
             if digit == '0' && consumed == 3 {
                 let extra = chars.next_if(|ch| ch.is_ascii_digit() && *ch <= '7');
-                let mut expanded = char::from_u32(value)?.to_string();
+                let mut expanded = byte.to_string();
                 if let Some(extra) = extra {
                     expanded.push(extra);
                 }
                 return Some(expanded);
             }
-            char::from_u32(value).map(|ch| ch.to_string())
+            Some(byte.to_string())
         }
         // An unrecognized escape keeps the backslash. Dropping it made
         // `\q` look like `q`, so the terminator never matched.
@@ -8862,6 +8868,7 @@ mod tests {
             // An escaped space or metacharacter is part of the delimiter word.
             "cat <<E\\ OF\n/etc/passwd\nE OF",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF",
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF",
             "cat <<E\\;OF\n/etc/passwd\nE;OF",
             // Bash ANSI-C quotes expand before the terminator is matched.
             "cat <<$'EOF'\n/etc/passwd\nEOF",
@@ -9079,6 +9086,22 @@ mod tests {
                 concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\ncat /etc/passwd"),
                 "/etc/passwd",
             ),
+            // `\501` is 0o501 masked to eight bits (`A`). Decoding it as a
+            // Unicode scalar waited for `EŁF` and skipped the trailing command.
+            (
+                concat!("cat <<$'E", r"\501", "F'\nhello\nEAF\ncat /etc/passwd"),
+                "/etc/passwd",
+            ),
+            // A bare `$` in a delimiter is literal. Opening no heredoc let the
+            // quote in the body swallow the trailing read.
+            (
+                "cat <<$EOF\necho 'https://example.invalid\n$EOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "cat <<E$HOME\necho 'https://example.invalid\nE$HOME\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
             (
@@ -9242,6 +9265,8 @@ mod tests {
             "cat <<$'E\\x4fF'\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\101F'\nhello\nEAF\nrm -rf ./build",
             concat!("cat <<$'E", r"\077", "F'\nhello\nE?F\nrm -rf ./build"),
+            concat!("cat <<$'E", r"\501", "F'\nhello\nEAF\nrm -rf ./build"),
+            "cat <<$EOF\necho 'https://example.invalid\n$EOF\nrm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",

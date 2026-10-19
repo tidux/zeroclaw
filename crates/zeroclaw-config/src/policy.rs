@@ -1365,9 +1365,10 @@ fn read_heredoc_delimiter(
         return Some(Err(()));
     };
     // A newline in the delimiter is not a one-line terminator (`<<$'E\nF'`
-    // runs to EOF). A carriage return can end a physical line, and the body
-    // matcher compares it before trimming.
-    if delimiter.is_empty() || delimiter.contains('\n') {
+    // runs to EOF). An empty delimiter is the blank line after `<<''`, and a
+    // carriage return can end a physical line. Both are matched before the
+    // body line is trimmed.
+    if delimiter.contains('\n') {
         return Some(Err(()));
     }
     Some(Ok(delimiter))
@@ -1378,6 +1379,7 @@ fn read_heredoc_delimiter(
 /// does not model (`$"..."`, `${...}`, `` `...` ``, `$(...)`), so no body may
 /// be skipped against it.
 fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
+
     let mut delimiter = String::new();
     let mut chars = raw.chars().peekable();
     let mut quote = QuoteState::None;
@@ -1634,7 +1636,11 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         // trimmed away. Any other line is compared after
                         // trimming, which is what `<<-` needs and is also how
                         // an ordinary delimiter ignores surrounding blanks.
-                        let line = if delim.contains('\r') {
+                        // `<<''` ends only at a completely blank line, and
+                        // `<<$'E\rF'` ends at `E<CR>F`. Trimming either would
+                        // miss that terminator and hide the following command.
+                        // `<<-` still strips leading tabs from every line.
+                        let line = if delim.is_empty() || delim.contains('\r') {
                             heredoc_line_buf.as_str()
                         } else {
                             heredoc_line_buf.trim()
@@ -9172,6 +9178,12 @@ mod tests {
                 "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
                 "/etc/passwd",
             ),
+            // `<<''` ends at the next completely blank line. A quote in that
+            // body is data, so it cannot swallow the command after the blank.
+            (
+                "cat <<''\necho 'https://example.invalid\n\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
             (
@@ -9349,6 +9361,7 @@ mod tests {
             ),
             // `$"..."` is not a proven delimiter, so its body is scanned too.
             "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
+            "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",

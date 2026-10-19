@@ -1379,7 +1379,6 @@ fn read_heredoc_delimiter(
 /// does not model (`$"..."`, `${...}`, `` `...` ``, `$(...)`), so no body may
 /// be skipped against it.
 fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
-
     let mut delimiter = String::new();
     let mut chars = raw.chars().peekable();
     let mut quote = QuoteState::None;

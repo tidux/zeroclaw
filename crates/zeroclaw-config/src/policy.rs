@@ -1075,7 +1075,7 @@ struct SegmentFrame {
     /// swallowed the inner terminator, and then skipped the commands after the
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
-    outer_heredocs: Option<VecDeque<(String, bool)>>,
+    outer_heredocs: Option<VecDeque<(Option<String>, bool)>>,
 }
 
 /// Per-frame syntax that changes what a `)` means. Bash parses a whole
@@ -1140,7 +1140,7 @@ fn open_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(String, bool)>,
+    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
     arithmetic: bool,
@@ -1179,7 +1179,7 @@ fn close_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(String, bool)>,
+    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
 ) {
     push_segment(segments, current);
     if let Some(frame) = frames.pop() {
@@ -1202,7 +1202,7 @@ fn toggle_backtick_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(String, bool)>,
+    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
 ) {
     if frames
         .last()
@@ -1564,15 +1564,22 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut top_nest = SegmentNest::default();
     // Inside a `#` comment, until the next newline.
     let mut in_comment = false;
-    // Heredoc state: Some(delim) while inside a heredoc body.
-    let mut heredoc_delimiter: Option<(String, bool)> = None;
+    // Heredoc state: Some(delim) while inside a heredoc body. `None` in the
+    // pair means the opener is a heredoc whose delimiter this scanner cannot
+    // prove. Its body runs to the end of the command, so the text stays data
+    // instead of being parsed as shell.
+    let mut heredoc_delimiter: Option<(Option<String>, bool)> = None;
+    // The command-frame depth that owns an unproven heredoc body. The body
+    // ends when that frame closes, so it cannot hide the command after a
+    // substitution.
+    let mut heredoc_owner: Option<usize> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
     // Delimiters of heredocs opened on the current command line, in order.
     // Their bodies start at the next unquoted newline.
     // A substitution sets this queue aside and starts its own (see
     // `SegmentFrame::outer_heredocs`).
-    let mut pending_heredocs: VecDeque<(String, bool)> = VecDeque::new();
+    let mut pending_heredocs: VecDeque<(Option<String>, bool)> = VecDeque::new();
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -1633,6 +1640,35 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 // delimiter shell would (`\<newline>` joins lines there), which
                 // only scans more text, never less.
                 if let Some((delim, strip_tabs)) = heredoc_delimiter.as_ref() {
+                    // An unproven delimiter has no terminator this scanner can
+                    // match. Bash still treats the following text as body, so
+                    // keep it data through the end of the command. Parsing it
+                    // lets a quote in the body swallow the next command.
+                    if delim.is_none() {
+                        // The body belongs to the command frame that was open
+                        // when it started. A `)` that closes that frame is the
+                        // end of the body, not more body text. Consuming it
+                        // here leaves the substitution open and hides the
+                        // command after it.
+                        if ch == ')'
+                            && heredoc_owner.is_some_and(|owner| frames.len() > owner)
+                            && frames
+                                .last()
+                                .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
+                        {
+                            heredoc_delimiter = None;
+                            heredoc_line_buf.clear();
+                            heredoc_owner = None;
+                            close_segment_frame(
+                                &mut frames,
+                                &mut segments,
+                                &mut current,
+                                &mut quote,
+                                &mut pending_heredocs,
+                            );
+                        }
+                        continue;
+                    }
                     if ch == '\n' {
                         // `<<-` removes leading tabs before the comparison, and
                         // nothing else. A tab-only line is therefore the blank
@@ -1645,7 +1681,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         } else {
                             heredoc_line_buf.as_str()
                         };
-                        if line == delim {
+                        if Some(line) == delim.as_deref() {
                             // Terminator line reached. Start the next queued
                             // heredoc body from the same command line, if any.
                             heredoc_delimiter = pending_heredocs.pop_front();
@@ -1728,6 +1764,10 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     '\n' => {
                         push_segment(&mut segments, &mut current);
                         heredoc_delimiter = pending_heredocs.pop_front();
+                        heredoc_owner = heredoc_delimiter
+                            .as_ref()
+                            .is_some_and(|(delim, _)| delim.is_none())
+                            .then_some(frames.len().saturating_sub(1));
                     }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
@@ -1759,13 +1799,16 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 ) {
                                     // A proven one-line delimiter. Its body is
                                     // data, so it is safe to skip.
-                                    Some(Ok(delimiter)) => pending_heredocs.push_back(delimiter),
+                                    Some(Ok(delimiter)) => {
+                                        pending_heredocs.push_back((Some(delimiter.0), delimiter.1))
+                                    }
                                     // The opener is a heredoc, but its delimiter
-                                    // uses syntax this scanner cannot prove.
-                                    // Skipping those lines is the bypass: a
-                                    // wrong terminator hides every later command.
-                                    // Leave the text in the scan instead.
-                                    Some(Err(())) => {}
+                                    // uses syntax this scanner cannot prove
+                                    // (`$"..."`, an unclosed quote, a newline
+                                    // inside the word). Its body is still data.
+                                    // Leave no terminator to guess at, and skip
+                                    // the rest of the command as body.
+                                    Some(Err(())) => pending_heredocs.push_back((None, false)),
                                     // Not a heredoc (`<<$(cmd)`). The following
                                     // text is ordinary command text.
                                     None => {}
@@ -1830,6 +1873,14 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                 &mut quote,
                                 &mut pending_heredocs,
                             );
+                            // An unproven heredoc body belongs to the command
+                            // frame that was just closed. Continuing it would
+                            // hide the command after the substitution.
+                            if heredoc_owner == Some(frames.len()) {
+                                heredoc_delimiter = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                            }
                         } else {
                             // A `case` pattern terminator, or an unmatched `)`,
                             // ends the word before it without closing a frame.
@@ -9171,8 +9222,9 @@ mod tests {
                 ),
                 "/etc/passwd",
             ),
-            // `$"..."` depends on the locale catalog, so its body is not skipped.
-            // The lines after the opener stay in the scan.
+            // `$"..."` depends on the locale catalog, so its terminator cannot
+            // be proven. The body is still data through the end of the command.
+            // Parsing it lets the quote swallow the following path.
             // `\"` inside a double-quoted delimiter is part of the word.
             (
                 "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; cat /etc/passwd",
@@ -9189,6 +9241,10 @@ mod tests {
             // never matches and hides the following command.
             (
                 "cat <<-''\necho 'https://example.invalid\n\t\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
+            (
+                "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
                 "/etc/passwd",
             ),
             // A carriage return can end a physical line. The body stays data,
@@ -9210,7 +9266,6 @@ mod tests {
                 "cat <<$'E\\;OF'\nhello\nE\\;OF\ncat /etc/passwd",
                 "/etc/passwd",
             ),
-            ("cat <<$\"EOF\"\nhello\nEOF\ncat /etc/passwd", "/etc/passwd"),
             (
                 "cat <<$(echo EOF)\nhello\nEOF\ncat /etc/passwd",
                 "/etc/passwd",
@@ -9308,10 +9363,11 @@ mod tests {
             split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
             vec!["cat <<E\\ OF", "wc -l", "next"]
         );
-        // `$"..."` is locale-dependent, so no body is skipped against it.
+        // `$"..."` is locale-dependent. Its body stays data through the end
+        // of the command, so the lines after the opener are not segments.
         assert_eq!(
             split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            vec!["cat <<$\"EOF\"", "body", "EOF", "next"]
+            vec!["cat <<$\"EOF\""]
         );
     }
 
@@ -9370,10 +9426,10 @@ mod tests {
             "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
             "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
             "cat <<-''\necho 'https://example.invalid\n\t\nrm -rf ./build",
+            "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",
-            "cat <<$\"EOF\"\nhello\nEOF\nrm -rf ./build",
         ] {
             assert_eq!(
                 p.command_risk_level(command),

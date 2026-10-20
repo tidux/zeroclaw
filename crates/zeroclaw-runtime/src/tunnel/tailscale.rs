@@ -1806,63 +1806,58 @@ mod tests {
             "URL should be cleared after stop"
         );
 
-        // Step 3: hold port 443 with a real `tailscale serve` process, then
+        // Step 3: hold port 443 with a real foreground `tailscale serve`, then
         // start again. This must fail with a port-held error and leave no
-        // defunct child.
-        // Start a local HTTP server to proxy to.
-        let holder_server = std::process::Command::new("python3")
-            .args(["-c", "import http.server,socketserver;h=http.server.SimpleHTTPRequestHandler;s=socketserver.TCPServer(('127.0.0.1',19999),h);s.serve_forever()"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn holder HTTP server");
-        // Hold port 443 via tailscale serve.
-        let serve_holder = std::process::Command::new("tailscale")
-            .args(["serve", "--bg", "--https=443", "http://127.0.0.1:19999"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("tailscale serve --bg should succeed");
-        // RAII cleanup guard: releases port 443 and kills the holder server
-        // even if subsequent assertions panic.
-        struct CleanupGuard {
-            holder_server: std::process::Child,
-        }
-        impl Drop for CleanupGuard {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("tailscale")
-                    .args(["serve", "reset"])
-                    .status();
-                self.holder_server.kill().ok();
-                self.holder_server.wait().ok();
-            }
-        }
-        let _guard = CleanupGuard { holder_server };
+        // defunct child. The holder is owned from the moment it is spawned:
+        // dropping it kills and reaps the process, which is also what
+        // withdraws its serve config. `serve reset` is not used — that would
+        // wipe every serve config on the node, including ones this test did
+        // not publish.
+        let holder = spawn_serve(&gateway_serve_args(false, 19999)).expect("spawn port holder");
+        let holder_pid = holder.id().expect("holder pid");
+        let holder = ServeProcess::spawn(Published::Gateway { local_port: 19999 }, holder);
         assert!(
-            serve_holder.success(),
-            "tailscale serve --bg should succeed"
+            holder.is_running(),
+            "port holder exited before it could publish"
         );
-        // Give tailscaled a moment to publish the session.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // The holder must actually own 443 before the conflict is meaningful.
+        // A process that is merely still running may be blocked before applying.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if serve_sessions_for_gateway(19999)
+                    .await
+                    .is_some_and(|sessions| !sessions.is_empty())
+                {
+                    break;
+                }
+                assert!(holder.is_running(), "port holder exited before publishing");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("holder never published an HTTPS proxy on 443");
 
-        let result2 = tunnel.start("127.0.0.1", 42617).await;
-        match result2 {
-            Err(err) => {
-                let err_msg = err.to_string();
-                assert!(
-                    err_msg.contains("listener already exists for port 443"),
-                    "error should mention port 443 conflict, got: {err_msg}"
-                );
-                // No defunct child should remain after the failed start.
-                assert!(
-                    !tunnel.health_check().await,
-                    "no defunct child after failed start"
-                );
-            }
-            Ok(_) => {
-                // If start succeeded unexpectedly (port was released), clean up.
-                tunnel.stop().await.unwrap();
-            }
-        }
+        let err = tunnel
+            .start("127.0.0.1", 42617)
+            .await
+            .expect_err("start() should fail while another session holds port 443");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("listener already exists for port 443"),
+            "error should mention port 443 conflict, got: {err_msg}"
+        );
+        // No defunct child should remain after the failed start.
+        assert!(
+            !tunnel.health_check().await,
+            "no defunct child after failed start"
+        );
+        // The holder is still the session on 443; ending it is what releases
+        // the port for the next run.
+        assert!(holder.is_running(), "port holder died during the conflict");
+        holder.shutdown().await;
+        assert!(
+            !process_exists(holder_pid),
+            "port holder pid {holder_pid} left running"
+        );
     }
 }

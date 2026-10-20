@@ -1546,7 +1546,20 @@ fn decode_hex_escape(
 /// unbalanced or a `case` pattern ends in `)`. A misparse can over-split a
 /// command but cannot drop text from the scan. Segments are returned in the
 /// order they end, so an inner command comes before the command containing it.
+/// A heredoc whose delimiter this scanner cannot prove. Its body is data, but
+/// the commands after the real terminator still run. Skipping them hides a
+/// forbidden path, and parsing them lets a quote in the body swallow the next
+/// command. Either guess is a bypass, so the command is refused.
+struct UnreadableHeredoc;
+
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+}
+
+fn split_unquoted_segments_checked(
+    command: &str,
+    dialect: ShellDialect,
+) -> Result<Vec<String>, UnreadableHeredoc> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1827,10 +1840,9 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                                     // The opener is a heredoc, but its delimiter
                                     // uses syntax this scanner cannot prove
                                     // (`$"..."`, an unclosed quote, a newline
-                                    // inside the word). Its body is still data.
-                                    // Leave no terminator to guess at, and skip
-                                    // the rest of the command as body.
-                                    Some(Err(())) => pending_heredocs.push_back((None, false)),
+                                    // inside the word). There is no safe body
+                                    // boundary to guess, so refuse the command.
+                                    Some(Err(())) => return Err(UnreadableHeredoc),
                                     // Not a heredoc (`<<$(cmd)`). The following
                                     // text is ordinary command text.
                                     None => {}
@@ -1936,7 +1948,7 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
         }
     }
 
-    segments
+    Ok(segments)
 }
 
 #[derive(Clone, Copy)]
@@ -3899,7 +3911,12 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command, dialect) {
+        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+            // The body boundary cannot be proven, so the risk of the commands
+            // after it cannot be proven either.
+            return CommandRiskLevel::High;
+        };
+        for segment in segments {
             let cmd_part = skip_env_assignments(&segment);
             let normalized = normalized_shell_command(&segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -4273,7 +4290,10 @@ impl SecurityPolicy {
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            return true;
+            // The opt-out skips syntax restrictions, but not a heredoc whose
+            // body boundary cannot be proven. The path and risk checks refuse
+            // that command for the same reason.
+            return split_unquoted_segments_checked(command, dialect).is_ok();
         }
 
         if command.contains('`')
@@ -4468,6 +4488,11 @@ impl SecurityPolicy {
         dialect: ShellDialect,
         resolve_workspace: bool,
     ) -> Option<String> {
+        if split_unquoted_segments_checked(command, dialect).is_err() {
+            // Name the opener rather than a path. The shell wrapper refuses
+            // any `Some`, and guessing which later command runs is the bypass.
+            return Some("unreadable heredoc delimiter".into());
+        }
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -9267,14 +9292,14 @@ mod tests {
             ),
             (
                 "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
-                "/etc/passwd",
+                "unreadable heredoc delimiter",
             ),
             // At top level the unproven body has no frame to close it. The
             // opener line stays data, and the lines after it are scanned
             // without treating a quote in the body as syntax.
             (
                 "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\ncat /etc/passwd",
-                "/etc/passwd",
+                "unreadable heredoc delimiter",
             ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
@@ -9392,11 +9417,11 @@ mod tests {
             split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
             vec!["cat <<E\\ OF", "wc -l", "next"]
         );
-        // `$"..."` is locale-dependent. The opener line is data, and every
-        // later line is scanned rather than discarded through end of command.
-        assert_eq!(
-            split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            vec!["cat <<$\"EOF\"", "EOF", "next"]
+        // `$"..."` is locale-dependent, so the split refuses rather than
+        // guessing which of the following lines are commands.
+        assert!(
+            split_unquoted_segments_checked("cat <<$\"EOF\"\nbody\nEOF\nnext", ShellDialect::Posix)
+                .is_err()
         );
     }
 

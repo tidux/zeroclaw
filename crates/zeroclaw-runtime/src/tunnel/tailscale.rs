@@ -1810,7 +1810,7 @@ mod tests {
         // start again. This must fail with a port-held error and leave no
         // defunct child.
         // Start a local HTTP server to proxy to.
-        let mut holder_server = std::process::Command::new("python3")
+        let holder_server = std::process::Command::new("python3")
             .args(["-c", "import http.server,socketserver;h=http.server.SimpleHTTPRequestHandler;s=socketserver.TCPServer(('127.0.0.1',19999),h);s.serve_forever()"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1823,21 +1823,27 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .expect("tailscale serve --bg should succeed");
+        // RAII cleanup guard: releases port 443 and kills the holder server
+        // even if subsequent assertions panic.
+        struct CleanupGuard {
+            holder_server: std::process::Child,
+        }
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tailscale")
+                    .args(["serve", "reset"])
+                    .status();
+                self.holder_server.kill().ok();
+                self.holder_server.wait().ok();
+            }
+        }
+        let _guard = CleanupGuard { holder_server };
         assert!(
             serve_holder.success(),
             "tailscale serve --bg should succeed"
         );
         // Give tailscaled a moment to publish the session.
         tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Cleanup guard: runs on both success and failure paths.
-        let mut cleanup = || {
-            let _ = std::process::Command::new("tailscale")
-                .args(["serve", "reset"])
-                .status();
-            holder_server.kill().ok();
-            holder_server.wait().ok();
-        };
 
         let result2 = tunnel.start("127.0.0.1", 42617).await;
         match result2 {
@@ -1852,12 +1858,10 @@ mod tests {
                     !tunnel.health_check().await,
                     "no defunct child after failed start"
                 );
-                cleanup();
             }
             Ok(_) => {
                 // If start succeeded unexpectedly (port was released), clean up.
                 tunnel.stop().await.unwrap();
-                cleanup();
             }
         }
     }

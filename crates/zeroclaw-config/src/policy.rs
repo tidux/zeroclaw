@@ -1571,8 +1571,14 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     let mut heredoc_delimiter: Option<(Option<String>, bool)> = None;
     // The command-frame depth that owns an unproven heredoc body. The body
     // ends when that frame closes, so it cannot hide the command after a
-    // substitution.
+    // substitution. `None` means the opener was at top level: its body has no
+    // frame to close it, so the following lines are scanned with quotes
+    // disabled instead of being discarded.
     let mut heredoc_owner: Option<usize> = None;
+    // After a top-level heredoc whose delimiter cannot be proven, quotes in
+    // the remainder are not syntax. A quote in the body must not join the
+    // following command into one word.
+    let mut quotes_are_literal = false;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
     // Delimiters of heredocs opened on the current command line, in order.
@@ -1645,27 +1651,40 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     // keep it data through the end of the command. Parsing it
                     // lets a quote in the body swallow the next command.
                     if delim.is_none() {
-                        // The body belongs to the command frame that was open
-                        // when it started. A `)` that closes that frame is the
-                        // end of the body, not more body text. Consuming it
-                        // here leaves the substitution open and hides the
-                        // command after it.
-                        if ch == ')'
-                            && heredoc_owner.is_some_and(|owner| frames.len() > owner)
-                            && frames
-                                .last()
-                                .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
-                        {
-                            heredoc_delimiter = None;
-                            heredoc_line_buf.clear();
-                            heredoc_owner = None;
-                            close_segment_frame(
-                                &mut frames,
-                                &mut segments,
-                                &mut current,
-                                &mut quote,
-                                &mut pending_heredocs,
-                            );
+                        match heredoc_owner {
+                            // The body belongs to the command frame that was
+                            // open when it started. A `)` that closes that
+                            // frame is the end of the body, not more body text.
+                            Some(owner)
+                                if ch == ')'
+                                    && frames.len() > owner
+                                    && frames.last().is_some_and(|frame| {
+                                        frame.kind == SegmentFrameKind::Paren
+                                    }) =>
+                            {
+                                heredoc_delimiter = None;
+                                heredoc_line_buf.clear();
+                                heredoc_owner = None;
+                                close_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                );
+                            }
+                            // At top level there is no frame to close the body.
+                            // Discarding the rest hides commands bash runs
+                            // after the real terminator. End the opaque line at
+                            // the next newline and scan what follows, but do
+                            // not let a quote in the body join those words.
+                            None if ch == '\n' => {
+                                heredoc_delimiter = None;
+                                heredoc_line_buf.clear();
+                                quotes_are_literal = true;
+                                push_segment(&mut segments, &mut current);
+                            }
+                            _ => {}
                         }
                         continue;
                     }
@@ -1752,11 +1771,11 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                         segment_nest_mut(&mut frames, &mut top_nest).param_depth -= 1;
                         current.push(ch);
                     }
-                    '\'' if single_quotes_are_syntax => {
+                    '\'' if single_quotes_are_syntax && !quotes_are_literal => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
-                    '"' => {
+                    '"' if !quotes_are_literal => {
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
@@ -1764,10 +1783,13 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                     '\n' => {
                         push_segment(&mut segments, &mut current);
                         heredoc_delimiter = pending_heredocs.pop_front();
-                        heredoc_owner = heredoc_delimiter
-                            .as_ref()
-                            .is_some_and(|(delim, _)| delim.is_none())
-                            .then_some(frames.len().saturating_sub(1));
+                        heredoc_owner = match heredoc_delimiter.as_ref() {
+                            // Top level has no frame. `saturating_sub(1)` on an
+                            // empty stack is `Some(0)`, which cannot be told
+                            // apart from a body owned by the outermost frame.
+                            Some((None, _)) if !frames.is_empty() => Some(frames.len() - 1),
+                            _ => None,
+                        };
                     }
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
@@ -9247,6 +9269,13 @@ mod tests {
                 "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; cat /etc/passwd",
                 "/etc/passwd",
             ),
+            // At top level the unproven body has no frame to close it. The
+            // opener line stays data, and the lines after it are scanned
+            // without treating a quote in the body as syntax.
+            (
+                "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
             (
@@ -9363,11 +9392,11 @@ mod tests {
             split("cat <<E\\ OF | wc -l\nbody\nE OF\nnext"),
             vec!["cat <<E\\ OF", "wc -l", "next"]
         );
-        // `$"..."` is locale-dependent. Its body stays data through the end
-        // of the command, so the lines after the opener are not segments.
+        // `$"..."` is locale-dependent. The opener line is data, and every
+        // later line is scanned rather than discarded through end of command.
         assert_eq!(
             split("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            vec!["cat <<$\"EOF\""]
+            vec!["cat <<$\"EOF\"", "EOF", "next"]
         );
     }
 
@@ -9427,6 +9456,7 @@ mod tests {
             "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
             "cat <<-''\necho 'https://example.invalid\n\t\nrm -rf ./build",
             "echo \"$(cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\n)\"; rm -rf ./build",
+            "cat <<$\"EOF\"\necho 'https://example.invalid\nEOF\nrm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",

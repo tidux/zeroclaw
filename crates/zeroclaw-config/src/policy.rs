@@ -1075,7 +1075,7 @@ struct SegmentFrame {
     /// swallowed the inner terminator, and then skipped the commands after the
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
-    outer_heredocs: Option<VecDeque<String>>,
+    outer_heredocs: Option<VecDeque<(String, bool)>>,
 }
 
 /// Per-frame syntax that changes what a `)` means. Bash parses a whole
@@ -1140,7 +1140,7 @@ fn open_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<String>,
+    pending_heredocs: &mut VecDeque<(String, bool)>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
     arithmetic: bool,
@@ -1179,7 +1179,7 @@ fn close_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<String>,
+    pending_heredocs: &mut VecDeque<(String, bool)>,
 ) {
     push_segment(segments, current);
     if let Some(frame) = frames.pop() {
@@ -1202,7 +1202,7 @@ fn toggle_backtick_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<String>,
+    pending_heredocs: &mut VecDeque<(String, bool)>,
 ) {
     if frames
         .last()
@@ -1235,16 +1235,20 @@ fn toggle_backtick_frame(
 /// `None` means this is not a heredoc (`<<$(cmd)`). `Some(Err(()))` means it is
 /// a heredoc whose delimiter this scanner cannot prove. Callers must not skip
 /// lines in that case: a wrong terminator hides every command after the body.
-/// `Some(Ok(delimiter))` is a one-line terminator the body matcher can compare
-/// exactly.
+/// `Some(Ok((delimiter, strip_tabs)))` is a one-line terminator the body matcher
+/// can compare exactly. `strip_tabs` is the `<<-` operator: bash removes leading
+/// tabs from the body and from the terminator line before comparing it.
 fn read_heredoc_delimiter(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     current: &mut String,
     backslash_is_literal: bool,
-) -> Option<Result<String, ()>> {
-    if let Some(dash) = chars.next_if_eq(&'-') {
+) -> Option<Result<(String, bool), ()>> {
+    let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
-    }
+        true
+    } else {
+        false
+    };
     while let Some(blank) = chars.next_if(|ch| matches!(ch, ' ' | '\t')) {
         current.push(blank);
     }
@@ -1371,7 +1375,7 @@ fn read_heredoc_delimiter(
     if delimiter.contains('\n') {
         return Some(Err(()));
     }
-    Some(Ok(delimiter))
+    Some(Ok((delimiter, strip_tabs)))
 }
 
 /// Apply shell quote removal to a heredoc delimiter word, including bash
@@ -1561,14 +1565,14 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
     // Inside a `#` comment, until the next newline.
     let mut in_comment = false;
     // Heredoc state: Some(delim) while inside a heredoc body.
-    let mut heredoc_delimiter: Option<String> = None;
+    let mut heredoc_delimiter: Option<(String, bool)> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
     // Delimiters of heredocs opened on the current command line, in order.
     // Their bodies start at the next unquoted newline.
     // A substitution sets this queue aside and starts its own (see
     // `SegmentFrame::outer_heredocs`).
-    let mut pending_heredocs: VecDeque<String> = VecDeque::new();
+    let mut pending_heredocs: VecDeque<(String, bool)> = VecDeque::new();
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -1628,21 +1632,18 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
                 // body this can end the heredoc earlier than an unquoted-
                 // delimiter shell would (`\<newline>` joins lines there), which
                 // only scans more text, never less.
-                if let Some(delim) = heredoc_delimiter.as_deref() {
+                if let Some((delim, strip_tabs)) = heredoc_delimiter.as_ref() {
                     if ch == '\n' {
-                        // A carriage return is part of the terminator
-                        // (`<<$'E\rF'` ends at the line `E<CR>F`) and is not
-                        // trimmed away. Any other line is compared after
-                        // trimming, which is what `<<-` needs and is also how
-                        // an ordinary delimiter ignores surrounding blanks.
-                        // `<<''` ends only at a completely blank line, and
-                        // `<<$'E\rF'` ends at `E<CR>F`. Trimming either would
-                        // miss that terminator and hide the following command.
-                        // `<<-` still strips leading tabs from every line.
-                        let line = if delim.is_empty() || delim.contains('\r') {
-                            heredoc_line_buf.as_str()
+                        // `<<-` removes leading tabs before the comparison, and
+                        // nothing else. A tab-only line is therefore the blank
+                        // terminator of `<<-''`. Trimming spaces, or ignoring
+                        // the dash, misses that terminator and hides the
+                        // following command. A carriage return stays part of
+                        // the line (`<<$'E\rF'` ends at `E<CR>F`).
+                        let line = if *strip_tabs {
+                            heredoc_line_buf.trim_start_matches('\t')
                         } else {
-                            heredoc_line_buf.trim()
+                            heredoc_line_buf.as_str()
                         };
                         if line == delim {
                             // Terminator line reached. Start the next queued
@@ -9183,6 +9184,13 @@ mod tests {
                 "cat <<''\necho 'https://example.invalid\n\ncat /etc/passwd",
                 "/etc/passwd",
             ),
+            // `<<-` strips leading tabs before comparing the terminator. A
+            // tab-only line ends `<<-''`; leaving the tab in the comparison
+            // never matches and hides the following command.
+            (
+                "cat <<-''\necho 'https://example.invalid\n\t\ncat /etc/passwd",
+                "/etc/passwd",
+            ),
             // A carriage return can end a physical line. The body stays data,
             // so a quote in it cannot swallow the command after the terminator.
             (
@@ -9361,6 +9369,7 @@ mod tests {
             // `$"..."` is not a proven delimiter, so its body is scanned too.
             "echo \"$(cat <<\"E\\\" F\"\nhello\nE\" F\n)\"; rm -rf ./build",
             "cat <<''\necho 'https://example.invalid\n\nrm -rf ./build",
+            "cat <<-''\necho 'https://example.invalid\n\t\nrm -rf ./build",
             "cat <<$'E\\rF'\necho 'https://example.invalid\nE\rF\nrm -rf ./build",
             "cat <<\\EOF\nhello\nEOF\nrm -rf ./build",
             "cat <<$'E\\ OF'\nhello\nE\\ OF\nrm -rf ./build",

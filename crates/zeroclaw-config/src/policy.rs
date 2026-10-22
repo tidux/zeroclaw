@@ -1043,6 +1043,25 @@ enum QuoteState {
     Double,
 }
 
+/// A heredoc queued on a command line, waiting for its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeredocDelimiter {
+    /// The terminator line, or `None` when it cannot be proven.
+    terminator: Option<String>,
+    /// `<<-`: leading tabs are removed from the start of each logical line
+    /// before it is compared.
+    strip_tabs: bool,
+    /// The delimiter word was unquoted, so the body is expanded: a line
+    /// ending in an odd number of backslashes continues onto the next one.
+    joins_lines: bool,
+}
+
+/// Whether a heredoc body line ends in a backslash that continues it onto the
+/// next line: an odd number of trailing backslashes (`\\` is an escaped one).
+fn ends_with_line_continuation(line: &str) -> bool {
+    line.bytes().rev().take_while(|&byte| byte == b'\\').count() % 2 == 1
+}
+
 /// What closes an open [`SegmentFrame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentFrameKind {
@@ -1075,7 +1094,7 @@ struct SegmentFrame {
     /// swallowed the inner terminator, and then skipped the commands after the
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
-    outer_heredocs: Option<VecDeque<(Option<String>, bool)>>,
+    outer_heredocs: Option<VecDeque<HeredocDelimiter>>,
     /// For a `$((` frame: text of the expression, held back until the frame
     /// closes. It runs no command only if the expression is confirmed.
     arithmetic_text: Vec<String>,
@@ -1204,7 +1223,7 @@ fn open_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
     arithmetic: bool,
@@ -1278,7 +1297,7 @@ fn close_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
 ) {
     emit_segment(frames, segments, current);
     if let Some(frame) = pop_segment_frame(frames, segments) {
@@ -1303,7 +1322,7 @@ fn open_backtick_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
 ) {
     open_segment_frame(
         frames,
@@ -1329,8 +1348,8 @@ fn open_backtick_frame(
 /// `None` means this is not a heredoc (`<<$(cmd)`). `Some(Err(()))` means it is
 /// a heredoc whose delimiter this scanner cannot prove. Callers must not skip
 /// lines in that case: a wrong terminator hides every command after the body.
-/// `Some(Ok((delimiter, strip_tabs)))` is a one-line terminator the body matcher
-/// can compare exactly. `strip_tabs` is the `<<-` operator: bash removes leading
+/// `Some(Ok(delimiter))` is a one-line terminator the body matcher can compare
+/// exactly. `strip_tabs` is the `<<-` operator: bash removes leading
 /// tabs from the body and from the terminator line before comparing it.
 ///
 /// `in_backtick` means a backtick substitution is open. The shell cuts its
@@ -1342,7 +1361,7 @@ fn read_heredoc_delimiter(
     current: &mut String,
     backslash_is_literal: bool,
     in_backtick: bool,
-) -> Option<Result<(String, bool), ()>> {
+) -> Option<Result<HeredocDelimiter, ()>> {
     let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
         true
@@ -1479,7 +1498,14 @@ fn read_heredoc_delimiter(
     if delimiter.contains('\n') {
         return Some(Err(()));
     }
-    Some(Ok((delimiter, strip_tabs)))
+    // Any quoting in the word (`'`, `"`, `\`) leaves the body unexpanded, so
+    // its backslash-newlines stay literal.
+    let joins_lines = !raw.contains(['\'', '"', '\\']);
+    Some(Ok(HeredocDelimiter {
+        terminator: Some(delimiter),
+        strip_tabs,
+        joins_lines,
+    }))
 }
 
 /// Apply shell quote removal to a heredoc delimiter word. `None` means the
@@ -1608,7 +1634,7 @@ fn scan_unquoted_segments(
     // pair means the opener is a heredoc whose delimiter this scanner cannot
     // prove. Its body runs to the end of the command, so the text stays data
     // instead of being parsed as shell.
-    let mut heredoc_delimiter: Option<(Option<String>, bool)> = None;
+    let mut heredoc_delimiter: Option<HeredocDelimiter> = None;
     // The command-frame depth that owns an unproven heredoc body. The body
     // ends when that frame closes, so it cannot hide the command after a
     // substitution. `None` means the opener was at top level: its body has no
@@ -1621,11 +1647,14 @@ fn scan_unquoted_segments(
     let mut quotes_are_literal = false;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
     let mut heredoc_line_buf = String::new();
+    // The joined text of a logical body line whose physical lines so far each
+    // ended in a line continuation (unquoted delimiters only).
+    let mut heredoc_logical_line: Option<String> = None;
     // Delimiters of heredocs opened on the current command line, in order.
     // Their bodies start at the next unquoted newline.
     // A substitution sets this queue aside and starts its own (see
     // `SegmentFrame::outer_heredocs`).
-    let mut pending_heredocs: VecDeque<(Option<String>, bool)> = VecDeque::new();
+    let mut pending_heredocs: VecDeque<HeredocDelimiter> = VecDeque::new();
     // Backslash state for finding a backtick's closer, which ignores quotes,
     // comments, and heredoc bodies (see the backtick check below).
     let mut backtick_escaped = false;
@@ -1664,6 +1693,7 @@ fn scan_unquoted_segments(
                 in_comment = false;
                 escaped = false;
                 heredoc_delimiter = None;
+                heredoc_logical_line = None;
                 heredoc_line_buf.clear();
                 if heredoc_owner.is_some_and(|owner| owner >= frames.len()) {
                     heredoc_owner = None;
@@ -1723,12 +1753,16 @@ fn scan_unquoted_segments(
                 current.push(ch);
             }
             QuoteState::None => {
-                // Heredoc bodies and comments are line-based and come first:
-                // a backslash cannot extend either past its newline. Inside a
-                // body this can end the heredoc earlier than an unquoted-
-                // delimiter shell would (`\<newline>` joins lines there), which
-                // only scans more text, never less.
-                if let Some((delim, strip_tabs)) = heredoc_delimiter.as_ref() {
+                // Heredoc bodies and comments are line-based and come first. A
+                // backslash cannot extend a comment past its newline. In the
+                // body of an unquoted delimiter it can: the terminator is
+                // compared against logical lines (see below).
+                if let Some(HeredocDelimiter {
+                    terminator: delim,
+                    strip_tabs,
+                    joins_lines,
+                }) = heredoc_delimiter.as_ref()
+                {
                     // An unproven delimiter has no terminator this scanner can
                     // match. Bash still treats the following text as body, so
                     // keep it data through the end of the command. Parsing it
@@ -1746,6 +1780,7 @@ fn scan_unquoted_segments(
                                     }) =>
                             {
                                 heredoc_delimiter = None;
+                                heredoc_logical_line = None;
                                 heredoc_line_buf.clear();
                                 heredoc_owner = None;
                                 close_segment_frame(
@@ -1763,6 +1798,7 @@ fn scan_unquoted_segments(
                             // not let a quote in the body join those words.
                             None if ch == '\n' => {
                                 heredoc_delimiter = None;
+                                heredoc_logical_line = None;
                                 heredoc_line_buf.clear();
                                 quotes_are_literal = true;
                                 push_segment(&mut segments, &mut current);
@@ -1778,19 +1814,45 @@ fn scan_unquoted_segments(
                         // the dash, misses that terminator and hides the
                         // following command. A carriage return stays part of
                         // the line (`<<$'E\rF'` ends at `E<CR>F`).
-                        let line = if *strip_tabs {
-                            heredoc_line_buf.trim_start_matches('\t')
-                        } else {
-                            heredoc_line_buf.as_str()
+                        //
+                        // An unquoted delimiter's body is expanded, so a line
+                        // ending in an odd number of backslashes continues onto
+                        // the next one. Tabs are stripped only at the start of
+                        // the logical line. A physical line after a continued
+                        // one is never a terminator on its own, in bash or
+                        // dash: ending the body there let a quote in the real
+                        // body swallow a later command.
+                        let physical = std::mem::take(&mut heredoc_line_buf);
+                        let continued_from = heredoc_logical_line.take();
+                        let line = match &continued_from {
+                            None if *strip_tabs => physical.trim_start_matches('\t'),
+                            _ => physical.as_str(),
                         };
-                        if Some(line) == delim.as_deref() {
+                        if *joins_lines && ends_with_line_continuation(line) {
+                            let mut joined = continued_from.unwrap_or_default();
+                            joined.push_str(&line[..line.len() - 1]);
+                            heredoc_logical_line = Some(joined);
+                            continue;
+                        }
+                        let ends = match continued_from {
+                            None => Some(line) == delim.as_deref(),
+                            // Bash compares the joined line and ends the body
+                            // when it spells the terminator (`EO\` then `F`).
+                            // Dash only compares a line that starts a logical
+                            // line, so it reads on. Either guess hides the
+                            // commands that follow from the other shell.
+                            Some(prefix) => {
+                                if delim.as_deref() == Some(format!("{prefix}{line}").as_str()) {
+                                    return Err(UnreadableHeredoc);
+                                }
+                                false
+                            }
+                        };
+                        if ends {
                             // Terminator line reached. Start the next queued
                             // heredoc body from the same command line, if any.
                             heredoc_delimiter = pending_heredocs.pop_front();
-                            heredoc_line_buf.clear();
                             push_segment(&mut segments, &mut current);
-                        } else {
-                            heredoc_line_buf.clear();
                         }
                     } else {
                         heredoc_line_buf.push(ch);
@@ -1874,7 +1936,9 @@ fn scan_unquoted_segments(
                             // Top level has no frame. `saturating_sub(1)` on an
                             // empty stack is `Some(0)`, which cannot be told
                             // apart from a body owned by the outermost frame.
-                            Some((None, _)) if !frames.is_empty() => Some(frames.len() - 1),
+                            Some(HeredocDelimiter {
+                                terminator: None, ..
+                            }) if !frames.is_empty() => Some(frames.len() - 1),
                             _ => None,
                         };
                     }
@@ -1923,9 +1987,7 @@ fn scan_unquoted_segments(
                                 ) {
                                     // A proven one-line delimiter. Its body is
                                     // data, so it is safe to skip.
-                                    Some(Ok(delimiter)) => {
-                                        pending_heredocs.push_back((Some(delimiter.0), delimiter.1))
-                                    }
+                                    Some(Ok(delimiter)) => pending_heredocs.push_back(delimiter),
                                     // The opener is a heredoc, but its delimiter
                                     // uses syntax this scanner cannot prove
                                     // (`$"..."`, an unclosed quote, a newline
@@ -2026,6 +2088,7 @@ fn scan_unquoted_segments(
                             // hide the command after the substitution.
                             if heredoc_owner == Some(frames.len()) {
                                 heredoc_delimiter = None;
+                                heredoc_logical_line = None;
                                 heredoc_line_buf.clear();
                                 heredoc_owner = None;
                             }
@@ -9784,6 +9847,66 @@ mod tests {
                 "{high}"
             );
             assert!(!risk.is_command_allowed(command), "{command}");
+        }
+    }
+
+    /// The body of an unquoted heredoc is expanded, so a line ending in an odd
+    /// number of backslashes continues onto the next one. Bash compares the
+    /// joined line with the terminator; dash compares only a physical line
+    /// that starts a logical line. A physical line after a continued one is a
+    /// terminator to neither.
+    #[test]
+    fn heredoc_terminators_follow_line_continuation() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        // Bash joins these into the terminator and runs the next line; dash
+        // reads on. The shells disagree, so the command is refused.
+        for command in [
+            "cat <<EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nE\\\nO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<EOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+        ] {
+            assert_eq!(
+                posix(command),
+                Some("unreadable heredoc delimiter".into()),
+                "{command:?}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high:?}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command:?}");
+        }
+        // Both shells read on past a physical `EOF` that continues a line, so
+        // the quote in the real body is data and the read after it runs.
+        assert_eq!(
+            posix("cat <<EOF\nbody \\\nEOF\necho 'x\nEOF\nwc -l /etc/passwd #'"),
+            Some("/etc/passwd".into())
+        );
+        // No join: the whole read is body in both shells.
+        for command in [
+            // Quoted delimiters leave backslash-newlines literal.
+            "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"EOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\\EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            // An even number of backslashes is an escaped backslash.
+            "cat <<EOF\nEO\\\\\nF\nwc -l /etc/passwd\nEOF",
+            // `<<-` strips tabs only at the start of the logical line.
+            "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
+            // A continued line that does not spell the terminator.
+            "cat <<EOF\nE\\\n OF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(posix(command), None, "{command:?}");
         }
     }
 

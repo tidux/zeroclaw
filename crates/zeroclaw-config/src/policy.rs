@@ -1649,7 +1649,11 @@ fn scan_unquoted_segments(
     let mut heredoc_line_buf = String::new();
     // The joined text of a logical body line whose physical lines so far each
     // ended in a line continuation (unquoted delimiters only).
-    let mut heredoc_logical_line: Option<String> = None;
+    // A logical body line in progress (unquoted delimiters only): the joined
+    // text of its physical lines so far, each of which ended in a line
+    // continuation, and whether dash is still at the start of the line
+    // (every line so far was exactly `\`). `None` at the start of a line.
+    let mut heredoc_logical_line: Option<(String, bool)> = None;
     // Delimiters of heredocs opened on the current command line, in order.
     // Their bodies start at the next unquoted newline.
     // A substitution sets this queue aside and starts its own (see
@@ -1817,37 +1821,49 @@ fn scan_unquoted_segments(
                         //
                         // An unquoted delimiter's body is expanded, so a line
                         // ending in an odd number of backslashes continues onto
-                        // the next one. Tabs are stripped only at the start of
-                        // the logical line. A physical line after a continued
-                        // one is never a terminator on its own, in bash or
-                        // dash: ending the body there let a quote in the real
-                        // body swallow a later command.
+                        // the next one, and the shells find the terminator
+                        // differently (both checked against bash 3.2 to 5.3 and
+                        // dash 0.5.12):
+                        // - Bash joins the physical lines and compares the
+                        //   logical line. `<<-` strips leading tabs from each
+                        //   physical line while the joined text is still empty.
+                        // - Dash, at the start of a line, skips lines that are
+                        //   exactly `\`, strips tabs, and compares the rest of
+                        //   that one physical line. It joins nothing else.
+                        // Both end at `\` then `EOF`, and neither at `body \`
+                        // then `EOF`, where ending let a quote in the real body
+                        // swallow a later command. Where only one ends (`EO\`
+                        // then `F`), either guess hides the following commands
+                        // from the other shell, so the command is refused.
                         let physical = std::mem::take(&mut heredoc_line_buf);
-                        let continued_from = heredoc_logical_line.take();
-                        let line = match &continued_from {
-                            None if *strip_tabs => physical.trim_start_matches('\t'),
-                            _ => physical.as_str(),
-                        };
-                        if *joins_lines && ends_with_line_continuation(line) {
-                            let mut joined = continued_from.unwrap_or_default();
-                            joined.push_str(&line[..line.len() - 1]);
-                            heredoc_logical_line = Some(joined);
-                            continue;
-                        }
-                        let ends = match continued_from {
-                            None => Some(line) == delim.as_deref(),
-                            // Bash compares the joined line and ends the body
-                            // when it spells the terminator (`EO\` then `F`).
-                            // Dash only compares a line that starts a logical
-                            // line, so it reads on. Either guess hides the
-                            // commands that follow from the other shell.
-                            Some(prefix) => {
-                                if delim.as_deref() == Some(format!("{prefix}{line}").as_str()) {
-                                    return Err(UnreadableHeredoc);
-                                }
-                                false
+                        let (prefix, dash_at_line_start) =
+                            heredoc_logical_line.take().unwrap_or((String::new(), true));
+                        let strip = |line: &'_ str| -> String {
+                            if *strip_tabs {
+                                line.trim_start_matches('\t').to_string()
+                            } else {
+                                line.to_string()
                             }
                         };
+                        let bash_line = if prefix.is_empty() {
+                            strip(&physical)
+                        } else {
+                            physical.clone()
+                        };
+                        if *joins_lines && ends_with_line_continuation(&bash_line) {
+                            let joined = format!("{prefix}{}", &bash_line[..bash_line.len() - 1]);
+                            heredoc_logical_line =
+                                Some((joined, dash_at_line_start && physical == "\\"));
+                            continue;
+                        }
+                        let bash_ends =
+                            delim.as_deref() == Some(format!("{prefix}{bash_line}").as_str());
+                        let dash_ends = dash_at_line_start
+                            && delim.as_deref() == Some(strip(&physical).as_str());
+                        if bash_ends != dash_ends {
+                            return Err(UnreadableHeredoc);
+                        }
+                        let ends = bash_ends;
                         if ends {
                             // Terminator line reached. Start the next queued
                             // heredoc body from the same command line, if any.
@@ -9852,9 +9868,10 @@ mod tests {
 
     /// The body of an unquoted heredoc is expanded, so a line ending in an odd
     /// number of backslashes continues onto the next one. Bash compares the
-    /// joined line with the terminator; dash compares only a physical line
-    /// that starts a logical line. A physical line after a continued one is a
-    /// terminator to neither.
+    /// joined line, stripping `<<-` tabs while it is still empty. Dash skips
+    /// lines that are exactly `\` at the start of a line and compares the
+    /// next physical line alone. Each case was run in bash 3.2 through 5.3
+    /// and dash 0.5.12.
     #[test]
     fn heredoc_terminators_follow_line_continuation() {
         let p = unix_forbidden_path_policy();
@@ -9873,6 +9890,12 @@ mod tests {
             "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
             "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
             "echo \"$(cat <<EOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
+            // Bash strips the tab before an empty continuation and ends at
+            // `EOF`; dash does not skip a tab-indented `\` line.
+            "cat <<-EOF\n\t\\\nEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\t\\\n\tEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\\\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
         ] {
             assert_eq!(
                 posix(command),
@@ -9886,6 +9909,15 @@ mod tests {
                 "{high:?}"
             );
             assert!(!risk.is_command_allowed(command), "{command:?}");
+        }
+        // Both shells end at a terminator after lines that are exactly `\`,
+        // with `<<-` tabs stripped from it, and run the read that follows.
+        for command in [
+            "cat <<-EOF\n\\\n\tEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\nEOF\nwc -l /etc/passwd",
+            "cat <<EOF\n\\\n\\\nEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command:?}");
         }
         // Both shells read on past a physical `EOF` that continues a line, so
         // the quote in the real body is data and the read after it runs.
@@ -9905,6 +9937,7 @@ mod tests {
             "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
             // A continued line that does not spell the terminator.
             "cat <<EOF\nE\\\n OF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\n \\\nEOF\nwc -l /etc/passwd\nEOF",
         ] {
             assert_eq!(posix(command), None, "{command:?}");
         }

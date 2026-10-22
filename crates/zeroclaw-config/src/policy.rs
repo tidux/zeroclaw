@@ -1864,9 +1864,11 @@ fn scan_unquoted_segments(
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
-                    ';' => push_segment(&mut segments, &mut current),
+                    // Separators inside `$((...))` (`&&`, `||`, newlines) end
+                    // text held for the expression, not command segments.
+                    ';' => emit_segment(&mut frames, &mut segments, &mut current),
                     '\n' => {
-                        push_segment(&mut segments, &mut current);
+                        emit_segment(&mut frames, &mut segments, &mut current);
                         heredoc_delimiter = pending_heredocs.pop_front();
                         heredoc_owner = match heredoc_delimiter.as_ref() {
                             // Top level has no frame. `saturating_sub(1)` on an
@@ -1880,12 +1882,12 @@ fn scan_unquoted_segments(
                         if chars.next_if_eq(&'|').is_some() {
                             // Consume full `||`; both characters are separators.
                         }
-                        push_segment(&mut segments, &mut current);
+                        emit_segment(&mut frames, &mut segments, &mut current);
                     }
                     '&' => {
                         if chars.next_if_eq(&'&').is_some() {
                             // `&&` is a separator; single `&` is handled separately.
-                            push_segment(&mut segments, &mut current);
+                            emit_segment(&mut frames, &mut segments, &mut current);
                         } else {
                             current.push(ch);
                         }
@@ -9668,6 +9670,10 @@ mod tests {
             "echo $((10 / 2))",
             "echo $(( (a + b) / 2 ))",
             "x=$(( $(wc -l < input.txt) / 2 ))",
+            // Separators inside the expression do not end a command there.
+            "echo \"$(( total /\n count ))\"",
+            "echo $(( a / 2 || b / 2 ))",
+            "echo $(( a / 2 && b / 2 ))",
         ] {
             assert_eq!(posix(command), None, "{command}");
             assert_eq!(
@@ -9684,6 +9690,9 @@ mod tests {
             "x=$((true) ; cat /etc/passwd)",
             "x=\"$((true)|cat /etc/passwd)\"",
             "((cat /etc/passwd))",
+            // Unconfirmed text keeps every separated command.
+            "x=$((true) ; cat /etc/passwd\n)",
+            "x=$((true) && cat /etc/passwd)",
         ] {
             assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
         }

@@ -1063,8 +1063,8 @@ struct SegmentFrame {
     /// Quote state of the enclosing word: command substitution also opens
     /// inside double quotes.
     resume_quote: QuoteState,
-    /// Set while this frame is read as `$((...))` or `((...))` arithmetic.
-    arithmetic: Option<ArithmeticFrame>,
+    /// Inside `$((...))`, where `<<` is a shift rather than a heredoc.
+    arithmetic: bool,
     /// Syntax state of the commands inside this frame.
     nest: SegmentNest,
     /// The enclosing heredoc queue, set aside while a substitution is open.
@@ -1077,33 +1077,6 @@ struct SegmentFrame {
     /// subshell, which shares the enclosing queue just as both shells do.
     outer_heredocs: Option<VecDeque<(Option<String>, bool)>>,
 }
-
-/// An open `$((` or `((` that is read as arithmetic until it proves otherwise.
-///
-/// Bash and dash decide the same way: they match the second `(` naively, and
-/// the expression is arithmetic only if `)` follows that match at once. Then
-/// `<<` is a shift, `#` and `case` are not syntax, and the text runs no
-/// command, so it is not scanned (`$(( total / count ))` names no path).
-/// Command and backtick substitutions inside it are ordinary shell syntax and
-/// open their own frames. Otherwise (`$((cd a && make) 2>&1)`) the text is a
-/// command substitution or subshell holding a subshell, and the scan restarts
-/// from the second `(` to read it as commands.
-struct ArithmeticFrame {
-    /// Unmatched `(` inside the expression, after the opening `((`.
-    depth: usize,
-    /// Byte offset of the second `(`, where a non-arithmetic rescan starts.
-    restart: usize,
-    /// Segments ended before the frame opened. A rescan regenerates the rest.
-    segments_len: usize,
-    /// The heredoc queue when the frame opened. `((` shares the enclosing
-    /// queue, so a rescan must not lose a body the arithmetic read consumed.
-    pending_heredocs: VecDeque<(Option<String>, bool)>,
-}
-
-/// Rescans after a `((` that is not arithmetic. Each rescan can try the
-/// nested `((` openers again, so deep nesting could otherwise cost
-/// exponential time. Real commands need at most a few.
-const MAX_ARITHMETIC_RESCANS: usize = 64;
 
 /// Per-frame syntax that changes what a `)` means. Bash parses a whole
 /// substitution before running it, so a `case` pattern's `)` or a `)` inside
@@ -1129,33 +1102,21 @@ fn segment_nest_mut<'a>(
 }
 
 /// Track `case`/`esac` keywords as the word in `current` ends. A keyword only
-/// counts in command position: first in the simple command, or after reserved
-/// words and prefixes that can precede a command (`then case`, `do case`,
-/// `coproc case`, `time -p case`). A lone `&` ends a command without ending
-/// the segment, so the word after it is in command position too
-/// (`true & case`). Missing a `case` lets its pattern `)` close the
-/// substitution early, and counting one bash never opens hides the real
-/// closer. Either one restores the enclosing quote over commands bash runs.
+/// counts in command position: first in the segment, or after reserved words
+/// that can precede a command (`then case`, `do case`).
 fn note_case_keyword(current: &str, nest: &mut SegmentNest) {
     if !current.ends_with(|c: char| !c.is_whitespace()) {
         return;
     }
-    let command = &current[background_command_start(current)..];
-    let mut words = command.split_whitespace();
+    let mut words = current.split_whitespace();
     let Some(last) = words.next_back() else {
         return;
     };
-    let mut previous = None;
     if !words.all(|word| {
-        let prefix = match word {
-            "!" | "{" | "coproc" | "do" | "elif" | "else" | "if" | "then" | "time" | "until"
-            | "while" => true,
-            // `time -p` and `time -p --` still time a pipeline.
-            "-p" | "--" => matches!(previous, Some("time" | "-p")),
-            _ => false,
-        };
-        previous = Some(word);
-        prefix
+        matches!(
+            word,
+            "!" | "{" | "do" | "elif" | "else" | "if" | "then" | "time" | "until" | "while"
+        )
     }) {
         return;
     }
@@ -1164,34 +1125,6 @@ fn note_case_keyword(current: &str, nest: &mut SegmentNest) {
         "esac" => nest.case_depth = nest.case_depth.saturating_sub(1),
         _ => {}
     }
-}
-
-/// Byte offset just past the last `&` in `current` that is a control operator
-/// rather than part of a redirection (`>&`, `<&`, `&>`) or escaped. A quoted
-/// `&` can be mistaken for one, but the closing quote then sits in a word
-/// before the keyword, and no reserved word contains a quote.
-fn background_command_start(current: &str) -> usize {
-    let bytes = current.as_bytes();
-    let mut start = 0;
-    for (index, &byte) in bytes.iter().enumerate() {
-        if byte != b'&' {
-            continue;
-        }
-        let before = index.checked_sub(1).and_then(|i| bytes.get(i));
-        let backslashes = bytes[..index]
-            .iter()
-            .rev()
-            .take_while(|&&b| b == b'\\')
-            .count();
-        if matches!(before, Some(b'>' | b'<'))
-            || bytes.get(index + 1) == Some(&b'>')
-            || backslashes % 2 == 1
-        {
-            continue;
-        }
-        start = index + 1;
-    }
-    start
 }
 
 fn push_segment(segments: &mut Vec<String>, current: &mut String) {
@@ -1210,7 +1143,7 @@ fn open_segment_frame(
     pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
-    arithmetic_restart: Option<usize>,
+    arithmetic: bool,
 ) {
     let resume = match placeholder {
         Some(placeholder) => {
@@ -1223,38 +1156,22 @@ fn open_segment_frame(
             None
         }
     };
-    let outer_heredocs = placeholder
-        .is_some()
-        .then(|| std::mem::take(pending_heredocs));
+    // Arithmetic carries into the parentheses of an arithmetic expression,
+    // but a command substitution or backtick inside it is ordinary shell
+    // syntax again (heredocs included).
+    let arithmetic = arithmetic
+        || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
     frames.push(SegmentFrame {
         kind,
         resume,
         resume_quote: *quote,
-        arithmetic: arithmetic_restart.map(|restart| ArithmeticFrame {
-            depth: 0,
-            restart,
-            segments_len: segments.len(),
-            pending_heredocs: pending_heredocs.clone(),
-        }),
+        arithmetic,
         nest: SegmentNest::default(),
-        outer_heredocs,
+        outer_heredocs: placeholder
+            .is_some()
+            .then(|| std::mem::take(pending_heredocs)),
     });
     *quote = QuoteState::None;
-}
-
-/// After the first `(` of `$(` or a grouping `(`: if a second `(` follows,
-/// consume it and return its byte offset, so the frame opens as arithmetic
-/// and can restart there if it is not.
-fn take_arithmetic_open(
-    command: &str,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Option<usize> {
-    if chars.peek() != Some(&'(') {
-        return None;
-    }
-    let remaining: usize = chars.clone().map(char::len_utf8).sum();
-    chars.next();
-    Some(command.len() - remaining)
 }
 
 fn close_segment_frame(
@@ -1279,6 +1196,33 @@ fn close_segment_frame(
     }
 }
 
+/// Open a backtick substitution, or close the innermost one if it is open.
+fn toggle_backtick_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+    current: &mut String,
+    quote: &mut QuoteState,
+    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+) {
+    if frames
+        .last()
+        .is_some_and(|frame| frame.kind == SegmentFrameKind::Backtick)
+    {
+        close_segment_frame(frames, segments, current, quote, pending_heredocs);
+    } else {
+        open_segment_frame(
+            frames,
+            segments,
+            current,
+            quote,
+            pending_heredocs,
+            SegmentFrameKind::Backtick,
+            Some("``"),
+            false,
+        );
+    }
+}
+
 /// Read the delimiter word after `<<` (or `<<-`), copying its raw text into
 /// `current` and returning it with quotes and escapes removed.
 ///
@@ -1294,16 +1238,10 @@ fn close_segment_frame(
 /// `Some(Ok((delimiter, strip_tabs)))` is a one-line terminator the body matcher
 /// can compare exactly. `strip_tabs` is the `<<-` operator: bash removes leading
 /// tabs from the body and from the terminator line before comparing it.
-///
-/// `in_backtick` means a backtick substitution is open. Bash cuts its text at
-/// the next unescaped backtick before parsing it, so that backtick ends the
-/// delimiter word in any quote state, and the backslash removal that cutting
-/// does is not modeled here.
 fn read_heredoc_delimiter(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     current: &mut String,
     backslash_is_literal: bool,
-    in_backtick: bool,
 ) -> Option<Result<(String, bool), ()>> {
     let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
@@ -1318,11 +1256,6 @@ fn read_heredoc_delimiter(
     let mut quote = QuoteState::None;
     let mut ansi_c = false;
     while let Some(&ch) = chars.peek() {
-        // Leave the closing backtick for the caller. A quote still open here
-        // is reported below as an unfinished delimiter.
-        if in_backtick && ch == '`' {
-            break;
-        }
         // An escape is part of the word, including when the escaped character
         // is itself a word boundary. Checking the boundary first turned
         // `<<E\ OF` into the delimiter `E\` (the space ended the word), which
@@ -1427,11 +1360,6 @@ fn read_heredoc_delimiter(
     if quote != QuoteState::None {
         // The opener is a heredoc, but its quote never closed. Do not skip a
         // body against a delimiter this scanner did not finish reading.
-        return Some(Err(()));
-    }
-    if in_backtick && raw.contains(['\\', '`']) {
-        // Inside backticks bash removes some backslashes before it parses the
-        // delimiter. That pass is not modeled, so the terminator is unproven.
         return Some(Err(()));
     }
     let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
@@ -1602,33 +1530,6 @@ fn decode_hex_escape(
     char::from_u32(value)
 }
 
-/// Why [`split_unquoted_segments_checked`] cannot produce segments the
-/// policy checks can trust. Every caller refuses the command (or rates it
-/// High): guessing which text bash runs is the bypass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentSplitError {
-    /// A heredoc whose delimiter this scanner cannot prove. Its body is data,
-    /// but the commands after the real terminator still run. Skipping them
-    /// hides a forbidden path, and parsing them lets a quote in the body
-    /// swallow the next command.
-    UnreadableHeredoc,
-    /// The scan ended with a substitution, quote, `case`, or `${` still open,
-    /// or met a `)` that closes nothing. Valid shell ends balanced, so the
-    /// scanner's model of the command has diverged from the shell's, and the
-    /// segments may have put text bash runs inside a quoted argument.
-    Unbalanced,
-}
-
-impl SegmentSplitError {
-    /// The reason reported in place of a forbidden path.
-    fn reason(self) -> &'static str {
-        match self {
-            Self::UnreadableHeredoc => "unreadable heredoc delimiter",
-            Self::Unbalanced => "unbalanced shell syntax",
-        }
-    }
-}
-
 /// Split a command into the simple commands a shell would run, so each one
 /// can be checked on its own.
 ///
@@ -1638,26 +1539,27 @@ impl SegmentSplitError {
 /// too: the inner command becomes its own segment, and the enclosing word keeps
 /// a `$()`-style placeholder. Otherwise the closing `)` or backtick sticks to
 /// the last inner word (`$(ls 2>/dev/null)` yields a `/dev/null)` redirect
-/// target), and the inner command hides behind the outer one. Arithmetic
-/// (`$((...))`, `((...))`) runs no command, so its text is not a segment;
-/// substitutions inside it still are.
+/// target), and the inner command hides behind the outer one.
 ///
-/// Every other character outside heredoc bodies and arithmetic lands in a
-/// segment, but that alone is not a guarantee: if this scanner closes a
-/// substitution where bash does not, it restores the enclosing quote state,
-/// and commands bash runs end up inside one quoted argument that the checks
-/// never look into. The scanner therefore follows bash where a `)` or
-/// backtick is ambiguous (`case` patterns, `${...}`, comments, backtick
-/// nesting), and when the scan ends unbalanced it returns
-/// [`SegmentSplitError::Unbalanced`] rather than segments it cannot vouch for.
-/// That backstop is not a proof: input crafted to rebalance a misparse is
-/// still only as safe as the specific rules above. Segments are returned in
-/// the order they end, so an inner command comes before the command
-/// containing it.
+/// Every character other than those delimiters lands in exactly one segment
+/// (heredoc bodies aside), including when parentheses or backticks are
+/// unbalanced or a `case` pattern ends in `)`. A misparse can over-split a
+/// command but cannot drop text from the scan. Segments are returned in the
+/// order they end, so an inner command comes before the command containing it.
+/// A heredoc whose delimiter this scanner cannot prove. Its body is data, but
+/// the commands after the real terminator still run. Skipping them hides a
+/// forbidden path, and parsing them lets a quote in the body swallow the next
+/// command. Either guess is a bypass, so the command is refused.
+struct UnreadableHeredoc;
+
+fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
+    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+}
+
 fn split_unquoted_segments_checked(
     command: &str,
     dialect: ShellDialect,
-) -> Result<Vec<String>, SegmentSplitError> {
+) -> Result<Vec<String>, UnreadableHeredoc> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1697,55 +1599,10 @@ fn split_unquoted_segments_checked(
     // A substitution sets this queue aside and starts its own (see
     // `SegmentFrame::outer_heredocs`).
     let mut pending_heredocs: VecDeque<(Option<String>, bool)> = VecDeque::new();
-    // A `)` that closed nothing and was not a `case` pattern terminator.
-    let mut unbalanced = false;
-    // Backslash state for finding a backtick's closer, which ignores quotes,
-    // comments, and heredoc bodies (see the backtick check below).
-    let mut backtick_escaped = false;
-    let mut arithmetic_rescans = 0;
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
         let opener = last_syntax_char.take();
-        // Bash finds the end of a backtick substitution before it parses the
-        // text inside: the next backtick not escaped by a backslash closes
-        // it, even inside quotes, a comment, a heredoc body, or a `$(` opened
-        // within it. Following inner syntax instead let a comment or a quote
-        // swallow the closer, so the next backtick restored the enclosing
-        // double quote over commands bash runs.
-        if posix_substitution
-            && let Some(backtick) = frames
-                .iter()
-                .rposition(|frame| frame.kind == SegmentFrameKind::Backtick)
-        {
-            if backtick_escaped {
-                backtick_escaped = false;
-            } else if ch == '\\' && !backslash_is_literal {
-                backtick_escaped = true;
-            } else if ch == '`' {
-                while frames.len() > backtick {
-                    close_segment_frame(
-                        &mut frames,
-                        &mut segments,
-                        &mut current,
-                        &mut quote,
-                        &mut pending_heredocs,
-                    );
-                }
-                // Comments, heredoc bodies, and escapes inside the backticks
-                // all end with them.
-                in_comment = false;
-                escaped = false;
-                if heredoc_delimiter.is_some() {
-                    heredoc_delimiter = None;
-                    heredoc_line_buf.clear();
-                }
-                if heredoc_owner.is_some_and(|owner| owner >= frames.len()) {
-                    heredoc_owner = None;
-                }
-                continue;
-            }
-        }
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -1765,7 +1622,7 @@ fn split_unquoted_segments_checked(
                     continue;
                 }
                 if posix_substitution && ch == '(' && opener == Some('$') {
-                    let arithmetic = take_arithmetic_open(command, &mut chars);
+                    let arithmetic = chars.peek() == Some(&'(');
                     open_segment_frame(
                         &mut frames,
                         &mut segments,
@@ -1778,18 +1635,13 @@ fn split_unquoted_segments_checked(
                     );
                     continue;
                 }
-                // No backtick substitution is open here (the check above
-                // closes one), so this backtick opens one.
                 if posix_substitution && ch == '`' {
-                    open_segment_frame(
+                    toggle_backtick_frame(
                         &mut frames,
                         &mut segments,
                         &mut current,
                         &mut quote,
                         &mut pending_heredocs,
-                        SegmentFrameKind::Backtick,
-                        Some("``"),
-                        None,
                     );
                     continue;
                 }
@@ -1901,13 +1753,9 @@ fn split_unquoted_segments_checked(
                     continue;
                 }
 
-                let in_arithmetic = frames
-                    .last()
-                    .is_some_and(|frame| frame.arithmetic.is_some());
-                // Arithmetic has no commands, so `case` there is a name.
+                let in_arithmetic = frames.last().is_some_and(|frame| frame.arithmetic);
                 if posix_substitution
                     && !in_comment
-                    && !in_arithmetic
                     && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | ')'))
                 {
                     note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
@@ -1979,14 +1827,10 @@ fn split_unquoted_segments_checked(
                                 current.push(second);
                             }
                             if chars.peek() != Some(&'<') && !in_arithmetic {
-                                let in_backtick = frames
-                                    .iter()
-                                    .any(|frame| frame.kind == SegmentFrameKind::Backtick);
                                 match read_heredoc_delimiter(
                                     &mut chars,
                                     &mut current,
                                     backslash_is_literal,
-                                    in_backtick,
                                 ) {
                                     // A proven one-line delimiter. Its body is
                                     // data, so it is safe to skip.
@@ -1998,9 +1842,7 @@ fn split_unquoted_segments_checked(
                                     // (`$"..."`, an unclosed quote, a newline
                                     // inside the word). There is no safe body
                                     // boundary to guess, so refuse the command.
-                                    Some(Err(())) => {
-                                        return Err(SegmentSplitError::UnreadableHeredoc);
-                                    }
+                                    Some(Err(())) => return Err(UnreadableHeredoc),
                                     // Not a heredoc (`<<$(cmd)`). The following
                                     // text is ordinary command text.
                                     None => {}
@@ -2013,21 +1855,10 @@ fn split_unquoted_segments_checked(
                     }
                     // Inside `${...}` only `$(` opens a frame; other parentheses
                     // are literal pattern text (`${x/)/y}`).
-                    // Inside arithmetic a `(` only groups, and `<(` is a
-                    // comparison, so only `$(` opens a frame.
-                    '(' if posix_substitution && in_arithmetic && opener != Some('$') => {
-                        if let Some(arithmetic) = frames
-                            .last_mut()
-                            .and_then(|frame| frame.arithmetic.as_mut())
-                        {
-                            arithmetic.depth += 1;
-                        }
-                        current.push(ch);
-                    }
                     '(' if posix_substitution && (param_depth == 0 || opener == Some('$')) => {
                         match opener {
                             Some('$') => {
-                                let arithmetic = take_arithmetic_open(command, &mut chars);
+                                let arithmetic = chars.peek() == Some(&'(');
                                 open_segment_frame(
                                     &mut frames,
                                     &mut segments,
@@ -2047,69 +1878,20 @@ fn split_unquoted_segments_checked(
                                 &mut pending_heredocs,
                                 SegmentFrameKind::Paren,
                                 Some("()"),
-                                None,
+                                false,
                             ),
                             // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
-                            // that is still a word boundary. `((` is an
-                            // arithmetic command if bash finds `))` for it.
-                            _ => {
-                                let arithmetic = take_arithmetic_open(command, &mut chars);
-                                open_segment_frame(
-                                    &mut frames,
-                                    &mut segments,
-                                    &mut current,
-                                    &mut quote,
-                                    &mut pending_heredocs,
-                                    SegmentFrameKind::Paren,
-                                    None,
-                                    arithmetic,
-                                );
-                            }
-                        }
-                    }
-                    ')' if posix_substitution && param_depth == 0 && in_arithmetic => {
-                        let Some(frame) = frames.last_mut() else {
-                            continue;
-                        };
-                        let Some(arithmetic) = frame.arithmetic.as_mut() else {
-                            continue;
-                        };
-                        if arithmetic.depth > 0 {
-                            arithmetic.depth -= 1;
-                            current.push(ch);
-                        } else if chars.next_if_eq(&')').is_some() {
-                            // `))`: the expression runs no command, so its
-                            // text is not a segment.
-                            current.clear();
-                            close_segment_frame(
+                            // that is still a word boundary.
+                            _ => open_segment_frame(
                                 &mut frames,
                                 &mut segments,
                                 &mut current,
                                 &mut quote,
                                 &mut pending_heredocs,
-                            );
-                        } else {
-                            // The second `(` closed without `))`, so bash reads
-                            // the text as commands in a subshell. Reopen this
-                            // frame as a command frame and rescan from that `(`
-                            // with heredocs, comments, and `case` live again.
-                            arithmetic_rescans += 1;
-                            if arithmetic_rescans > MAX_ARITHMETIC_RESCANS {
-                                return Err(SegmentSplitError::Unbalanced);
-                            }
-                            let Some(arithmetic) = frame.arithmetic.take() else {
-                                continue;
-                            };
-                            frame.nest = SegmentNest::default();
-                            segments.truncate(arithmetic.segments_len);
-                            pending_heredocs = arithmetic.pending_heredocs;
-                            heredoc_delimiter = None;
-                            heredoc_line_buf.clear();
-                            current.clear();
-                            let Some(rest) = command.get(arithmetic.restart..) else {
-                                return Err(SegmentSplitError::Unbalanced);
-                            };
-                            chars = rest.chars().peekable();
+                                SegmentFrameKind::Paren,
+                                None,
+                                false,
+                            ),
                         }
                     }
                     ')' if posix_substitution && param_depth == 0 => {
@@ -2134,28 +1916,18 @@ fn split_unquoted_segments_checked(
                                 heredoc_owner = None;
                             }
                         } else {
-                            // A `case` pattern terminator ends the word before
-                            // it without closing a frame. Any other `)` closes
-                            // nothing in bash either, which is a syntax error
-                            // there and a misparse here.
-                            if case_depth == 0 {
-                                unbalanced = true;
-                            }
+                            // A `case` pattern terminator, or an unmatched `)`,
+                            // ends the word before it without closing a frame.
                             push_segment(&mut segments, &mut current);
                         }
                     }
-                    // No backtick substitution is open here (the check at the
-                    // top of the loop closes one), so this backtick opens one.
                     '`' if posix_substitution => {
-                        open_segment_frame(
+                        toggle_backtick_frame(
                             &mut frames,
                             &mut segments,
                             &mut current,
                             &mut quote,
                             &mut pending_heredocs,
-                            SegmentFrameKind::Backtick,
-                            Some("``"),
-                            None,
                         );
                     }
                     _ => {
@@ -2167,27 +1939,13 @@ fn split_unquoted_segments_checked(
         }
     }
 
-    // A keyword at the very end (`...; esac`) has no delimiter after it.
-    if posix_substitution
-        && quote == QuoteState::None
-        && !in_comment
-        && heredoc_delimiter.is_none()
-        && !escaped
-    {
-        note_case_keyword(&current, segment_nest_mut(&mut frames, &mut top_nest));
-    }
     push_segment(&mut segments, &mut current);
-    // Valid shell ends with every substitution, quote, `case`, and `${`
-    // closed. Anything else means this model of the command diverged from
-    // the shell's, so the segments cannot be trusted to hold what runs.
-    if posix_substitution
-        && (unbalanced
-            || !frames.is_empty()
-            || quote != QuoteState::None
-            || top_nest.case_depth > 0
-            || top_nest.param_depth > 0)
-    {
-        return Err(SegmentSplitError::Unbalanced);
+    // Flush the enclosing text of any substitution left open, so an
+    // unterminated `$(` cannot hide the command around it.
+    while let Some(frame) = frames.pop() {
+        if let Some(mut resume) = frame.resume {
+            push_segment(&mut segments, &mut resume);
+        }
     }
 
     Ok(segments)
@@ -4395,10 +4153,7 @@ impl SecurityPolicy {
     }
 
     fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
-        // Segments that cannot be trusted cannot prove an explicit entry.
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
-            return false;
-        };
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection {
@@ -4535,9 +4290,9 @@ impl SecurityPolicy {
         // $(), heredocs, etc. in trusted environments.
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
-            // The opt-out skips syntax restrictions, but not a split the path
-            // and risk checks cannot trust (an unprovable heredoc boundary or
-            // unbalanced syntax). Those checks refuse it for the same reason.
+            // The opt-out skips syntax restrictions, but not a heredoc whose
+            // body boundary cannot be proven. The path and risk checks refuse
+            // that command for the same reason.
             return split_unquoted_segments_checked(command, dialect).is_ok();
         }
 
@@ -4554,10 +4309,6 @@ impl SecurityPolicy {
         // would be checked as plain `git status`. Keep rejecting unquoted
         // grouping syntax here so the segment split does not widen the strict
         // allowlist; `$(`, `<(`, `>(`, and backticks are rejected above.
-        // `contains_unmodeled_shell_word_expansion` already rejects unquoted
-        // `(` and `)` as extended-glob syntax, so this duplicates that check on
-        // purpose: the allowlist must not depend on the glob rule staying as
-        // broad as it is today.
         if matches!(dialect, ShellDialect::Posix)
             && (contains_unquoted_char(command, '(', dialect)
                 || contains_unquoted_char(command, ')', dialect))
@@ -4595,10 +4346,7 @@ impl SecurityPolicy {
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        // A split that cannot be trusted cannot prove every command is listed.
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
-            return false;
-        };
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
             let normalized = normalized_shell_command(segment, dialect);
             if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
@@ -4740,12 +4488,11 @@ impl SecurityPolicy {
         dialect: ShellDialect,
         resolve_workspace: bool,
     ) -> Option<String> {
-        let segments = match split_unquoted_segments_checked(command, dialect) {
-            Ok(segments) => segments,
-            // Name the reason rather than a path. The shell wrapper refuses
+        if split_unquoted_segments_checked(command, dialect).is_err() {
+            // Name the opener rather than a path. The shell wrapper refuses
             // any `Some`, and guessing which later command runs is the bypass.
-            Err(error) => return Some(error.reason().into()),
-        };
+            return Some("unreadable heredoc delimiter".into());
+        }
         let forbidden_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();
             if candidate.is_empty() || candidate.contains("://") {
@@ -4819,7 +4566,7 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in segments {
+        for segment in split_unquoted_segments(command, dialect) {
             let words = shell_words_after_env_assignments(&segment, dialect);
             let Some(executable) = words.first() else {
                 continue;
@@ -9313,9 +9060,7 @@ mod tests {
             // Unbalanced or `case`-style closers are boundaries, not hiding
             // places.
             ("case x in a) cat /etc/passwd;; esac", "/etc/passwd"),
-            // A `)` that closes nothing is a syntax error in bash and a
-            // misparse here, so the command is refused as a whole.
-            ("echo a) cat /etc/passwd", "unbalanced shell syntax"),
+            ("echo a) cat /etc/passwd", "/etc/passwd"),
             // Arithmetic `<<` is a shift, not a heredoc that swallows the rest.
             ("echo $((8 << 1)); cat /etc/passwd", "/etc/passwd"),
             ("echo $((8<<1))\ncat /etc/passwd\n1", "/etc/passwd"),
@@ -9589,19 +9334,14 @@ mod tests {
     #[test]
     fn windows_cmd_does_not_split_posix_substitution_syntax() {
         assert_eq!(
-            split_unquoted_segments_checked("echo `a` $(b)", ShellDialect::WindowsCmd),
-            Ok(vec!["echo `a` $(b)".to_string()])
+            split_unquoted_segments("echo `a` $(b)", ShellDialect::WindowsCmd),
+            vec!["echo `a` $(b)".to_string()]
         );
     }
 
     #[test]
     fn posix_segments_split_at_substitution_boundaries() {
-        let split = |command: &str| {
-            split_unquoted_segments_checked(command, ShellDialect::Posix)
-                .unwrap_or_else(|error| panic!("{command}: {error:?}"))
-        };
-        let split_error =
-            |command: &str| split_unquoted_segments_checked(command, ShellDialect::Posix).err();
+        let split = |command: &str| split_unquoted_segments(command, ShellDialect::Posix);
         // Segments are returned in the order they end: inner commands first.
         assert_eq!(split("x=$(echo a)"), vec!["echo a", "x=$()"]);
         assert_eq!(split("x=\"$(echo a)\""), vec!["echo a", "x=\"$()\""]);
@@ -9610,26 +9350,13 @@ mod tests {
         assert_eq!(split("diff <(a) >(b)"), vec!["a", "b", "diff <() >()"]);
         assert_eq!(split("x=$(a $(b) c) d"), vec!["b", "a $() c", "x=$() d"]);
         assert_eq!(split("x=$(a; b)"), vec!["a", "b", "x=$()"]);
-        // Arithmetic runs no command, so its text is not a segment, and its
-        // `<<` is a shift rather than a heredoc.
-        assert_eq!(split("echo $((1 << 2))"), vec!["echo $()"]);
-        assert_eq!(split("echo $(( (1 + 2) / 3 ))"), vec!["echo $()"]);
-        assert_eq!(split("((x = 8 << 1)); y"), vec!["y"]);
-        // Without `))` right after the second `(`'s match, bash reads a
-        // subshell inside a substitution or subshell, and so does the scan.
-        assert_eq!(
-            split("x=$((cd a && make) 2>&1)"),
-            vec!["cd a", "make", "2>&1", "x=$()"]
-        );
-        assert_eq!(split("((echo a) )"), vec!["echo a"]);
-        // Unbalanced input is refused rather than split by guesswork.
-        for command in ["cat a $(echo b", "cat a `echo b", "echo a) b", "echo \"a"] {
-            assert_eq!(
-                split_error(command),
-                Some(SegmentSplitError::Unbalanced),
-                "{command}"
-            );
-        }
+        // Arithmetic is scanned like a nested command, with no heredoc.
+        assert_eq!(split("echo $((1 << 2))"), vec!["1 << 2", "echo $()"]);
+        // Unbalanced input keeps every word: an unterminated substitution
+        // still flushes the command around it, and a stray `)` is a boundary.
+        assert_eq!(split("cat a $(echo b"), vec!["echo b", "cat a $()"]);
+        assert_eq!(split("cat a `echo b"), vec!["echo b", "cat a ``"]);
+        assert_eq!(split("echo a) b"), vec!["echo a", "b"]);
         // Quoted and escaped parentheses and backticks are literal.
         assert_eq!(split("echo '$(a)' '`b`'"), vec!["echo '$(a)' '`b`'"]);
         assert_eq!(
@@ -9661,7 +9388,7 @@ mod tests {
         // A command substitution inside arithmetic recognizes heredocs again.
         assert_eq!(
             split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
-            vec!["cat <<'E'", "echo $()"]
+            vec!["cat <<'E'", "$() + 1", "echo $()"]
         );
         // The heredoc delimiter is one word, and the body starts at the next
         // newline, so the rest of the line is its own segment.
@@ -9692,9 +9419,9 @@ mod tests {
         );
         // `$"..."` is locale-dependent, so the split refuses rather than
         // guessing which of the following lines are commands.
-        assert_eq!(
-            split_error("cat <<$\"EOF\"\nbody\nEOF\nnext"),
-            Some(SegmentSplitError::UnreadableHeredoc)
+        assert!(
+            split_unquoted_segments_checked("cat <<$\"EOF\"\nbody\nEOF\nnext", ShellDialect::Posix)
+                .is_err()
         );
     }
 
@@ -9768,121 +9495,6 @@ mod tests {
         assert_eq!(
             p.command_risk_level("x=$(git rev-parse HEAD 2>/dev/null)"),
             CommandRiskLevel::Low
-        );
-    }
-
-    /// Where this scanner and bash disagree on which `)` or backtick closes a
-    /// substitution, the scan restores the enclosing double quote over text
-    /// bash runs. Each command here was blocked or rated High before
-    /// substitutions were split, and bash runs the forbidden part of it.
-    #[test]
-    fn posix_substitution_closers_follow_bash() {
-        let p = unix_forbidden_path_policy();
-        let posix =
-            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
-        let risk = SecurityPolicy {
-            allowed_commands: vec!["*".into()],
-            block_high_risk_commands: false,
-            ..SecurityPolicy::default()
-        };
-        for (command, blocked) in [
-            // A lone `&`, `coproc`, and `time -p` leave the next word in
-            // command position, so its `case` pattern `)` does not close.
-            (
-                "echo \"$(echo \"$(true & case x in x) wc -l /etc/passwd;; esac)\")\"",
-                "/etc/passwd",
-            ),
-            (
-                "echo \"$(true&case x in x) wc -l /etc/passwd;; esac)\"",
-                "/etc/passwd",
-            ),
-            (
-                "echo \"$(coproc case x in x) wc -l /etc/passwd;; esac)\"",
-                "/etc/passwd",
-            ),
-            (
-                "echo \"$(time -p case x in x) wc -l /etc/passwd;; esac)\"",
-                "/etc/passwd",
-            ),
-            // `case` inside arithmetic is a name, not a statement, so it does
-            // not hold the real closer open.
-            (
-                "echo \"$($((case x in (x) echo a)))\"; wc -l /etc/passwd",
-                "/etc/passwd",
-            ),
-            // Inside backticks a comment ends at the closing backtick.
-            ("echo \"`#x`\"\necho `wc -l /etc/passwd`", "/etc/passwd"),
-            // So does a single-quoted string: bash finds the closer first.
-            ("echo `echo 'a`; wc -l /etc/passwd #'`", "/etc/passwd"),
-            // A backtick closes the innermost backtick substitution even with
-            // a `$(` or `(` still open inside it.
-            (
-                "x=\"`x=1 (case x in x) echo a)`\"; wc -l /etc/passwd",
-                "/etc/passwd",
-            ),
-            // A heredoc inside backticks ends with them, so the next line runs.
-            ("echo `cat <<EOF`\nwc -l /etc/passwd\nEOF", "/etc/passwd"),
-            // `((` without `))` after its match is a subshell, scanned as one.
-            ("x=$((cd a && cat /etc/passwd) 2>&1)", "/etc/passwd"),
-            ("echo \"$((echo a); wc -l /etc/passwd)\"", "/etc/passwd"),
-            ("((cat /etc/passwd) )", "/etc/passwd"),
-            // Arithmetic `<<` is a shift, so the next line is a command.
-            ("((x = 8 << 1))\nwc -l /etc/passwd", "/etc/passwd"),
-            // Bash ends this body at `EOF)`. The scan cannot prove that, so
-            // the unclosed substitution refuses the command.
-            (
-                "x=$(cat <<EOF\nhello\nEOF); wc -l /etc/passwd",
-                "unbalanced shell syntax",
-            ),
-        ] {
-            assert_eq!(posix(command), Some(blocked.into()), "{command}");
-            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
-            let high = high.replace("cat /etc/passwd", "rm -rf ./build");
-            assert_eq!(
-                risk.command_risk_level(&high),
-                CommandRiskLevel::High,
-                "{high}"
-            );
-        }
-        // An unterminated `case` in backticks: bash reports the error when it
-        // runs the substitution, then deletes `./build`.
-        assert_eq!(
-            risk.command_risk_level("x=\"`x=1 (case x in x) git status)`\"; rm -rf ./build"),
-            CommandRiskLevel::High
-        );
-        assert_eq!(
-            posix("x=\"`x=1 (case x in x) git status)`\"; wc -l /etc/passwd"),
-            Some("/etc/passwd".into())
-        );
-    }
-
-    /// Arithmetic names no file and runs no command, so `/` in an expression
-    /// is division, not a path. Substitutions inside it are still scanned.
-    #[test]
-    fn posix_arithmetic_text_is_not_a_command() {
-        let p = unix_forbidden_path_policy();
-        let posix =
-            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
-        for command in [
-            "echo \"$(( total / count ))\"",
-            "echo $((10 / 2))",
-            "echo $(( (a + b) / 2 ))",
-            "(( x = 10 / 2 ))",
-        ] {
-            assert_eq!(posix(command), None, "{command}");
-            assert_eq!(
-                p.command_risk_level(command),
-                CommandRiskLevel::Low,
-                "{command}"
-            );
-        }
-        assert_eq!(
-            posix("echo $(( $(wc -l < /etc/passwd) / 2 ))"),
-            Some("/etc/passwd".into())
-        );
-        assert_eq!(
-            posix("echo $(( `wc -l < /etc/passwd` / 2 ))"),
-            Some("/etc/passwd".into())
         );
     }
 

@@ -206,12 +206,6 @@ impl Sandbox for BubblewrapSandbox {
         self.version_launcher().is_ok()
     }
 
-    fn runs_host_shell(&self) -> bool {
-        // Same host executable, same filesystem view: only its access is
-        // restricted.
-        true
-    }
-
     fn name(&self) -> &str {
         "bubblewrap"
     }

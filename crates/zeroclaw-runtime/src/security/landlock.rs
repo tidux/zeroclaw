@@ -661,12 +661,6 @@ impl Sandbox for LandlockSandbox {
             .is_ok()
     }
 
-    fn runs_host_shell(&self) -> bool {
-        // Same host executable, same filesystem view: only its access is
-        // restricted.
-        true
-    }
-
     fn name(&self) -> &str {
         "landlock"
     }

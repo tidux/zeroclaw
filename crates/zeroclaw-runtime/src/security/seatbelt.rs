@@ -166,12 +166,6 @@ impl Sandbox for SeatbeltSandbox {
         Self::is_installed() && self.policy_path.exists()
     }
 
-    fn runs_host_shell(&self) -> bool {
-        // Same host executable, same filesystem view: only its access is
-        // restricted.
-        true
-    }
-
     fn name(&self) -> &str {
         "sandbox-exec"
     }

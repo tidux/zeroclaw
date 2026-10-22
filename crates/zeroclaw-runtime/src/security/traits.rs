@@ -22,6 +22,18 @@ pub trait Sandbox: Send + Sync {
         self.wrap_command(cmd)
     }
 
+    /// Whether the wrapped shell command still runs the host executable the
+    /// runtime resolved, with the host's view of it.
+    ///
+    /// The command policy identifies the POSIX shell from that executable
+    /// (see `ShellGrammar::for_program`). A container sandbox runs the shell
+    /// program from its image instead, where `sh` or even `bash` may be a
+    /// different shell, so it must keep the default `false`, and the policy
+    /// then applies rules that are safe for any POSIX shell.
+    fn runs_host_shell(&self) -> bool {
+        false
+    }
+
     /// Report a retained construction failure without probing backend availability.
     fn check_initialization(&self) -> std::io::Result<()> {
         Ok(())
@@ -59,6 +71,10 @@ impl Sandbox for NoopSandbox {
         Ok(())
     }
 
+    fn runs_host_shell(&self) -> bool {
+        true
+    }
+
     fn is_available(&self) -> bool {
         true
     }
@@ -75,6 +91,31 @@ impl Sandbox for NoopSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noop_sandbox_runs_the_host_shell() {
+        assert!(NoopSandbox.runs_host_shell());
+    }
+
+    #[test]
+    fn sandboxes_do_not_claim_the_host_shell_by_default() {
+        struct Unknown;
+        impl Sandbox for Unknown {
+            fn wrap_command(&self, _cmd: &mut Command) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn name(&self) -> &str {
+                "unknown"
+            }
+            fn description(&self) -> &str {
+                "unknown"
+            }
+        }
+        assert!(!Unknown.runs_host_shell());
+    }
 
     #[test]
     fn noop_sandbox_name() {

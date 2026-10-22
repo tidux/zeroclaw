@@ -29,6 +29,79 @@ pub enum ShellDialect {
     None,
 }
 
+/// Which POSIX shell will parse a command, when that is known.
+///
+/// POSIX shells disagree on a few forms that decide where a heredoc body ends
+/// or whether text runs as a command at all: bash expands `<<$'EOF'` and reads
+/// `((x << 1))` as arithmetic, while dash ends that heredoc at a literal
+/// `$EOF` line and runs `((...))` as nested subshells. The command policy
+/// refuses those forms when the shell is [`PosixShell::Unknown`], and follows
+/// the shell's own reading when it is known.
+///
+/// The default is `Unknown`. A shell is only identified from the executable
+/// that will actually run, never from its configured name: `sh` may be bash,
+/// dash, or something else entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PosixShell {
+    /// Any POSIX shell. Forms the shells read differently are refused.
+    #[default]
+    Unknown,
+    /// GNU bash, in normal or POSIX mode (invoked as `sh`). The modeled forms
+    /// read the same in bash 3.2 through 5.3, in either mode.
+    Bash,
+}
+
+impl PosixShell {
+    /// Identify the shell from the executable a runtime built its command
+    /// with. `program` must be the resolved binary that will be spawned (the
+    /// native runtime canonicalizes it, so `/bin/sh -> dash` names `dash`),
+    /// not the configured name. Only a file named exactly `bash` is
+    /// recognized; anything else, including `sh`, is `Unknown`.
+    #[must_use]
+    pub fn from_program(program: &OsStr) -> Self {
+        match Path::new(program).file_name() {
+            Some(name) if name == "bash" => Self::Bash,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The shell language a command will be parsed in: the dialect, plus which
+/// POSIX shell when the dialect is POSIX and the shell is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShellGrammar {
+    pub dialect: ShellDialect,
+    /// Ignored unless `dialect` is [`ShellDialect::Posix`].
+    pub posix_shell: PosixShell,
+}
+
+impl ShellGrammar {
+    /// The grammar of a command built by a runtime for `dialect` whose
+    /// resolved executable is `program`. See [`PosixShell::from_program`].
+    #[must_use]
+    pub fn for_program(dialect: ShellDialect, program: &OsStr) -> Self {
+        let posix_shell = match dialect {
+            ShellDialect::Posix => PosixShell::from_program(program),
+            _ => PosixShell::Unknown,
+        };
+        Self {
+            dialect,
+            posix_shell,
+        }
+    }
+}
+
+/// A dialect alone says nothing about which POSIX shell runs, so it converts
+/// to the portable grammar.
+impl From<ShellDialect> for ShellGrammar {
+    fn from(dialect: ShellDialect) -> Self {
+        Self {
+            dialect,
+            posix_shell: PosixShell::Unknown,
+        }
+    }
+}
+
 /// Tools whose arguments carry a model-authored shell command.
 ///
 /// The dialect guidance is worth its tokens exactly when the model writes a
@@ -328,6 +401,62 @@ pub trait RuntimeAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_shell_is_identified_only_from_a_bash_executable() {
+        for program in [
+            "/usr/bin/bash",
+            "/bin/bash",
+            "/nix/store/abc-bash-5.2/bin/bash",
+            "bash",
+        ] {
+            assert_eq!(
+                PosixShell::from_program(OsStr::new(program)),
+                PosixShell::Bash,
+                "{program}"
+            );
+        }
+        // `sh` names no particular shell, and other shells keep the portable
+        // rules: they are not modeled.
+        for program in [
+            "/bin/sh",
+            "/usr/bin/dash",
+            "/bin/zsh",
+            "/bin/busybox",
+            "/usr/bin/bash5",
+            "/usr/bin/docker",
+            "",
+        ] {
+            assert_eq!(
+                PosixShell::from_program(OsStr::new(program)),
+                PosixShell::Unknown,
+                "{program}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_grammar_names_a_posix_shell_only_for_the_posix_dialect() {
+        let bash = OsStr::new("/usr/bin/bash");
+        assert_eq!(
+            ShellGrammar::for_program(ShellDialect::Posix, bash).posix_shell,
+            PosixShell::Bash
+        );
+        for dialect in [
+            ShellDialect::WindowsCmd,
+            ShellDialect::PowerShell,
+            ShellDialect::None,
+        ] {
+            assert_eq!(
+                ShellGrammar::for_program(dialect, bash).posix_shell,
+                PosixShell::Unknown
+            );
+        }
+        assert_eq!(
+            ShellGrammar::from(ShellDialect::Posix).posix_shell,
+            PosixShell::Unknown
+        );
+    }
 
     struct DummyRuntime;
 

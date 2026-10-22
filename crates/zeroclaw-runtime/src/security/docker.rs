@@ -275,6 +275,13 @@ mod tests {
     }
 
     #[test]
+    fn docker_sandbox_runs_its_image_shell_not_the_host_shell() {
+        // The image decides what `sh` (or `bash`) is, so the command policy
+        // must not use the host shell's grammar.
+        assert!(!DockerSandbox::default().runs_host_shell());
+    }
+
+    #[test]
     fn docker_sandbox_name() {
         let sandbox = DockerSandbox::default();
         assert_eq!(sandbox.name(), "docker");

@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use zeroclaw_api::runtime_traits::ShellDialect;
+use zeroclaw_api::runtime_traits::{PosixShell, ShellDialect, ShellGrammar};
 
 // Re-export from zeroclaw-config.
 pub use crate::autonomy::AutonomyLevel;
@@ -1043,6 +1043,12 @@ enum QuoteState {
     Double,
 }
 
+/// A queued heredoc: its terminator line as bytes (`None` when it cannot be
+/// proven), and whether `<<-` strips leading tabs before comparing. Bash
+/// compares terminator lines bytewise, and `$'\xc3'` can name bytes that are
+/// not UTF-8 on their own, so the terminator is not a `String`.
+type HeredocDelimiter = (Option<Vec<u8>>, bool);
+
 /// What closes an open [`SegmentFrame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentFrameKind {
@@ -1075,19 +1081,22 @@ struct SegmentFrame {
     /// swallowed the inner terminator, and then skipped the commands after the
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
-    outer_heredocs: Option<VecDeque<(Option<String>, bool)>>,
-    /// For a `$((` frame: text of the expression, held back until the frame
-    /// closes. It runs no command only if the expression is confirmed.
+    outer_heredocs: Option<VecDeque<HeredocDelimiter>>,
+    /// The outer frame of `$((`, or of a bare `((` when the shell is bash:
+    /// the frame that holds the expression's text until it is confirmed.
+    arithmetic_root: bool,
+    /// For an arithmetic root: text of the expression, held back until the
+    /// frame closes. It runs no command only if the expression is confirmed.
     arithmetic_text: Vec<String>,
-    /// For a `$((` frame: whether its first inner group has closed yet.
+    /// For an arithmetic root: whether its first inner group has closed yet.
     first_group_closed: bool,
-    /// For a `$((` frame: the second `(` closed with `)` right after it.
+    /// For an arithmetic root: the second `(` closed with `)` right after it.
     /// Bash then reads arithmetic, and dash reads `$((` as arithmetic always,
     /// so neither runs the text as commands.
     arithmetic_confirmed: bool,
-    /// A grouping `(` followed at once by `(`. Bash reads `((...))` as an
-    /// arithmetic command and dash as nested subshells, so a `<<` inside is a
-    /// shift to one and a heredoc to the other.
+    /// A bare `((` when the shell is not known to be bash. Bash reads
+    /// `((...))` as an arithmetic command and dash as nested subshells, so a
+    /// `<<` inside is a shift to one and a heredoc to the other.
     double_paren: bool,
 }
 
@@ -1204,7 +1213,7 @@ fn open_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
     kind: SegmentFrameKind,
     placeholder: Option<&str>,
     arithmetic: bool,
@@ -1223,6 +1232,7 @@ fn open_segment_frame(
     // Arithmetic carries into the parentheses of an arithmetic expression,
     // but a command substitution or backtick inside it is ordinary shell
     // syntax again (heredocs included).
+    let arithmetic_root = arithmetic;
     let arithmetic = arithmetic
         || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
     frames.push(SegmentFrame {
@@ -1230,6 +1240,7 @@ fn open_segment_frame(
         resume,
         resume_quote: *quote,
         arithmetic,
+        arithmetic_root,
         nest: SegmentNest::default(),
         outer_heredocs: placeholder
             .is_some()
@@ -1247,10 +1258,7 @@ fn open_segment_frame(
 /// [`SegmentFrame::arithmetic_confirmed`]); everywhere else it is a segment.
 fn emit_segment(frames: &mut [SegmentFrame], segments: &mut Vec<String>, current: &mut String) {
     let root = if frames.last().is_some_and(|frame| frame.arithmetic) {
-        frames
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.arithmetic && frame.resume.is_some())
+        frames.iter_mut().rev().find(|frame| frame.arithmetic_root)
     } else {
         None
     };
@@ -1278,7 +1286,7 @@ fn close_segment_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
 ) {
     emit_segment(frames, segments, current);
     if let Some(frame) = pop_segment_frame(frames, segments) {
@@ -1303,7 +1311,7 @@ fn open_backtick_frame(
     segments: &mut Vec<String>,
     current: &mut String,
     quote: &mut QuoteState,
-    pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
+    pending_heredocs: &mut VecDeque<HeredocDelimiter>,
 ) {
     open_segment_frame(
         frames,
@@ -1342,7 +1350,8 @@ fn read_heredoc_delimiter(
     current: &mut String,
     backslash_is_literal: bool,
     in_backtick: bool,
-) -> Option<Result<(String, bool), ()>> {
+    posix_shell: PosixShell,
+) -> Option<Result<(Vec<u8>, bool), ()>> {
     let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
         true
@@ -1467,7 +1476,7 @@ fn read_heredoc_delimiter(
     if in_backtick && raw.contains(['\\', '`']) {
         return Some(Err(()));
     }
-    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw, posix_shell) else {
         // `$'...'`, `$"..."`, and any other form whose terminator depends on
         // the shell. The opener is still a heredoc. Skipping its lines against a guessed
         // terminator is the bypass, so the caller scans them instead.
@@ -1476,25 +1485,27 @@ fn read_heredoc_delimiter(
     // A newline in the delimiter is not a one-line terminator. An empty delimiter is the blank line after `<<''`, and a
     // carriage return can end a physical line. Both are matched before the
     // body line is trimmed.
-    if delimiter.contains('\n') {
+    if delimiter.contains(&b'\n') {
         return Some(Err(()));
     }
     Some(Ok((delimiter, strip_tabs)))
 }
 
-/// Apply shell quote removal to a heredoc delimiter word. `None` means the
-/// word's terminator depends on the shell or is not modeled, so no body may be
-/// skipped against it.
+/// Apply shell quote removal to a heredoc delimiter word, returning the
+/// terminator line's bytes. `None` means the terminator depends on the shell
+/// or is not modeled, so no body may be skipped against it.
 ///
-/// `$'...'` and `$"..."` are refused. Bash expands `$'...'` (and translates
-/// `$"..."` through the locale catalog) before matching the terminator, but
-/// dash, the usual `sh`, has neither: `<<$'EOF'` ends at a literal `$EOF`
-/// line there, and the commands after that line run while a bash reading
-/// still treats them as body. Modeling either shell hides commands from the
-/// other, and the bash expansion was also byte-oriented (`\0` truncation,
-/// `\xc3`) in ways a `String` cannot represent.
-fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
-    let mut delimiter = String::new();
+/// `$"..."` is always refused: bash translates it through the locale catalog.
+/// `$'...'` depends on the shell. Bash expands it before matching the
+/// terminator, while dash (the usual `sh`) has no `$'...'` and ends `<<$'EOF'`
+/// at a literal `$EOF` line. Modeling either one hides the commands after the
+/// body from the other, so it is refused unless the shell is known to be
+/// bash, and then expanded as bash does (see [`expand_bash_ansi_c_quote`]).
+fn remove_heredoc_delimiter_quotes(raw: &str, posix_shell: PosixShell) -> Option<Vec<u8>> {
+    let mut delimiter = Vec::new();
+    let push = |delimiter: &mut Vec<u8>, ch: char| {
+        delimiter.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    };
     let mut chars = raw.chars().peekable();
     let mut quote = QuoteState::None;
     while let Some(ch) = chars.next() {
@@ -1502,7 +1513,13 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
             (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
             (QuoteState::None, '\'') => quote = QuoteState::Single,
             (QuoteState::None, '"') => quote = QuoteState::Double,
-            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => return None,
+            (QuoteState::None, '$') if chars.next_if_eq(&'\'').is_some() => {
+                if posix_shell != PosixShell::Bash {
+                    return None;
+                }
+                expand_bash_ansi_c_quote(&mut chars, &mut delimiter)?;
+            }
+            (QuoteState::None, '$') if chars.peek() == Some(&'"') => return None,
             // A bare `$` or backtick in a heredoc delimiter is literal. Neither
             // shell expands `<<$EOF`, `<<"$EOF"`, or `<<`echo EOF``. Treating
             // every `$` as an unsupported expansion opened no heredoc, so a
@@ -1512,18 +1529,115 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
                 Some(escaped)
                     if quote == QuoteState::None || matches!(escaped, '$' | '`' | '"' | '\\') =>
                 {
-                    delimiter.push(escaped);
+                    push(&mut delimiter, escaped);
                 }
                 Some(escaped) => {
-                    delimiter.push('\\');
-                    delimiter.push(escaped);
+                    push(&mut delimiter, '\\');
+                    push(&mut delimiter, escaped);
                 }
-                None => delimiter.push('\\'),
+                None => push(&mut delimiter, '\\'),
             },
-            _ => delimiter.push(ch),
+            _ => push(&mut delimiter, ch),
         }
     }
     Some(delimiter)
+}
+
+/// Expand the body of a bash `$'...'` quote in a heredoc delimiter, after the
+/// opening `$'`, through its closing `'`. Returns `None` for an escape whose
+/// meaning varies, or an unclosed quote.
+///
+/// Every rule here reads the same in bash 3.2 through 5.3, in normal and
+/// POSIX mode, as a heredoc delimiter:
+/// - `\a \b \e \E \f \n \r \t \v` are control bytes, and `\\ \' \" \?` the
+///   character itself.
+/// - `\xH` and `\xHH` are one byte. `\x` with no hex digit stays `\x`.
+/// - One to three octal digits are one byte, masked to eight bits (`\777` is
+///   `0xff`, `\400` is NUL).
+/// - Any other escape (`\q`, `\8`) keeps its backslash.
+/// - A NUL byte ends the quoted part: the rest of it is dropped, escapes
+///   still apply while finding its end, and text after the quote stays in the
+///   delimiter (`$'E\0F'X` is `EX`).
+///
+/// `\c`, `\u`, and `\U` are refused: `\c?`, `\c\\`, and the Unicode escapes
+/// changed meaning between bash 3.2 and 4.x, and `\cA` in a delimiter does
+/// not match its expansion as a word. A backslash-newline is refused too.
+fn expand_bash_ansi_c_quote(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    delimiter: &mut Vec<u8>,
+) -> Option<()> {
+    let mut truncated = false;
+    loop {
+        let ch = chars.next()?;
+        let byte = match ch {
+            '\'' => return Some(()),
+            '\\' => {
+                let escaped = chars.next()?;
+                match escaped {
+                    'a' => Some(0x07),
+                    'b' => Some(0x08),
+                    'e' | 'E' => Some(0x1b),
+                    'f' => Some(0x0c),
+                    'n' => Some(b'\n'),
+                    'r' => Some(b'\r'),
+                    't' => Some(b'\t'),
+                    'v' => Some(0x0b),
+                    '\\' | '\'' | '"' | '?' => Some(escaped as u8),
+                    'x' => {
+                        let mut value: u32 = 0;
+                        let mut digits = 0;
+                        while digits < 2 {
+                            let Some(digit) = chars.next_if(char::is_ascii_hexdigit) else {
+                                break;
+                            };
+                            value = value * 16 + digit.to_digit(16)?;
+                            digits += 1;
+                        }
+                        if digits == 0 {
+                            if !truncated {
+                                delimiter.extend_from_slice(b"\\x");
+                            }
+                            None
+                        } else {
+                            u8::try_from(value).ok()
+                        }
+                    }
+                    '0'..='7' => {
+                        let mut value = escaped.to_digit(8)?;
+                        let mut digits = 1;
+                        while digits < 3 {
+                            let Some(digit) = chars.next_if(|next| matches!(next, '0'..='7'))
+                            else {
+                                break;
+                            };
+                            value = value * 8 + digit.to_digit(8)?;
+                            digits += 1;
+                        }
+                        u8::try_from(value & 0xff).ok()
+                    }
+                    'c' | 'u' | 'U' | '\n' => return None,
+                    other => {
+                        if !truncated {
+                            delimiter.push(b'\\');
+                            delimiter.extend_from_slice(other.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
+                        None
+                    }
+                }
+            }
+            other => {
+                if !truncated {
+                    delimiter.extend_from_slice(other.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                None
+            }
+        };
+        match byte {
+            Some(0) => truncated = true,
+            Some(byte) if !truncated => delimiter.push(byte),
+            _ => {}
+        }
+    }
 }
 
 /// Split a command into the simple commands a shell would run, so each one
@@ -1557,11 +1671,12 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
 /// before the command containing it.
 fn split_unquoted_segments_checked(
     command: &str,
-    dialect: ShellDialect,
+    shell: impl Into<ShellGrammar>,
 ) -> Result<Vec<String>, UnreadableHeredoc> {
-    let (mut segments, balanced) = scan_unquoted_segments(command, dialect, true)?;
+    let shell = shell.into();
+    let (mut segments, balanced) = scan_unquoted_segments(command, shell, true)?;
     if !balanced {
-        let (flat, _) = scan_unquoted_segments(command, dialect, false)?;
+        let (flat, _) = scan_unquoted_segments(command, shell, false)?;
         segments.extend(flat);
     }
     Ok(segments)
@@ -1573,8 +1688,8 @@ fn split_unquoted_segments_checked(
 /// command. Either guess is a bypass, so the command is refused.
 struct UnreadableHeredoc;
 
-fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
-    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+fn split_unquoted_segments(command: &str, shell: impl Into<ShellGrammar>) -> Vec<String> {
+    split_unquoted_segments_checked(command, shell).unwrap_or_default()
 }
 
 /// One pass of [`split_unquoted_segments_checked`]. `model_substitutions`
@@ -1582,9 +1697,10 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
 /// returned flag is `false` when that model ended unbalanced.
 fn scan_unquoted_segments(
     command: &str,
-    dialect: ShellDialect,
+    shell: ShellGrammar,
     model_substitutions: bool,
 ) -> Result<(Vec<String>, bool), UnreadableHeredoc> {
+    let dialect = shell.dialect;
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1608,7 +1724,7 @@ fn scan_unquoted_segments(
     // pair means the opener is a heredoc whose delimiter this scanner cannot
     // prove. Its body runs to the end of the command, so the text stays data
     // instead of being parsed as shell.
-    let mut heredoc_delimiter: Option<(Option<String>, bool)> = None;
+    let mut heredoc_delimiter: Option<HeredocDelimiter> = None;
     // The command-frame depth that owns an unproven heredoc body. The body
     // ends when that frame closes, so it cannot hide the command after a
     // substitution. `None` means the opener was at top level: its body has no
@@ -1625,7 +1741,7 @@ fn scan_unquoted_segments(
     // Their bodies start at the next unquoted newline.
     // A substitution sets this queue aside and starts its own (see
     // `SegmentFrame::outer_heredocs`).
-    let mut pending_heredocs: VecDeque<(Option<String>, bool)> = VecDeque::new();
+    let mut pending_heredocs: VecDeque<HeredocDelimiter> = VecDeque::new();
     // Backslash state for finding a backtick's closer, which ignores quotes,
     // comments, and heredoc bodies (see the backtick check below).
     let mut backtick_escaped = false;
@@ -1783,7 +1899,7 @@ fn scan_unquoted_segments(
                         } else {
                             heredoc_line_buf.as_str()
                         };
-                        if Some(line) == delim.as_deref() {
+                        if Some(line.as_bytes()) == delim.as_deref() {
                             // Terminator line reached. Start the next queued
                             // heredoc body from the same command line, if any.
                             heredoc_delimiter = pending_heredocs.pop_front();
@@ -1920,6 +2036,7 @@ fn scan_unquoted_segments(
                                     &mut current,
                                     backslash_is_literal,
                                     in_backtick,
+                                    shell.posix_shell,
                                 ) {
                                     // A proven one-line delimiter. Its body is
                                     // data, so it is safe to skip.
@@ -1970,10 +2087,14 @@ fn scan_unquoted_segments(
                                 false,
                             ),
                             // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
-                            // that is still a word boundary.
+                            // that is still a word boundary. A bare `((` is an
+                            // arithmetic command to bash (with the same `))`
+                            // test as `$((`) and nested subshells to dash.
                             _ => {
-                                let in_arithmetic_group =
-                                    frames.last().is_some_and(|frame| frame.arithmetic);
+                                let double_paren = chars.peek() == Some(&'(')
+                                    && !frames.last().is_some_and(|frame| frame.arithmetic);
+                                let bash_arithmetic =
+                                    double_paren && shell.posix_shell == PosixShell::Bash;
                                 open_segment_frame(
                                     &mut frames,
                                     &mut segments,
@@ -1982,10 +2103,10 @@ fn scan_unquoted_segments(
                                     &mut pending_heredocs,
                                     SegmentFrameKind::Paren,
                                     None,
-                                    false,
+                                    bash_arithmetic,
                                 );
-                                if !in_arithmetic_group
-                                    && chars.peek() == Some(&'(')
+                                if double_paren
+                                    && !bash_arithmetic
                                     && let Some(frame) = frames.last_mut()
                                 {
                                     frame.double_paren = true;
@@ -1999,16 +2120,15 @@ fn scan_unquoted_segments(
                                 .last()
                                 .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
                         {
-                            // Closing the first group of a `$((` frame. If `)`
-                            // follows at once, the expression is arithmetic.
+                            // Closing the first group of an arithmetic root. If
+                            // `)` follows at once, the expression is arithmetic.
                             let group_of_root = frames.len() >= 2
                                 && frames.last().is_some_and(|frame| {
-                                    frame.arithmetic && frame.resume.is_none()
+                                    frame.arithmetic && !frame.arithmetic_root
                                 });
                             if group_of_root
                                 && let Some(root) = frames.iter_mut().rev().nth(1)
-                                && root.arithmetic
-                                && root.resume.is_some()
+                                && root.arithmetic_root
                                 && !root.first_group_closed
                             {
                                 root.first_group_closed = true;
@@ -4041,17 +4161,18 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix.into())
     }
 
     fn command_risk_level_for_posix_like_shell(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: ShellGrammar,
     ) -> CommandRiskLevel {
+        let dialect = shell.dialect;
         let mut saw_medium = false;
 
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             // The body boundary cannot be proven, so the risk of the commands
             // after it cannot be proven either.
             return CommandRiskLevel::High;
@@ -4091,11 +4212,12 @@ impl SecurityPolicy {
     pub fn command_risk_level_for_shell(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: impl Into<ShellGrammar>,
     ) -> CommandRiskLevel {
-        match dialect {
+        let shell = shell.into();
+        match shell.dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                return self.command_risk_level_for_posix_like_shell(command, dialect);
+                return self.command_risk_level_for_posix_like_shell(command, shell);
             }
             ShellDialect::None => return CommandRiskLevel::High,
             ShellDialect::PowerShell => {}
@@ -4204,8 +4326,10 @@ impl SecurityPolicy {
         &self,
         command: &str,
         approved: bool,
-        dialect: ShellDialect,
+        shell: impl Into<ShellGrammar>,
     ) -> Result<CommandRiskLevel, String> {
+        let shell = shell.into();
+        let dialect = shell.dialect;
         if dialect == ShellDialect::None {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
@@ -4218,20 +4342,20 @@ impl SecurityPolicy {
         // enforced by that wrapper; running it again here would reject legitimate
         // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
         if shell_uses_windows_path_syntax(dialect)
-            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, shell)
         {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
-        if !self.is_command_allowed_for_shell(command, dialect) {
+        if !self.is_command_allowed_for_shell(command, shell) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
-        let risk = self.command_risk_level_for_shell(command, dialect);
+        let risk = self.command_risk_level_for_shell(command, shell);
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands
-                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
+                && !self.is_command_explicitly_allowed_for_shell(command, shell)
             {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
@@ -4256,11 +4380,8 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
-    fn is_command_explicitly_allowed_for_shell(
-        &self,
-        command: &str,
-        dialect: ShellDialect,
-    ) -> bool {
+    fn is_command_explicitly_allowed_for_shell(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         match dialect {
             ShellDialect::PowerShell => {
                 let Some(segments) = split_powershell_pipeline_syntax(command) else {
@@ -4286,15 +4407,16 @@ impl SecurityPolicy {
                 })
             }
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command, dialect)
+                self.is_command_explicitly_allowed(command, shell)
             }
             ShellDialect::None => false,
         }
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+    fn is_command_explicitly_allowed(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         // A split that refuses a heredoc proves no command is listed.
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             return false;
         };
         for segment in &segments {
@@ -4350,11 +4472,16 @@ impl SecurityPolicy {
     /// dialect selects the command grammar (PowerShell vs POSIX-like) and gates
     /// platform-specific redirect safety (the Windows `nul` null device is only
     /// discard-safe under `cmd.exe`).
-    pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
-        match dialect {
+    pub fn is_command_allowed_for_shell(
+        &self,
+        command: &str,
+        shell: impl Into<ShellGrammar>,
+    ) -> bool {
+        let shell = shell.into();
+        match shell.dialect {
             ShellDialect::PowerShell => self.is_simple_powershell_command_allowed(command),
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_posix_like_command_allowed(command, dialect)
+                self.is_posix_like_command_allowed(command, shell)
             }
             ShellDialect::None => false,
         }
@@ -4422,7 +4549,8 @@ impl SecurityPolicy {
         true
     }
 
-    fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+    fn is_posix_like_command_allowed(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -4436,7 +4564,7 @@ impl SecurityPolicy {
             // The opt-out skips syntax restrictions, but not a heredoc whose
             // body boundary cannot be proven. The path and risk checks refuse
             // that command for the same reason.
-            return split_unquoted_segments_checked(command, dialect).is_ok();
+            return split_unquoted_segments_checked(command, shell).is_ok();
         }
 
         if command.contains('`')
@@ -4494,7 +4622,7 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         // An unreadable heredoc yields no segments, which must not read as
         // "every segment is allowed".
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             return false;
         };
         for segment in &segments {
@@ -4614,9 +4742,9 @@ impl SecurityPolicy {
     pub fn forbidden_path_argument_for_shell(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: impl Into<ShellGrammar>,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, false)
+        self.forbidden_path_argument_impl(command, shell.into(), false)
     }
 
     /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
@@ -4627,18 +4755,19 @@ impl SecurityPolicy {
     pub fn forbidden_workspace_path_argument_for_shell(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: impl Into<ShellGrammar>,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, true)
+        self.forbidden_path_argument_impl(command, shell.into(), true)
     }
 
     fn forbidden_path_argument_impl(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: ShellGrammar,
         resolve_workspace: bool,
     ) -> Option<String> {
-        if split_unquoted_segments_checked(command, dialect).is_err() {
+        let dialect = shell.dialect;
+        if split_unquoted_segments_checked(command, shell).is_err() {
             // Name the opener rather than a path. The shell wrapper refuses
             // any `Some`, and guessing which later command runs is the bypass.
             return Some("unreadable heredoc delimiter".into());
@@ -4716,7 +4845,7 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command, dialect) {
+        for segment in split_unquoted_segments(command, shell) {
             let words = shell_words_after_env_assignments(&segment, dialect);
             let Some(executable) = words.first() else {
                 continue;
@@ -9785,6 +9914,143 @@ mod tests {
             );
             assert!(!risk.is_command_allowed(command), "{command}");
         }
+    }
+
+    fn bash_grammar() -> ShellGrammar {
+        ShellGrammar {
+            dialect: ShellDialect::Posix,
+            posix_shell: PosixShell::Bash,
+        }
+    }
+
+    /// When the shell is known to be bash, the forms POSIX shells disagree on
+    /// are read the way bash 3.2 through 5.3 read them, in normal and POSIX
+    /// mode, instead of being refused.
+    #[test]
+    fn bash_grammar_expands_ansi_c_heredoc_delimiters_bytewise() {
+        let p = unix_forbidden_path_policy();
+        let bash = |command: &str| p.forbidden_path_argument_for_shell(command, bash_grammar());
+        // (delimiter word, the terminator line bash matches)
+        for (word, terminator) in [
+            ("$'EOF'", "EOF"),
+            ("$'E\\x41F'", "EAF"),
+            ("$'E\\x4g'", "E\u{4}g"),
+            ("$'E\\xg'", "E\\xg"),
+            ("$'E\\101F'", "EAF"),
+            ("$'E\\0101'", "E\u{8}1"),
+            ("$'E\\tF'", "E\tF"),
+            ("$'E\\rF'", "E\rF"),
+            ("$'E\\'F'", "E'F"),
+            ("$'E\\qF'", "E\\qF"),
+            ("$'E\\xc3\\xa9F'", "EéF"),
+            ("E$'O'F", "EOF"),
+            // A NUL ends the quoted part; escapes still apply while skipping
+            // the rest of it, and text after the quote stays.
+            ("$'E\\0F'X", "EX"),
+            ("$'E\\400F'", "E"),
+            ("$'E\\x00Q'", "E"),
+            ("$'\\0A\\'B'X", "X"),
+        ] {
+            // The body is data, including a lookalike of dash's terminator.
+            let body = format!("cat <<{word}\n/etc/passwd\n$EOF\n{terminator}");
+            assert_eq!(bash(&body), None, "{body:?}");
+            // The command after the terminator runs and is scanned.
+            let after = format!("cat <<{word}\nhello\n{terminator}\nwc -l /etc/passwd");
+            assert_eq!(bash(&after), Some("/etc/passwd".into()), "{after:?}");
+        }
+        // `\777` is the byte 0xff, which no UTF-8 line contains, so bash never
+        // matches the terminator and the body runs to the end.
+        assert_eq!(bash("cat <<$'E\\777F'\n/etc/passwd\nE\u{ff}F"), None);
+        // Inside a substitution the quoted command after the real terminator
+        // is scanned (Greptile's `\0A\'B'X` case).
+        assert_eq!(
+            bash("echo \"$(cat <<$'\\0A\\'B'X\nhello\nX\nwc -l /etc/passwd\nBX\n)\"\n)\""),
+            Some("/etc/passwd".into())
+        );
+        // Escapes whose meaning varies across bash versions, `$"..."`, and a
+        // newline in the delimiter stay refused.
+        for word in [
+            "$'E\\cAF'",
+            "$'E\\c?F'",
+            "$'E\\u00e9F'",
+            "$'E\\U0001F600F'",
+            "$'E\\nF'",
+            "$'E\\\nF'",
+            "$\"EOF\"",
+            "$'EOF",
+        ] {
+            let command = format!("cat <<{word}\nhello\nEOF\nwc -l /etc/passwd");
+            assert_eq!(
+                bash(&command),
+                Some("unreadable heredoc delimiter".into()),
+                "{command:?}"
+            );
+        }
+        // The portable grammar still refuses every `$'...'` delimiter.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "cat <<$'EOF'\nhello\nEOF\nwc -l /etc/passwd",
+                ShellDialect::Posix
+            ),
+            Some("unreadable heredoc delimiter".into())
+        );
+    }
+
+    /// Bash reads a bare `((...))` as arithmetic when the second `(` closes
+    /// with `)` right after it, and as nested subshells otherwise.
+    #[test]
+    fn bash_grammar_reads_bare_double_parentheses_as_arithmetic() {
+        let p = unix_forbidden_path_policy();
+        let bash = |command: &str| p.forbidden_path_argument_for_shell(command, bash_grammar());
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            "(( x = 10 / 2 ))",
+            "((y = x / 2)); echo \"$y\"",
+            "(( (a + b) / 2 ))",
+            // Arithmetic: bash reports an expression error and runs nothing.
+            "((cat /etc/passwd))",
+        ] {
+            assert_eq!(bash(command), None, "{command}");
+            assert_eq!(
+                risk.command_risk_level_for_shell(command, bash_grammar()),
+                CommandRiskLevel::Low,
+                "{command}"
+            );
+        }
+        for command in [
+            // `<<` is a shift, so the next line runs.
+            "((x=8<<1))\nwc -l /etc/passwd\n1",
+            "(( x = 8 << 1 ))\nwc -l /etc/passwd",
+            // Without `))` after the second `(`'s match, these are subshells.
+            "((cat /etc/passwd) )",
+            "((true) ; cat /etc/passwd)",
+            "(( $(wc -l < /etc/passwd) / 2 ))",
+        ] {
+            assert_eq!(bash(command), Some("/etc/passwd".into()), "{command}");
+        }
+        // The portable grammar refuses the shift and scans `((cmd))`, which
+        // dash runs as subshells.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "((x=8<<1))\nwc -l /etc/passwd\n1",
+                ShellDialect::Posix
+            ),
+            Some("unreadable heredoc delimiter".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument_for_shell("((cat /etc/passwd))", ShellDialect::Posix),
+            Some("/etc/passwd".into())
+        );
+        // The `EOF)` terminator inside a quoted substitution varies across
+        // bash versions, so it stays refused even for bash.
+        assert_eq!(
+            bash("echo \"$(cat <<EOF\nhello\nEOF)\"; wc -l /etc/passwd"),
+            Some("unreadable heredoc delimiter".into())
+        );
     }
 
     /// The strict allowlist decision for grouping and substitution syntax is

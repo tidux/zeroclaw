@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
+use zeroclaw_api::runtime_traits::ShellGrammar;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
@@ -230,11 +231,36 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution_for_shell(
+        // Resolve the command before validating it, so the policy reads the
+        // command in the grammar of the shell that will actually run it. The
+        // forwarded map is immutable for the session incarnation, so launcher
+        // resolution and the child process read the same values. Nothing is
+        // spawned until validation passes, and a policy rejection still takes
+        // precedence over a launcher that cannot be resolved.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let built = self.runtime.build_shell_command_with_effective_path(
             command,
-            approved,
-            self.runtime.shell_dialect(),
-        ) {
+            &self.security.workspace_dir,
+            effective_path,
+        );
+        // The built program is the resolved shell binary. Without one, or
+        // under a sandbox that runs a different shell (a container image's),
+        // the grammar stays portable.
+        let dialect = self.runtime.shell_dialect();
+        let shell = match &built {
+            Ok(cmd) if self.sandbox.runs_host_shell() => {
+                ShellGrammar::for_program(dialect, cmd.as_std().get_program())
+            }
+            _ => ShellGrammar::from(dialect),
+        };
+
+        match self
+            .security
+            .validate_command_execution_for_shell(command, approved, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -251,7 +277,7 @@ impl Tool for ShellTool {
         // null device only on the native Windows execution path.
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_for_shell(command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -260,20 +286,7 @@ impl Tool for ShellTool {
             });
         }
 
-        // Execute with timeout to prevent hanging commands.
-        // Clear the environment to prevent leaking API keys and other secrets
-        // (CWE-200), then re-add only safe, functional variables.
-        // The forwarded map is immutable for the session incarnation, so
-        // launcher resolution and the child process read the same values.
-        let tui_env_snapshot = self.tui_env.as_ref();
-        let effective_path = tui_env_snapshot
-            .and_then(|env| env.get("PATH"))
-            .map(OsStr::new);
-        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
-            command,
-            &self.security.workspace_dir,
-            effective_path,
-        ) {
+        let mut cmd = match built {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -302,6 +315,9 @@ impl Tool for ShellTool {
                 anyhow::Error::msg(format!("Sandbox error: {e}"))
             })?;
 
+        // Execute with timeout to prevent hanging commands.
+        // Clear the environment to prevent leaking API keys and other secrets
+        // (CWE-200), then re-add only safe, functional variables.
         cmd.env_clear();
 
         for var in collect_allowed_shell_env_vars(&self.security) {
@@ -689,6 +705,128 @@ mod tests {
             block_high_risk_commands: false,
             ..SecurityPolicy::default()
         })
+    }
+
+    /// A sandbox that wraps nothing but, like a container sandbox, does not
+    /// promise to run the host's shell.
+    struct ForeignShellSandbox;
+
+    impl Sandbox for ForeignShellSandbox {
+        fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &str {
+            "foreign-shell-test"
+        }
+
+        fn description(&self) -> &str {
+            "test sandbox that runs a shell other than the host's"
+        }
+    }
+
+    /// The canonical host bash, or `None` where there is none to test with.
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn host_bash() -> Option<std::path::PathBuf> {
+        let bash = zeroclaw_config::platform::resolve_executable(OsStr::new("bash")).ok()?;
+        std::fs::canonicalize(bash).ok()
+    }
+
+    /// The shell tool reads a command in the grammar of the binary it spawns.
+    /// Bash expands a `$'...'` heredoc delimiter, so the command runs; the
+    /// same command is refused when the shell is not known to be bash.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn shell_reads_commands_in_the_resolved_bash_grammar() {
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let command = json!({"command": "cat <<$'EOF'\nhello\nEOF"});
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell(
+            bash.to_string_lossy().into_owned(),
+        ));
+
+        let tool = ShellTool::new(unrestricted_shell_test_security(), runtime.clone());
+        let result = tool.execute(command.clone()).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), "hello");
+
+        // A sandbox that may run a different shell keeps the portable rules.
+        let tool = ShellTool::new_with_sandbox(
+            unrestricted_shell_test_security(),
+            runtime,
+            Arc::new(ForeignShellSandbox),
+        );
+        let result = tool.execute(command).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "{:?}",
+            result.error
+        );
+    }
+
+    /// The shell is identified from the executable that runs, not from the
+    /// configured name: `sh` linked to bash is bash, and a `bash` link to
+    /// another shell is not.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[tokio::test]
+    async fn shell_grammar_follows_the_canonical_executable_not_its_name() {
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let command = json!({"command": "cat <<$'EOF'\nhello\nEOF"});
+
+        let sh = dir.path().join("sh");
+        std::os::unix::fs::symlink(&bash, &sh).unwrap();
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell(sh.to_string_lossy().into_owned()));
+        let result = ShellTool::new(unrestricted_shell_test_security(), runtime)
+            .execute(command.clone())
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let other = ["/bin/sh", "dash", "zsh", "ksh"]
+            .into_iter()
+            .find_map(|shell| {
+                let resolved =
+                    zeroclaw_config::platform::resolve_executable(OsStr::new(shell)).ok()?;
+                let canonical = std::fs::canonicalize(resolved).ok()?;
+                (canonical.file_name() != Some(OsStr::new("bash"))).then_some(canonical)
+            });
+        let Some(other) = other else {
+            eprintln!("skipping the spoof half: no POSIX shell other than bash");
+            return;
+        };
+        let fake_bash = dir.path().join("bash");
+        std::os::unix::fs::symlink(&other, &fake_bash).unwrap();
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell(
+            fake_bash.to_string_lossy().into_owned(),
+        ));
+        let result = ShellTool::new(unrestricted_shell_test_security(), runtime)
+            .execute(command)
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "{:?}",
+            result.error
+        );
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {

@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::runtime_traits::ShellGrammar;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Default execution time for a skill shell command when the manifest does not
@@ -168,13 +169,26 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
+        // Resolve the command before validating it, so the policy reads the
+        // command in the grammar of the shell that will run it: the built
+        // program is the resolved shell binary, and this tool runs it without
+        // a sandbox. Nothing is spawned until validation passes, and a policy
+        // rejection still takes precedence over an unresolvable launcher.
+        let built = self
+            .runtime
+            .build_shell_command(&command, &self.security.workspace_dir);
+        let dialect = self.runtime.shell_dialect();
+        let shell = match &built {
+            Ok(cmd) => ShellGrammar::for_program(dialect, cmd.as_std().get_program()),
+            Err(_) => ShellGrammar::from(dialect),
+        };
+
         // Security validation — always requires explicit approval (approved=true)
         // since skill tools are user-defined and should be treated as medium-risk.
-        match self.security.validate_command_execution_for_shell(
-            &command,
-            true,
-            self.runtime.shell_dialect(),
-        ) {
+        match self
+            .security
+            .validate_command_execution_for_shell(&command, true, shell)
+        {
             Ok(_) => {}
             Err(reason) => {
                 return Ok(ToolResult {
@@ -187,7 +201,7 @@ impl Tool for SkillShellTool {
 
         if let Some(path) = self
             .security
-            .forbidden_workspace_path_argument_for_shell(&command, self.runtime.shell_dialect())
+            .forbidden_workspace_path_argument_for_shell(&command, shell)
         {
             return Ok(ToolResult {
                 success: false,
@@ -196,10 +210,7 @@ impl Tool for SkillShellTool {
             });
         }
 
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(&command, &self.security.workspace_dir)
-        {
+        let mut cmd = match built {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {

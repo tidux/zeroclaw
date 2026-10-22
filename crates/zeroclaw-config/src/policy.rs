@@ -1076,6 +1076,19 @@ struct SegmentFrame {
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
     outer_heredocs: Option<VecDeque<(Option<String>, bool)>>,
+    /// For a `$((` frame: text of the expression, held back until the frame
+    /// closes. It runs no command only if the expression is confirmed.
+    arithmetic_text: Vec<String>,
+    /// For a `$((` frame: whether its first inner group has closed yet.
+    first_group_closed: bool,
+    /// For a `$((` frame: the second `(` closed with `)` right after it.
+    /// Bash then reads arithmetic, and dash reads `$((` as arithmetic always,
+    /// so neither runs the text as commands.
+    arithmetic_confirmed: bool,
+    /// A grouping `(` followed at once by `(`. Bash reads `((...))` as an
+    /// arithmetic command and dash as nested subshells, so a `<<` inside is a
+    /// shift to one and a heredoc to the other.
+    double_paren: bool,
 }
 
 /// Per-frame syntax that changes what a `)` means. Bash parses a whole
@@ -1203,7 +1216,7 @@ fn open_segment_frame(
             Some(resume)
         }
         None => {
-            push_segment(segments, current);
+            emit_segment(frames, segments, current);
             None
         }
     };
@@ -1221,8 +1234,43 @@ fn open_segment_frame(
         outer_heredocs: placeholder
             .is_some()
             .then(|| std::mem::take(pending_heredocs)),
+        arithmetic_text: Vec::new(),
+        first_group_closed: false,
+        arithmetic_confirmed: false,
+        double_paren: false,
     });
     *quote = QuoteState::None;
+}
+
+/// End a segment of text. Inside a `$((` expression the text is held on that
+/// frame until the expression is confirmed (see
+/// [`SegmentFrame::arithmetic_confirmed`]); everywhere else it is a segment.
+fn emit_segment(frames: &mut [SegmentFrame], segments: &mut Vec<String>, current: &mut String) {
+    let root = if frames.last().is_some_and(|frame| frame.arithmetic) {
+        frames
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.arithmetic && frame.resume.is_some())
+    } else {
+        None
+    };
+    match root {
+        Some(root) => push_segment(&mut root.arithmetic_text, current),
+        None => push_segment(segments, current),
+    }
+}
+
+/// Pop the innermost frame. A `$((` frame's held text becomes segments unless
+/// the expression was confirmed as arithmetic.
+fn pop_segment_frame(
+    frames: &mut Vec<SegmentFrame>,
+    segments: &mut Vec<String>,
+) -> Option<SegmentFrame> {
+    let mut frame = frames.pop()?;
+    if !frame.arithmetic_confirmed {
+        segments.append(&mut frame.arithmetic_text);
+    }
+    Some(frame)
 }
 
 fn close_segment_frame(
@@ -1232,8 +1280,8 @@ fn close_segment_frame(
     quote: &mut QuoteState,
     pending_heredocs: &mut VecDeque<(Option<String>, bool)>,
 ) {
-    push_segment(segments, current);
-    if let Some(frame) = frames.pop() {
+    emit_segment(frames, segments, current);
+    if let Some(frame) = pop_segment_frame(frames, segments) {
         *current = frame.resume.unwrap_or_default();
         *quote = frame.resume_quote;
         // Heredocs still pending here were opened inside the substitution with
@@ -1489,8 +1537,9 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
 /// the last inner word (`$(ls 2>/dev/null)` yields a `/dev/null)` redirect
 /// target), and the inner command hides behind the outer one.
 ///
-/// Every character other than those delimiters lands in a segment (heredoc
-/// bodies aside), but that alone does not mean the checks see it. If the
+/// Every character other than those delimiters lands in a segment, except
+/// heredoc bodies and confirmed `$((...))` arithmetic, which both bash and
+/// dash read as data. That alone does not mean the checks see the rest. If the
 /// scanner closes a substitution where the shell does not, it restores the
 /// enclosing quote state, and commands the shell runs end up inside one quoted
 /// argument that the checks never look into. The scanner therefore follows
@@ -1501,6 +1550,9 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
 /// function made before it modeled them. That only adds segments to check,
 /// so it refuses nothing the flat split accepted. It is not a proof: input
 /// crafted to rebalance a misparse is only as safe as the specific rules.
+/// Where the shells disagree or no split can bound a heredoc body (`<<` in a
+/// bare `((`, a body running to the end inside an open substitution), the
+/// split is refused instead.
 /// Segments are returned in the order they end, so an inner command comes
 /// before the command containing it.
 fn split_unquoted_segments_checked(
@@ -1847,6 +1899,17 @@ fn scan_unquoted_segments(
                                 current.push(second);
                             }
                             if chars.peek() != Some(&'<') && !in_arithmetic {
+                                // Inside a bare `((`, `<<` is a shift to bash and a
+                                // heredoc to dash. Either reading hides the lines
+                                // after it from the other shell.
+                                if frames
+                                    .iter()
+                                    .rev()
+                                    .take_while(|frame| frame.resume.is_none())
+                                    .any(|frame| frame.double_paren)
+                                {
+                                    return Err(UnreadableHeredoc);
+                                }
                                 let in_backtick = frames
                                     .iter()
                                     .any(|frame| frame.kind == SegmentFrameKind::Backtick);
@@ -1906,16 +1969,26 @@ fn scan_unquoted_segments(
                             ),
                             // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
                             // that is still a word boundary.
-                            _ => open_segment_frame(
-                                &mut frames,
-                                &mut segments,
-                                &mut current,
-                                &mut quote,
-                                &mut pending_heredocs,
-                                SegmentFrameKind::Paren,
-                                None,
-                                false,
-                            ),
+                            _ => {
+                                let in_arithmetic_group =
+                                    frames.last().is_some_and(|frame| frame.arithmetic);
+                                open_segment_frame(
+                                    &mut frames,
+                                    &mut segments,
+                                    &mut current,
+                                    &mut quote,
+                                    &mut pending_heredocs,
+                                    SegmentFrameKind::Paren,
+                                    None,
+                                    false,
+                                );
+                                if !in_arithmetic_group
+                                    && chars.peek() == Some(&'(')
+                                    && let Some(frame) = frames.last_mut()
+                                {
+                                    frame.double_paren = true;
+                                }
+                            }
                         }
                     }
                     ')' if posix_substitution && param_depth == 0 => {
@@ -1924,6 +1997,21 @@ fn scan_unquoted_segments(
                                 .last()
                                 .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
                         {
+                            // Closing the first group of a `$((` frame. If `)`
+                            // follows at once, the expression is arithmetic.
+                            let group_of_root = frames.len() >= 2
+                                && frames.last().is_some_and(|frame| {
+                                    frame.arithmetic && frame.resume.is_none()
+                                });
+                            if group_of_root
+                                && let Some(root) = frames.iter_mut().rev().nth(1)
+                                && root.arithmetic
+                                && root.resume.is_some()
+                                && !root.first_group_closed
+                            {
+                                root.first_group_closed = true;
+                                root.arithmetic_confirmed = chars.peek() == Some(&')');
+                            }
                             close_segment_frame(
                                 &mut frames,
                                 &mut segments,
@@ -1984,9 +2072,15 @@ fn scan_unquoted_segments(
             && quote == QuoteState::None
             && top_nest.case_depth == 0
             && top_nest.param_depth == 0);
+    // A heredoc body that runs to the end inside an open substitution may
+    // have swallowed its closer: bash ends a body at `EOF)` there and runs the
+    // rest. Neither split can tell where commands resume, so refuse.
+    if posix_substitution && heredoc_delimiter.is_some() && !frames.is_empty() {
+        return Err(UnreadableHeredoc);
+    }
     // Flush the enclosing text of any substitution left open, so an
     // unterminated `$(` cannot hide the command around it.
-    while let Some(frame) = frames.pop() {
+    while let Some(frame) = pop_segment_frame(&mut frames, &mut segments) {
         if let Some(mut resume) = frame.resume {
             push_segment(&mut segments, &mut resume);
         }
@@ -9327,8 +9421,16 @@ mod tests {
         assert_eq!(split("diff <(a) >(b)"), vec!["a", "b", "diff <() >()"]);
         assert_eq!(split("x=$(a $(b) c) d"), vec!["b", "a $() c", "x=$() d"]);
         assert_eq!(split("x=$(a; b)"), vec!["a", "b", "x=$()"]);
-        // Arithmetic is scanned like a nested command, with no heredoc.
-        assert_eq!(split("echo $((1 << 2))"), vec!["1 << 2", "echo $()"]);
+        // Confirmed `$((...))` arithmetic runs no command, so its text is not
+        // a segment, and its `<<` is a shift rather than a heredoc.
+        assert_eq!(split("echo $((1 << 2))"), vec!["echo $()"]);
+        assert_eq!(split("echo $(( (a + b) / 2 ))"), vec!["echo $()"]);
+        // Without `))` right after the second `(`'s match, bash runs a
+        // subshell, so the text is scanned as commands.
+        assert_eq!(split("x=$((echo a) )"), vec!["echo a", "x=$()"]);
+        assert_eq!(split("x=$((a)+(b))"), vec!["a", "+", "b", "x=$()"]);
+        // A bare `((` is scanned as commands: dash runs it as subshells.
+        assert_eq!(split("((echo a))"), vec!["echo a"]);
         // Unbalanced input keeps every word: an unterminated substitution
         // still flushes the command around it, and a stray `)` is a boundary.
         // Because the model diverged from the shell's, the flat split that
@@ -9383,7 +9485,7 @@ mod tests {
         // A command substitution inside arithmetic recognizes heredocs again.
         assert_eq!(
             split("echo $(( $(cat <<'E'\n)\nE\n) + 1 ))"),
-            vec!["cat <<'E'", "$() + 1", "echo $()"]
+            vec!["cat <<'E'", "echo $()"]
         );
         // The heredoc delimiter is one word, and the body starts at the next
         // newline, so the rest of the line is its own segment.
@@ -9550,6 +9652,83 @@ mod tests {
             assert_eq!(posix(command), None, "{command}");
             assert!(risk.is_command_allowed(command), "{command}");
         }
+    }
+
+    /// `$((...))` whose second `(` closes right before `)` is arithmetic in
+    /// both bash and dash, so its text names no file and runs no command.
+    /// Substitutions inside it still run and are still scanned. Any other
+    /// `$((` or a bare `((` is scanned as commands.
+    #[test]
+    fn posix_confirmed_arithmetic_is_not_a_command() {
+        let p = unix_forbidden_path_policy();
+        let posix =
+            |command: &str| p.forbidden_path_argument_for_shell(command, ShellDialect::Posix);
+        for command in [
+            "echo \"$(( total / count ))\"",
+            "echo $((10 / 2))",
+            "echo $(( (a + b) / 2 ))",
+            "x=$(( $(wc -l < input.txt) / 2 ))",
+        ] {
+            assert_eq!(posix(command), None, "{command}");
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "{command}"
+            );
+        }
+        for command in [
+            "echo $(( $(wc -l < /etc/passwd) / 2 ))",
+            "echo \"$(( `wc -l < /etc/passwd` / 2 ))\"",
+            // Bash reads these as command substitutions holding a subshell.
+            "x=$((cat /etc/passwd) )",
+            "x=$((true) ; cat /etc/passwd)",
+            "x=\"$((true)|cat /etc/passwd)\"",
+            "((cat /etc/passwd))",
+        ] {
+            assert_eq!(posix(command), Some("/etc/passwd".into()), "{command}");
+        }
+    }
+
+    /// Heredoc forms whose body boundary differs between shells, or that
+    /// neither split can bound, are refused rather than guessed.
+    #[test]
+    fn ambiguous_heredoc_boundaries_are_refused() {
+        let p = unix_forbidden_path_policy();
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            // Bash ends a body inside `$(` at `EOF)`, then runs the rest.
+            "x=$(cat <<EOF\nhello\nEOF); wc -l /etc/passwd",
+            "echo \"$(cat <<EOF\nhello\nEOF)\"; wc -l /etc/passwd",
+            // Bash shifts inside `((`, so the next line runs. Dash reads a
+            // subshell with a heredoc whose body is that line.
+            "((x=8<<1))\nwc -l /etc/passwd\n1",
+            "(( x = 8 << 1 ))\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(
+                p.forbidden_path_argument_for_shell(command, ShellDialect::Posix),
+                Some("unreadable heredoc delimiter".into()),
+                "{command}"
+            );
+            let high = command.replace("wc -l /etc/passwd", "rm -rf ./build");
+            assert_eq!(
+                risk.command_risk_level(&high),
+                CommandRiskLevel::High,
+                "{high}"
+            );
+            assert!(!risk.is_command_allowed(command), "{command}");
+        }
+        // A heredoc in a spaced subshell means the same to both shells.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "( (cat <<EOF\nhello\nEOF\n) )\nwc -l /etc/passwd",
+                ShellDialect::Posix
+            ),
+            Some("/etc/passwd".into())
+        );
     }
 
     /// `$'...'` heredoc delimiters mean different things to bash and dash, the

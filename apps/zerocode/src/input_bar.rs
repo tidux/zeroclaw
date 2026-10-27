@@ -4180,6 +4180,21 @@ mod tests {
     }
 
     #[test]
+    fn second_enter_after_load_session_completion_opens_the_picker() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/load-s");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::Consumed
+        ));
+        assert_eq!(bar.input(), "/load-session ");
+        assert!(matches!(
+            bar.handle_key(KeyEvent::from(KeyCode::Enter)),
+            InputBarAction::OpenSessionPicker
+        ));
+    }
+
+    #[test]
     fn enter_accepts_highlighted_provider_arg_and_submits() {
         let mut bar = input_bar_with_shared_commands();
         bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);

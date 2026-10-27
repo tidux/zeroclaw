@@ -6213,6 +6213,7 @@ impl crate::widgets::HelpContext for Chat {
                     ),
                 ];
                 pane_entries.extend(queue_sidebar_help_entries());
+                pane_entries.push(E::desc(crate::i18n::t("zc-chat-help-load-session")));
                 // Code owns a session root the user can re-select; Chat
                 // sessions keep the root they started with, so the hint is
                 // scoped to this pane.
@@ -21701,6 +21702,23 @@ mod tests {
         };
         assert!(sessions.is_empty());
         assert_eq!(list_state.selected(), None);
+
+        let entries = vec![
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("a", None, None))
+                .unwrap(),
+            serde_json::from_value::<crate::client::SessionEntry>(listed_session("b", None, None))
+                .unwrap(),
+        ];
+        state.open_session_list(entries);
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open with entries");
+        };
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(list_state.selected(), Some(0));
     }
 
     /// Answer every follow-up request a transition emits (session/close,

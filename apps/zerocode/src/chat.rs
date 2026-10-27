@@ -52,6 +52,7 @@ use context_menu::{
 };
 
 mod message_queue;
+mod session_lookup;
 mod transcript_layout;
 use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
 pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};

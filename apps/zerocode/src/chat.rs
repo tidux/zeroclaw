@@ -4647,35 +4647,11 @@ impl Chat {
                 self.add_session_requested = true;
             }
             Some(ChatTabAction::SwitchSession) => {
-                // ACP and Chat live in separate stores and must not cross-pick:
-                //  • Chat → unified session_backend (filter out channel-backed
-                //    sessions; those are owned by the channels pane).
-                //  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
-                let picker_sessions = if self.pane_kind == PaneKind::Acp {
-                    self.rpc
-                        .acp_session_list()
-                        .await
-                        .map(|list| list.sessions)
-                        .unwrap_or_default()
-                } else {
-                    match self.rpc.session_list(None).await {
-                        Ok(list) => list
-                            .sessions
-                            .into_iter()
-                            .filter(|s| s.channel_id.is_none())
-                            .collect(),
-                        Err(_) => Vec::new(),
-                    }
-                };
-
-                let mut ls = ListState::default();
-                if !picker_sessions.is_empty() {
-                    ls.select(Some(0));
-                }
-                state.session_overlay = SessionOverlay::List {
-                    sessions: picker_sessions,
-                    list_state: ls,
-                };
+                // A listing failure shows an empty picker, as before.
+                let sessions = Self::list_pane_sessions(&self.rpc, self.pane_kind)
+                    .await
+                    .unwrap_or_default();
+                state.open_session_list(sessions);
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -4816,6 +4792,34 @@ impl Chat {
     /// Session-picker confirm: focus the picked session if this pane already
     /// tracks it, else attach it as a new tracked session. The previously
     /// focused session stays live in `background` (no `session/close`).
+    /// The persisted sessions this pane may load, from the pane's own store.
+    ///
+    /// ACP and Chat live in separate stores and must not cross-pick:
+    ///  • Chat → unified session_backend (filter out channel-backed
+    ///    sessions; those are owned by the channels pane).
+    ///  • ACP  → dedicated acp-sessions.db, listed by a separate RPC.
+    async fn list_pane_sessions(
+        rpc: &RpcClient,
+        pane_kind: PaneKind,
+    ) -> Result<Vec<SessionEntry>, String> {
+        if pane_kind == PaneKind::Acp {
+            rpc.acp_session_list()
+                .await
+                .map(|list| list.sessions)
+                .map_err(|e| e.to_string())
+        } else {
+            rpc.session_list(None)
+                .await
+                .map(|list| {
+                    list.sessions
+                        .into_iter()
+                        .filter(|s| s.channel_id.is_none())
+                        .collect()
+                })
+                .map_err(|e| e.to_string())
+        }
+    }
+
     async fn switch_to_session_entry(&mut self, entry: crate::client::SessionEntry) {
         let new_sid = entry.session_id;
         let new_name = entry.name;
@@ -12076,6 +12080,18 @@ impl ChatState {
     /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
+    }
+
+    /// Open the session picker over `sessions`, selecting the first row.
+    fn open_session_list(&mut self, sessions: Vec<SessionEntry>) {
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(0));
+        }
+        self.session_overlay = SessionOverlay::List {
+            sessions,
+            list_state,
+        };
     }
 
     fn surface_cleanup_report(&mut self, report: CleanupReport) {
@@ -21560,6 +21576,98 @@ mod tests {
         chat.session_order.push(session_id.to_string());
         chat.phase = ChatPhase::Active(Box::new(state));
         chat
+    }
+
+    fn listed_session(id: &str, name: Option<&str>, channel: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": id,
+            "session_key": id,
+            "created_at": "2026-10-27T00:00:00Z",
+            "last_activity": "2026-10-27T00:05:00Z",
+            "message_count": 2,
+            "agent_alias": "alpha",
+            "channel_id": channel,
+            "name": name,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_uses_the_acp_store_for_code_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "Code panes list the ACP store").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [listed_session("acp-1", None, None)] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["acp-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_hides_channel_sessions_in_chat_panes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Chat).await });
+        let request = next_rpc_request(&mut rx, "Chat panes list the unified store").await;
+        assert_eq!(request["method"], method::SESSION_LIST);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "sessions": [
+                listed_session("chan-1", None, Some("telegram")),
+                listed_session("web-1", None, None),
+            ] }),
+        );
+        let ids: Vec<String> = task
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(ids, ["web-1"]);
+    }
+
+    #[tokio::test]
+    async fn list_pane_sessions_reports_store_errors() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let task =
+            tokio::spawn(async move { Chat::list_pane_sessions(&client, PaneKind::Acp).await });
+        let request = next_rpc_request(&mut rx, "listing should reach the daemon").await;
+        respond_err(&rpc, &request, -32000, "store unavailable");
+        let error = task.await.unwrap().expect_err("an RPC error must surface");
+        assert!(error.contains("store unavailable"), "got: {error}");
+    }
+
+    #[test]
+    fn open_session_list_selects_the_first_row_or_none() {
+        let mut state = state_for("sess-1", "alpha");
+        state.open_session_list(Vec::new());
+        let SessionOverlay::List {
+            sessions,
+            list_state,
+        } = &state.session_overlay
+        else {
+            panic!("the picker must open even when empty");
+        };
+        assert!(sessions.is_empty());
+        assert_eq!(list_state.selected(), None);
     }
 
     fn headless_term() -> crate::config_manager::Term {

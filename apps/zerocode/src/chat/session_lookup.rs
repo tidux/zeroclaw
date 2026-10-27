@@ -21,8 +21,10 @@ pub(crate) enum SessionMatch {
 ///
 /// 1. exact `session_id`
 /// 2. exact `name`
-/// 3. case-insensitive `name`
+/// 3. case-insensitive `name` (Unicode lowercase, not full case folding)
 /// 4. case-insensitive `session_id` prefix
+///
+/// An empty query returns [`SessionMatch::NoMatch`] without checking any tier.
 pub(crate) fn resolve_session(sessions: &[SessionEntry], query: &str) -> SessionMatch {
     // The parser routes an empty argument to the picker; guard anyway so an
     // empty prefix can never match every session.
@@ -142,11 +144,20 @@ mod tests {
 
     #[test]
     fn unnamed_sessions_do_not_match_by_name() {
-        let sessions = [entry("s-1", None), entry("s-2", None)];
-        assert!(matches!(
-            resolve_session(&sessions, "foo"),
-            SessionMatch::NoMatch
-        ));
+        let sessions = [entry("s-1", None), entry("s-2", Some("foo"))];
+        assert_eq!(one_id(resolve_session(&sessions, "foo")), "s-2");
+    }
+
+    #[test]
+    fn case_insensitive_name_beats_an_id_prefix() {
+        let sessions = [entry("cafe1234-0000", None), entry("s-named", Some("Cafe"))];
+        assert_eq!(one_id(resolve_session(&sessions, "cafe")), "s-named");
+    }
+
+    #[test]
+    fn exact_name_beats_an_id_prefix() {
+        let sessions = [entry("cafe1234-0000", None), entry("s-named", Some("cafe"))];
+        assert_eq!(one_id(resolve_session(&sessions, "cafe")), "s-named");
     }
 
     #[test]

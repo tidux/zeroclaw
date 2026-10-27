@@ -4789,9 +4789,6 @@ impl Chat {
         }
     }
 
-    /// Session-picker confirm: focus the picked session if this pane already
-    /// tracks it, else attach it as a new tracked session. The previously
-    /// focused session stays live in `background` (no `session/close`).
     /// The persisted sessions this pane may load, from the pane's own store.
     ///
     /// ACP and Chat live in separate stores and must not cross-pick:
@@ -4820,6 +4817,9 @@ impl Chat {
         }
     }
 
+    /// Session-picker confirm: focus the picked session if this pane already
+    /// tracks it, else attach it as a new tracked session. The previously
+    /// focused session stays live in `background` (no `session/close`).
     async fn switch_to_session_entry(&mut self, entry: crate::client::SessionEntry) {
         let new_sid = entry.session_id;
         let new_name = entry.name;

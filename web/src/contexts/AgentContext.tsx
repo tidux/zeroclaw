@@ -35,6 +35,7 @@ import {
 import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import {
   EMPTY_CONTEXT_LIMITS,
+  applyHistoryTrimToDisplayedBudget,
   contextLimitsFromDoneFrame,
 } from '@/contexts/contextLimits.logic';
 import {
@@ -254,6 +255,13 @@ export function AgentProvider({
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
   const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
+  // The socket callback is stable across frames, so a trim reads the latest
+  // displayed snapshot from these refs rather than a closure captured at the
+  // previous `done` frame.
+  const contextLimitsRef = useRef(contextLimits);
+  const contextInputTokensRef = useRef(contextInputTokens);
+  contextLimitsRef.current = contextLimits;
+  contextInputTokensRef.current = contextInputTokens;
 
   const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
@@ -565,6 +573,22 @@ export function AgentProvider({
 
       case 'history_trimmed': {
         const content = buildHistoryTrimmedNotice(msg, t);
+        // The trim lands after the usage sample the meter last rendered, and
+        // the next refresh is the terminal `done` frame. Adopt the post-trim
+        // count now so the bar does not keep the pre-trim snapshot.
+        const trimmedBudget = applyHistoryTrimToDisplayedBudget(
+          {
+            inputTokens: contextInputTokensRef.current,
+            maxTokens: contextLimitsRef.current.maxTokens,
+          },
+          msg,
+        );
+        if (trimmedBudget.inputTokens !== contextInputTokensRef.current) {
+          setContextInputTokens(trimmedBudget.inputTokens);
+        }
+        if (trimmedBudget.maxTokens !== contextLimitsRef.current.maxTokens) {
+          setContextLimits((prev) => ({ ...prev, maxTokens: trimmedBudget.maxTokens }));
+        }
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,

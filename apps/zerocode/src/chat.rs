@@ -4488,11 +4488,7 @@ impl Chat {
                 }
                 InputBarAction::OpenSessionPicker => {
                     // Same picker and listing as `Ctrl+S`.
-                    let rpc = Arc::clone(&self.rpc);
-                    let sessions = Self::list_pane_sessions(&rpc, self.pane_kind)
-                        .await
-                        .unwrap_or_default();
-                    state.open_session_list(sessions);
+                    Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
                     return false;
                 }
                 InputBarAction::LoadSession(query) => {
@@ -4657,10 +4653,7 @@ impl Chat {
             }
             Some(ChatTabAction::SwitchSession) => {
                 // A listing failure shows an empty picker, as before.
-                let sessions = Self::list_pane_sessions(&self.rpc, self.pane_kind)
-                    .await
-                    .unwrap_or_default();
-                state.open_session_list(sessions);
+                Self::open_pane_session_picker(&self.rpc, self.pane_kind, state).await;
             }
             Some(ChatTabAction::ToggleThoughts)
                 if state.input_bar.input().is_empty()
@@ -4824,6 +4817,15 @@ impl Chat {
                 })
                 .map_err(|e| e.to_string())
         }
+    }
+
+    /// Open the session picker over this pane's saved sessions (Ctrl+S and
+    /// bare `/load-session`). A listing failure shows an empty picker.
+    async fn open_pane_session_picker(rpc: &RpcClient, pane_kind: PaneKind, state: &mut ChatState) {
+        let sessions = Self::list_pane_sessions(rpc, pane_kind)
+            .await
+            .unwrap_or_default();
+        state.open_session_list(sessions);
     }
 
     /// `/load-session <query>`: resolve `query` against this pane's store and
@@ -15989,23 +15991,10 @@ mod tests {
         serde_json::from_str(&line).expect("RPC request should be JSON")
     }
 
-    /// Answer every follow-up request a transition emits (session/close,
-    /// model identity refresh, history load) with a permissive empty result,
-    /// until the pane goes quiet. Keeps transition tests focused on the
-    /// behavior under test rather than on exact RPC choreography.
+    /// Answer every follow-up request permissively; see
+    /// [`drain_and_record_methods`] for the drain behavior.
     async fn drain_pending_requests(rx: &mut mpsc::Receiver<String>, rpc: &RpcOutbound) {
-        while let Ok(Some(line)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-        {
-            let request: serde_json::Value =
-                serde_json::from_str(&line).expect("RPC request should be JSON");
-            if let Some(id) = request["id"].as_str() {
-                rpc.dispatch_response(
-                    id,
-                    Some(serde_json::json!({ "messages": [], "sessions": [] })),
-                    None,
-                );
-            }
-        }
+        drain_and_record_methods(rx, rpc).await;
     }
 
     fn respond_ok(rpc: &RpcOutbound, request: &serde_json::Value, result: serde_json::Value) {
@@ -21714,8 +21703,12 @@ mod tests {
         assert_eq!(list_state.selected(), None);
     }
 
-    /// Answer every follow-up request permissively and record its method, so a
-    /// test can assert that no `session/new` was sent.
+    /// Answer every follow-up request a transition emits (session/close,
+    /// model identity refresh, history load) with a permissive empty result,
+    /// until the pane goes quiet, and return the methods seen in order. Keeps
+    /// transition tests focused on the behavior under test rather than on
+    /// exact RPC choreography, while still letting a test assert that a
+    /// given request (e.g. `session/new`) was never sent.
     async fn drain_and_record_methods(
         rx: &mut mpsc::Receiver<String>,
         rpc: &RpcOutbound,
@@ -21826,6 +21819,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_focuses_a_background_session_without_attaching() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -21860,6 +21856,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_on_the_focused_session_shows_a_notice() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -21890,6 +21889,9 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_load_session_opens_a_filtered_picker() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -21930,6 +21932,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_with_no_match_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -21959,6 +21964,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_listing_failure_shows_a_notice_and_starts_nothing() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -21983,6 +21991,9 @@ mod tests {
 
     #[tokio::test]
     async fn load_session_respects_the_session_cap() {
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
@@ -22016,6 +22027,49 @@ mod tests {
                 &[("max", &MAX_TRACKED_SESSIONS_PER_PANE.to_string())]
             )
         );
+    }
+
+    #[tokio::test]
+    async fn load_session_command_reaches_the_handler_mid_turn() {
+        use crossterm::event::KeyCode;
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = local_code_chat_with_session(&rpc, "sess-old", "/old/project");
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.input_bar.insert_text("/load-session sess-target");
+
+        let task = tokio::spawn(async move {
+            let mut term = headless_term();
+            chat.handle_key(KeyEvent::from(KeyCode::Enter), &mut term)
+                .await;
+            chat
+        });
+        let list = next_rpc_request(&mut rx, "Enter on /load-session should list the store").await;
+        assert_eq!(list["method"], method::SESSION_LIST_ACP);
+        respond_ok(
+            &rpc,
+            &list,
+            serde_json::json!({ "sessions": [listed_session("sess-target", None, None)] }),
+        );
+        let attach = next_rpc_request(&mut rx, "a unique match should attach mid-turn").await;
+        assert_eq!(attach["method"], method::SESSION_NEW);
+        assert_eq!(attach["params"]["session_id"], "sess-target");
+        respond_ok(
+            &rpc,
+            &attach,
+            serde_json::json!({ "session_id": "sess-target", "workspace_dir": "/w" }),
+        );
+        drain_pending_requests(&mut rx, &rpc).await;
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("load should finish")
+            .unwrap();
+        assert_eq!(chat.current_session_id(), Some("sess-target"));
     }
 
     fn headless_term() -> crate::config_manager::Term {

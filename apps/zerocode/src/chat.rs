@@ -4486,6 +4486,10 @@ impl Chat {
                     self.begin_change_directory();
                     return false;
                 }
+                InputBarAction::OpenSessionPicker | InputBarAction::LoadSession(_) => {
+                    // Wired up by the /load-session handler.
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     state.clear_info_notice();
                     if state.resume_queue() {

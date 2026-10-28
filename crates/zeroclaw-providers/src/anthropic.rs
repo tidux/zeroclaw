@@ -486,6 +486,11 @@ struct NativeToolSpec {
     input_schema: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+    /// Fine-grained tool streaming. Without it the API buffers each input
+    /// value until it is complete, so one large argument (a file body) leaves
+    /// the SSE stream silent for minutes. Set only on streaming requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eager_input_streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -892,6 +897,7 @@ impl AnthropicModelProvider {
                     zeroclaw_api::schema::CleaningStrategy::Anthropic,
                 ),
                 cache_control: None,
+                eager_input_streaming: None,
             })
             .collect();
 
@@ -2407,6 +2413,13 @@ impl AnthropicModelProvider {
         )
     }
 
+    /// `eager_input_streaming` is a first-party Messages API tool field.
+    /// Anthropic-compatible gateways behind a custom `base_url` may reject
+    /// unknown tool fields, so they keep the buffered request shape.
+    fn sends_eager_tool_input_streaming(&self) -> bool {
+        self.base_url.trim_end_matches('/') == BASE_URL
+    }
+
     /// Streaming requests have no whole-request deadline. Header acquisition
     /// and buffered error bodies are bounded separately, while successful SSE
     /// bodies use the shared byte-idle timeout.
@@ -3252,7 +3265,7 @@ impl ModelProvider for AnthropicModelProvider {
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = self.convert_tools(request.tools);
+        let mut native_tools = self.convert_tools(request.tools);
         let tools_count = native_tools.as_ref().map_or(0, Vec::len);
         let tool_choice = if tools_count > 0
             && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
@@ -3426,6 +3439,11 @@ impl ModelProvider for AnthropicModelProvider {
                     })),
                 "anthropic streaming provider request prepared"
             );
+        }
+        if self.sends_eager_tool_input_streaming() {
+            for tool in native_tools.iter_mut().flatten() {
+                tool.eager_input_streaming = Some(true);
+            }
         }
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -4168,6 +4186,117 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
         server.abort();
         assert_eq!(text, "hi");
         assert!(saw_final, "message_stop must emit Final");
+    }
+
+    #[tokio::test]
+    async fn custom_base_url_streaming_tools_omit_eager_input_streaming() {
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+
+        let (body_tx, mut body_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(
+                    |State(body_tx): State<tokio::sync::mpsc::Sender<serde_json::Value>>,
+                     Json(body): Json<serde_json::Value>| async move {
+                        let _ = body_tx.send(body).await;
+                        axum::body::Body::from(
+                            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                        )
+                        .into_response()
+                    },
+                ),
+            )
+            .with_state(body_tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage::user("write a file")];
+        let tools = vec![ToolSpec::new(
+            "file_write",
+            "Write a file",
+            serde_json::json!({"type": "object"}),
+        )];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+                thinking: None,
+            },
+            "claude-haiku-4-5",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        while let Some(event) = stream.next().await {
+            if matches!(event, Ok(StreamEvent::Final) | Err(_)) {
+                break;
+            }
+        }
+        let body = tokio::time::timeout(std::time::Duration::from_secs(4), body_rx.recv())
+            .await
+            .expect("request body must arrive")
+            .expect("request body channel open");
+        server.abort();
+
+        assert_eq!(body["stream"], serde_json::json!(true));
+        let tool = &body["tools"][0];
+        assert_eq!(tool["name"], "file_write");
+        assert!(
+            tool.get("eager_input_streaming").is_none(),
+            "a custom base_url must keep the buffered tool shape: {tool}"
+        );
+    }
+
+    #[test]
+    fn eager_tool_input_streaming_is_first_party_only() {
+        assert!(
+            AnthropicModelProvider::builder("test")
+                .build()
+                .sends_eager_tool_input_streaming()
+        );
+        assert!(
+            AnthropicModelProvider::builder("test")
+                .base_url("https://api.anthropic.com/")
+                .build()
+                .sends_eager_tool_input_streaming()
+        );
+        assert!(
+            !AnthropicModelProvider::builder("test")
+                .base_url("https://gateway.example.com")
+                .build()
+                .sends_eager_tool_input_streaming()
+        );
+    }
+
+    #[test]
+    fn native_tool_spec_serializes_eager_input_streaming_only_when_set() {
+        let mut tool = NativeToolSpec {
+            name: "file_write".to_string(),
+            description: "Write a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}).into(),
+            cache_control: None,
+            eager_input_streaming: None,
+        };
+        let buffered = serde_json::to_value(&tool).unwrap();
+        assert!(buffered.get("eager_input_streaming").is_none());
+
+        tool.eager_input_streaming = Some(true);
+        let eager = serde_json::to_value(&tool).unwrap();
+        assert_eq!(eager["eager_input_streaming"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -5059,6 +5188,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
             cache_control: None,
+            eager_input_streaming: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("get_weather"));
@@ -5073,6 +5203,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             description: "Get weather info".to_string(),
             input_schema: schema.into(),
             cache_control: Some(CacheControl::ephemeral()),
+            eager_input_streaming: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("get_weather"));

@@ -567,13 +567,17 @@ impl GrokCliModelProvider {
             cwd: &self.working_directory,
             permission_policy,
             max_stdout_bytes: self.max_acp_stdout_bytes,
+            session_meta: None,
+            model: None,
+            session_check: None,
+            failure_marker: None,
         };
         let outcome = run_oneshot_subprocess(cmd, self.timeout, &request, |initialize| {
             let method_id = select_auth_method_id(initialize, xai_api_key_available)?;
-            Ok(json!({
+            Ok(Some(json!({
                 "methodId": method_id,
                 "_meta": { "headless": true }
-            }))
+            })))
         })
         .await;
 
